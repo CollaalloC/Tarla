@@ -63,3 +63,9 @@ A local usage monitor may obtain a one-hour credential with bearer-authenticated
 Install a UTF-8 instruction file at `workspaces/<workspace>/skills/<name>/SKILL.md`. Send `/skills` in any conversation to list the names available there. Send `/skill calibrate check the fixture` to apply the complete instructions from `skills/calibrate/SKILL.md` to that task.
 
 The supervisor adds the selected revision after the current conversation window for that turn. The frozen system prefix stays stable. A delegated or pinned run receives the selected instructions in its bounded mission packet. Retrying the same source message uses the original revision. A subsequent request can select a newly edited revision. An oversized activation produces an error before dispatch so the executor never receives partial instructions.
+
+## Intermediate assistant replies
+
+A gateway can poll `GET /v1/conversations/{id}/draft?channel=telegram&source_msg_id=...` while the matching message POST is running. Use the workspace bearer and the exact same channel, source message ID and conversation. A response has `status`, `revision` and `text`. A streaming response replaces the entire previous draft, including when the text resets to empty after provider failure or a tool round. Idle means that source has no available draft. A completed response includes the durable assistant message sequence in `seq_no`. Revision values identify changes within an active attempt. Completion and a restarted process start separate revision ranges.
+
+Only public text deltas are published. Tool arguments, reasoning blocks and provider metadata stay out of previews. Drafts live in memory and are capped at 8 KiB. The committed reply survives restart and may be longer. Providers and CLI drivers that return only complete decisions use the same final-message path.

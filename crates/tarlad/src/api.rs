@@ -21,6 +21,14 @@ pub async fn client_auth(State(s): State<S>, req: Request, next: Next) -> Api<Re
             "invalid workspace credential".into(),
         ));
     }
+    if let Some(expected) = req.headers().get("x-tarla-workspace") {
+        if expected.as_bytes() != s.id().as_bytes() {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "workspace identity changed".into(),
+            ));
+        }
+    }
     Ok(next.run(req).await)
 }
 pub async fn health(State(s): State<S>) -> Json<Value> {
@@ -52,7 +60,7 @@ pub async fn messages(State(s): State<S>, Route(id): Route<String>, Query(p): Qu
     } else {
         "ASC"
     };
-    let mut rows=list(&c,&format!("SELECT seq_no,channel_type,sender_role,content,run_id,created_at FROM messages WHERE conversation_id=? AND seq_no>? AND seq_no<? ORDER BY seq_no {order} LIMIT ?"),&[&id,&p.after_seq.unwrap_or(0),&p.before_seq.unwrap_or(i64::MAX),&limit])?;
+    let mut rows=list(&c,&format!("SELECT seq_no,channel_type,source_msg_id,sender_role,content,run_id,created_at FROM messages WHERE conversation_id=? AND seq_no>? AND seq_no<? ORDER BY seq_no {order} LIMIT ?"),&[&id,&p.after_seq.unwrap_or(0),&p.before_seq.unwrap_or(i64::MAX),&limit])?;
     if order == "DESC" {
         rows.reverse()
     }
@@ -194,6 +202,9 @@ pub async fn resolve(State(s): State<S>, Route(id): Route<String>, Json(v): Json
             .as_i64()
             .context("expected_version required for memory decision")?,
     )?;
+    if let Some(m) = &applied {
+        peers::memory_changed(&s, m.sync_seq);
+    }
     Ok(Json(json!({"resolution":resolution,"memory":applied})))
 }
 pub fn resolve_local_approval(s: &Service, id: &str, v: &str) -> Result<Value> {

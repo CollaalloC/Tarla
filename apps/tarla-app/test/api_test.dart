@@ -5,6 +5,46 @@ import 'package:tarla_app/api.dart';
 
 void main() {
   test(
+    'a workspace mismatch blocks the credential and all business requests',
+    () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final endpoint = Endpoint(
+        'http://127.0.0.1:${server.port}',
+        'workspace-secret',
+      );
+      final wrong = TarlaApi(endpoint, workspaceId: 'life');
+      final correct = TarlaApi(endpoint, workspaceId: 'work');
+      final paths = <String>[];
+      server.listen((req) async {
+        paths.add(req.uri.path);
+        if (req.uri.path == '/health') {
+          expect(req.headers.value('Authorization'), isNull);
+          req.response.write(jsonEncode({'workspace_id': 'work'}));
+        } else {
+          expect(req.headers.value('Authorization'), 'Bearer workspace-secret');
+          expect(req.headers.value('X-Tarla-Workspace'), 'work');
+          req.response.write('[]');
+        }
+        await req.response.close();
+      });
+      try {
+        await expectLater(
+          wrong.post(['memories'], {'content': 'isolated'}),
+          throwsA(isA<ApiError>().having((e) => e.status, 'status', 409)),
+        );
+        expect(paths, ['/health']);
+        expect(await correct.list(['memories']), isEmpty);
+        expect(await correct.list(['runs']), isEmpty);
+        expect(paths, ['/health', '/health', '/v1/memories', '/v1/runs']);
+      } finally {
+        wrong.close();
+        correct.close();
+        await server.close(force: true);
+      }
+    },
+  );
+
+  test(
     'endpoints reject embedded credentials, unsafe remote transport and redirects encoded in URLs',
     () {
       for (final url in [

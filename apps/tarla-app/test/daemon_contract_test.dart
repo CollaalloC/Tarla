@@ -35,7 +35,10 @@ void main() {
         final address = '127.0.0.1:${port.port}';
         await port.close();
         child = await Process.start(daemon, [...args, '--listen', address]);
-        final service = TarlaApi(Endpoint('http://$address', token));
+        final service = TarlaApi(
+          Endpoint('http://$address', token),
+          workspaceId: 'work',
+        );
         client = service;
         final end = DateTime.now().add(const Duration(seconds: 15));
         while (true) {
@@ -46,6 +49,21 @@ void main() {
             if (DateTime.now().isAfter(end)) rethrow;
           }
           await Future<void>.delayed(const Duration(milliseconds: 80));
+        }
+        final wrong = TarlaApi(
+          Endpoint('http://$address', token),
+          workspaceId: 'life',
+        );
+        try {
+          await expectLater(
+            wrong.post(
+              ['memories'],
+              {'memory_id': 'wrong', 'content': 'wrong', 'base_version': 0},
+            ),
+            throwsA(isA<ApiError>().having((e) => e.status, 'status', 409)),
+          );
+        } finally {
+          wrong.close();
         }
         for (final group in [
           'conversations',

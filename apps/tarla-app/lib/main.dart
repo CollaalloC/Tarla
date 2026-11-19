@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'api.dart' as api;
 import 'screens.dart';
+import 'local_core.dart';
 
 void main() => runApp(const TarlaApp());
 
@@ -34,7 +35,7 @@ Future<api.Profile?> connectProfile(BuildContext context) async {
               mainAxisSize: MainAxisSize.min,
               children: [
                 for (final entry in [
-                  (0, '工作空间名称', '工作或生活', false),
+                  (0, '工作空间 ID', 'work', false),
                   (1, '主管服务地址', 'https://core.example.com', false),
                   (2, '主管访问令牌', '', true),
                 ])
@@ -83,7 +84,8 @@ Future<api.Profile?> connectProfile(BuildContext context) async {
             onPressed: () {
               try {
                 final name = fields[0].trim();
-                if (name.isEmpty) throw const FormatException('请输入工作空间名称');
+                if (!RegExp(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$').hasMatch(name))
+                  throw const FormatException('请输入服务端配置的工作空间 ID');
                 Navigator.pop(
                   ctx,
                   api.Profile(
@@ -118,12 +120,15 @@ class _WorkspaceHomeState extends State<WorkspaceHome> {
   api.Profile? selected;
   Future<void> add() async {
     final profile = await connectProfile(context);
-    if (mounted && profile != null)
-      setState(() {
-        profiles.removeWhere((p) => p.name == profile.name);
-        profiles.add(profile);
-        selected = profile;
-      });
+    if (mounted && profile != null) selectProfile(profile);
+  }
+
+  void selectProfile(api.Profile profile) {
+    setState(() {
+      profiles.removeWhere((p) => p.name == profile.name);
+      profiles.add(profile);
+      selected = profile;
+    });
   }
 
   @override
@@ -131,6 +136,7 @@ class _WorkspaceHomeState extends State<WorkspaceHome> {
     final header = AppBar(
       title: const Text('Tarla'),
       actions: [
+        LocalCoreButton(onConnect: selectProfile),
         PopupMenuButton<int>(
           tooltip: '切换工作空间',
           onSelected: (i) {
@@ -198,10 +204,16 @@ class _SessionState extends State<Session> {
     Icons.bookmarks_outlined,
   ];
   final paths = ['conversations', 'runs', 'actions', 'memories'];
-  late final api.TarlaApi supervisor = api.TarlaApi(widget.profile.supervisor);
+  late final api.TarlaApi supervisor = api.TarlaApi(
+    widget.profile.supervisor,
+    workspaceId: widget.profile.name,
+  );
   late final api.TarlaApi? executor = widget.profile.executor == null
       ? null
-      : api.TarlaApi(widget.profile.executor!);
+      : api.TarlaApi(
+          widget.profile.executor!,
+          workspaceId: widget.profile.name,
+        );
   int tab = 0;
   int generation = 0;
   bool busy = true;

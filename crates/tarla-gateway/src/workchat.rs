@@ -232,6 +232,7 @@ mod tests {
             client: reqwest::Client::new(),
             feishu_token: Default::default(),
             instance: "test".into(),
+            test_platform_origin: None,
         })
     }
     #[tokio::test]

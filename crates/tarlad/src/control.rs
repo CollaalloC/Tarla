@@ -97,6 +97,7 @@ pub async fn memories(s: &Service, v: &Value) -> Result<Value> {
         hlc_timestamp: None,
     };
     let reply = m.propose_mutation(&req)?;
+    peers::mutation_committed(s, &reply);
     s.notify.notify_waiters();
     Ok(json!(reply))
 }
@@ -105,6 +106,7 @@ pub struct Plane<'a> {
     s: &'a Service,
     source: String,
     skill: Option<skills::Selection>,
+    draft: Option<drafts::Live<'a>>,
 }
 impl Plane<'_> {
     fn effect(&self, action: &str) -> String {
@@ -116,6 +118,11 @@ impl Plane<'_> {
 }
 #[async_trait]
 impl ControlPlane for Plane<'_> {
+    fn preview(&self, text: &str) {
+        if let Some(d) = &self.draft {
+            d.write(text)
+        }
+    }
     async fn short_circuit(&self, trigger: &SupervisorTrigger) -> Result<Option<String>> {
         let SupervisorTrigger::UserMessage {
             conversation_id: id,
@@ -257,7 +264,7 @@ pub async fn message(s: &Service, id: &str, payload: &Value) -> Result<String> {
         bail!("invalid message source")
     }
     let _lock = s.lock(id).await;
-    let key = format!("in:{channel}:{source}");
+    let key;
     {
         let mut c = s.db()?;
         c.execute(
@@ -272,10 +279,11 @@ pub async fn message(s: &Service, id: &str, payload: &Value) -> Result<String> {
         if old_id != id || old_text != text {
             bail!("message source id already used for different content")
         }
+        key = drafts::reply_key(&c, id, channel, &source)?;
         let replay = c
             .query_row(
-                "SELECT content FROM messages WHERE channel_type='supervisor' AND source_msg_id=?",
-                [&key],
+                "SELECT content FROM messages WHERE channel_type='supervisor' AND conversation_id=? AND source_msg_id=?",
+                params![id,key],
                 |r| r.get::<_, String>(0),
             )
             .optional()?;
@@ -288,6 +296,7 @@ pub async fn message(s: &Service, id: &str, payload: &Value) -> Result<String> {
     let plane = Plane {
         s,
         source: key,
+        draft: Some(s.drafts.begin(id, channel, &source)),
         skill,
     };
     s.brain
@@ -309,7 +318,7 @@ pub async fn deliver_receipts(s: S) {
                 eprintln!("receipt notification deferred: {e}")
             }
         }
-        tokio::select! {_=s.notify.notified()=>(),_=tokio::time::sleep(Duration::from_secs(2))=>()}
+        tokio::select! {_=s.receipt_wake.notified()=>(),_=s.notify.notified()=>(),_=tokio::time::sleep(Duration::from_secs(2))=>()}
     }
 }
 async fn next_wake(s: &Service) -> Result<()> {
@@ -348,6 +357,7 @@ async fn next_wake(s: &Service) -> Result<()> {
                 s,
                 source,
                 skill: None,
+                draft: None,
             };
             let trigger = SupervisorTrigger::RunCompleted {
                 conversation_id: id.into(),

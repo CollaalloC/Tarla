@@ -1,5 +1,6 @@
 //! Workspace-scoped channel ingress, durable relay and approval delivery.
 mod config;
+mod drafts;
 mod platform;
 mod store;
 mod workchat;
@@ -28,6 +29,8 @@ struct Gateway {
     client: reqwest::Client,
     feishu_token: tokio::sync::Mutex<Option<(i64, String)>>,
     instance: String,
+    #[cfg(test)]
+    test_platform_origin: Option<reqwest::Url>,
 }
 impl Gateway {
     fn db(&self) -> Result<MutexGuard<'_, Connection>> {
@@ -69,6 +72,8 @@ pub async fn router(cfg: GatewayConfig) -> Result<Router> {
             .build()?,
         feishu_token: tokio::sync::Mutex::new(None),
         instance,
+        #[cfg(test)]
+        test_platform_origin: None,
     });
     worker::start(&g);
     Ok(Router::new()

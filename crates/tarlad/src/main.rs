@@ -1,9 +1,11 @@
 mod api;
 mod control;
+mod drafts;
 mod facts;
 mod fleet;
 mod handoff;
 mod hooks;
+mod local_endpoint;
 mod peers;
 mod skills;
 mod slot_reports;
@@ -43,12 +45,16 @@ struct Args {
     workspace: String,
     #[arg(long, env = "TARLA_LISTEN", default_value = "127.0.0.1:7878")]
     listen: SocketAddr,
+    /// Publish this loopback listener for an explicitly enabled desktop service.
+    #[arg(long)]
+    publish_local_endpoint: bool,
 }
 
 struct Service {
     memory_index: Option<tarla_memory::MnemosyneIndex>,
     hosted_index: Option<tarla_memory::HostedIndex>,
     transcripts: transcript::Captures,
+    drafts: drafts::Drafts,
     ws: Workspace,
     local_url: String,
     home: PathBuf,
@@ -60,6 +66,9 @@ struct Service {
     account_locks: std::sync::Mutex<BTreeMap<String, std::fs::File>>,
     http: reqwest::Client,
     notify: tokio::sync::Notify,
+    s2_changed: tokio::sync::watch::Sender<i64>,
+    sync_wake: tokio::sync::Notify,
+    receipt_wake: tokio::sync::Notify,
 }
 type S = Arc<Service>;
 impl Service {
@@ -193,14 +202,22 @@ async fn main() -> Result<()> {
         std::process::exit(handoff::helper(Path::new(&path))?);
     }
     let a = Args::parse();
-    let home = a
-        .home
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(|p| PathBuf::from(p).join(".tarla"))
-        })
-        .context("specify --home")?;
+    if a.publish_local_endpoint && !a.listen.ip().is_loopback() {
+        bail!("local endpoint discovery requires a loopback listener");
+    }
+    let account_home = || {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .context("specify --home")
+    };
+    let home = match a.home {
+        // launchd passes arguments without a shell. Resolve the account directory
+        // here so a registered agent selects exactly the same state as its app.
+        Some(path) if path.starts_with("~") => account_home()?.join(path.strip_prefix("~")?),
+        Some(path) => path,
+        None => account_home()?.join(".tarla"),
+    };
     let ws = Workspace::open(&home, &a.workspace)?;
     let guard = std::fs::OpenOptions::new()
         .read(true)
@@ -221,6 +238,7 @@ async fn main() -> Result<()> {
     let db_path = ws.root.join("state.db");
     let mut initial = tarla_memory::open(&db_path, &a.workspace)?;
     initial.execute_batch(MIGRATIONS)?;
+    drafts::migrate(&mut initial)?;
     peers::check_term(&mut initial, &ws)?;
     facts::configure(&mut initial, &conf, &ws.config.workspace.node_id)?;
     let slots = fleet::load(&conf, &ws, &home)?;
@@ -357,6 +375,7 @@ async fn main() -> Result<()> {
         hosted_index,
         local_url: format!("http://{host}"),
         transcripts: Default::default(),
+        drafts: Default::default(),
         ws,
         home,
         db_path,
@@ -367,9 +386,13 @@ async fn main() -> Result<()> {
         account_locks: Default::default(),
         http: http.build()?,
         notify: Default::default(),
+        s2_changed: tokio::sync::watch::channel(0).0,
+        sync_wake: Default::default(),
+        receipt_wake: Default::default(),
     });
 
     let routes = Router::new()
+        .route("/v1/conversations/{id}/draft", get(drafts::get))
         .route("/v1/conversations", get(api::conversations))
         .route(
             "/v1/conversations/{id}/messages",
@@ -410,7 +433,14 @@ async fn main() -> Result<()> {
     )? {
         routes = routes.nest("/gateway", tarla_gateway::router(config).await?);
     }
+    let _local_endpoint = if a.publish_local_endpoint {
+        routes = routes.merge(local_endpoint::proof_route(service.clone()));
+        Some(local_endpoint::publish(&service.ws.root, actual)?)
+    } else {
+        None
+    };
     tokio::spawn(fleet::worker(service.clone()));
+    peers::start_s2_notifications(&service);
     tokio::spawn(peers::replicate(service.clone()));
     tokio::spawn(control::deliver_receipts(service.clone()));
     if service.hosted_index.is_some() {

@@ -2,6 +2,7 @@
 mod http;
 mod slot;
 mod tools;
+mod visible;
 pub use tools::{control_tools, ControlTool, ToolSpec};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -64,6 +65,16 @@ pub trait BrainBackend: Send + Sync {
         messages: &[ChatMessage],
         tools: &[ToolSpec],
     ) -> Result<BrainTurnOutput, BrainError>;
+    /// Backends with public text deltas may replace the current draft. A default
+    /// implementation keeps providers which only return complete decisions working.
+    async fn generate_turn_with_preview(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        _preview: &(dyn for<'chunk> Fn(&'chunk str) + Send + Sync),
+    ) -> Result<BrainTurnOutput, BrainError> {
+        self.generate_turn(messages, tools).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +104,8 @@ impl SupervisorTrigger {
 
 #[async_trait]
 pub trait ControlPlane: Send + Sync {
+    /// Ephemeral public assistant text for this specific input. An empty string clears it.
+    fn preview(&self, _text: &str) {}
     /// Handles deterministic user actions and pinned conversations. Return the reply when handled.
     async fn short_circuit(&self, trigger: &SupervisorTrigger) -> Result<Option<String>>;
     /// Includes the current trigger exactly once, in addition to the frozen prefix and history.
@@ -127,16 +140,28 @@ impl SupervisorEngine {
         self
     }
 
-    async fn turn(&self, messages: &[ChatMessage], tools: &[ToolSpec]) -> Result<BrainTurnOutput> {
+    async fn turn(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        plane: &dyn ControlPlane,
+    ) -> Result<BrainTurnOutput> {
         ensure!(
             !self.backends.is_empty(),
             "no supervisor backend configured"
         );
         let mut errors = Vec::new();
         for backend in &self.backends {
-            match backend.generate_turn(messages, tools).await {
+            plane.preview("");
+            match backend
+                .generate_turn_with_preview(messages, tools, &|text| plane.preview(text))
+                .await
+            {
                 Ok(turn) => return Ok(turn),
-                Err(BrainError::Unavailable(message)) => errors.push(message),
+                Err(BrainError::Unavailable(message)) => {
+                    plane.preview("");
+                    errors.push(message)
+                }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -187,11 +212,12 @@ impl SupervisorEngine {
                 size.saturating_add(tool_overhead(allowed)) <= self.max_window_bytes,
                 "supervisor context exceeds active budget"
             );
-            let next = self.turn(&messages, allowed).await?;
+            let next = self.turn(&messages, allowed, plane).await?;
             if next.tool_calls.is_empty() {
                 ensure!(!next.text.trim().is_empty(), "empty supervisor reply");
                 break next.text;
             }
+            plane.preview("");
             ensure!(
                 next.tool_calls.len() <= self.max_tool_steps - spent,
                 "supervisor tool budget exceeded"

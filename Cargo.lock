@@ -1729,6 +1729,7 @@ dependencies = [
  "tarla-sidecar",
  "tarla-supervisor",
  "tarla-workspace",
+ "tempfile",
  "tokio",
  "toml",
  "uuid",

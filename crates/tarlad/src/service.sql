@@ -19,3 +19,5 @@ CREATE TABLE IF NOT EXISTS service_peer_facts(node_id TEXT NOT NULL,fact_key TEX
 CREATE TABLE IF NOT EXISTS service_requirements(run_id TEXT PRIMARY KEY,role TEXT NOT NULL,model_family TEXT NOT NULL,request_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS service_osc(run_id TEXT PRIMARY KEY,approval_id TEXT NOT NULL UNIQUE,fingerprint TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS service_skill_selections(source TEXT PRIMARY KEY,name TEXT NOT NULL,instructions TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS service_reply_origins(reply_key TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,channel TEXT NOT NULL,source TEXT NOT NULL,UNIQUE(channel,source));
+CREATE TABLE IF NOT EXISTS service_reply_origin_migration(done INTEGER PRIMARY KEY);

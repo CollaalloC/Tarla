@@ -71,9 +71,11 @@ String identifier() {
 
 class TarlaApi {
   final Endpoint endpoint;
+  final String? workspaceId;
+  bool _verified = false;
   final HttpClient _client = HttpClient()
     ..connectionTimeout = const Duration(seconds: 7);
-  TarlaApi(this.endpoint);
+  TarlaApi(this.endpoint, {this.workspaceId});
 
   Future<dynamic> request(
     String method,
@@ -81,15 +83,41 @@ class TarlaApi {
     Row? payload,
     Map<String, String>? query,
   ]) async {
-    final req = await _client.openUrl(
+    if (workspaceId != null && !_verified) {
+      final health = await _exchange(
+        'GET',
+        endpoint.uri.replace(path: '/health'),
+        null,
+        authenticate: false,
+      );
+      if (health is! Map || health['workspace_id'] != workspaceId) {
+        throw ApiError(409, '服务端工作空间与选择的 ID 不一致');
+      }
+      _verified = true;
+    }
+    return _exchange(
       method,
       endpoint.route(path).replace(queryParameters: query),
+      payload,
     );
+  }
+
+  Future<dynamic> _exchange(
+    String method,
+    Uri uri,
+    Row? payload, {
+    bool authenticate = true,
+  }) async {
+    final req = await _client.openUrl(method, uri);
     req.followRedirects = false;
-    req.headers.set(
-      HttpHeaders.authorizationHeader,
-      'Bearer ${endpoint.token}',
-    );
+    if (authenticate) {
+      req.headers.set(
+        HttpHeaders.authorizationHeader,
+        'Bearer ${endpoint.token}',
+      );
+      if (workspaceId != null)
+        req.headers.set('X-Tarla-Workspace', workspaceId!);
+    }
     req.headers.set(HttpHeaders.acceptHeader, 'application/json');
     if (payload != null) {
       req.headers.contentType = ContentType.json;

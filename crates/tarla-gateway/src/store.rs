@@ -32,6 +32,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     CREATE TABLE IF NOT EXISTS inbox(n INTEGER PRIMARY KEY, platform TEXT NOT NULL, event TEXT NOT NULL, route TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE, job TEXT NOT NULL, tries INTEGER NOT NULL DEFAULT 0, retry INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, UNIQUE(platform,event));
     CREATE TABLE IF NOT EXISTS outgoing(n INTEGER PRIMARY KEY AUTOINCREMENT, route TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE, job TEXT NOT NULL, tries INTEGER NOT NULL DEFAULT 0, retry INTEGER NOT NULL DEFAULT 0);
     ")?;
+    db.execute_batch(crate::drafts::SCHEMA)?;
     Ok(db)
 }
 pub fn issue(
@@ -73,6 +74,8 @@ pub enum Job {
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub enum Delivery {
     Text(String),
+    Draft { source: String },
+    Final { source: String, text: String },
     Approval { title: String, token: String },
     Callback(String),
 }
@@ -153,10 +156,13 @@ pub fn ingest(db: &mut Connection, e: Event) -> Result<()> {
             )
         }
     };
-    tx.execute(
+    let added = tx.execute(
         "INSERT OR IGNORE INTO inbox(platform,event,route,job) VALUES (?,?,?,?)",
         params![r.platform, e.event_id, rid, serde_json::to_string(&job)?],
     )?;
+    if added == 1 && matches!(job, Job::Message { .. }) {
+        crate::drafts::track(&tx, &rid, &crate::drafts::source(&r.platform, &e.event_id))?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -215,17 +221,31 @@ pub fn queue_messages(
         }
         if m["sender_role"] == "assistant" {
             let text = m["content"].as_str().context("invalid assistant message")?;
-            for fragment in chunks(
+            let source = m["source_msg_id"].as_str().unwrap_or("");
+            let final_preview = crate::drafts::close(&tx, &b.id, source)?;
+            let mut fragments = chunks(
                 text,
                 if b.route.platform == "discord" {
                     1900
                 } else {
                     3500
                 },
-            ) {
+            );
+            if final_preview && fragments.is_empty() {
+                fragments.push("(Empty reply)".to_owned());
+            }
+            for (ix, fragment) in fragments.into_iter().enumerate() {
+                let job = if ix == 0 && final_preview {
+                    Delivery::Final {
+                        source: source.into(),
+                        text: fragment,
+                    }
+                } else {
+                    Delivery::Text(fragment)
+                };
                 tx.execute(
                     "INSERT INTO outgoing(route,job) VALUES (?,?)",
-                    params![b.id, serde_json::to_string(&Delivery::Text(fragment))?],
+                    params![b.id, serde_json::to_string(&job)?],
                 )?;
             }
         }

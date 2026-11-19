@@ -75,6 +75,20 @@ jobs:
       - name: Self-hosted Tailscale mesh
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: python3 tests/tailnet_acceptance.py
+      - name: Fragmented model replies and authenticated IM drafts
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: |
+          python3 tests/draft_stream.py
+          python3 tests/gateway_stream.py
+      - name: S2 visibility and completion receipt latency
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: python3 tests/replication_latency.py --samples 5 --warmup 2 --jitter-ms 50 --receipt-samples 2 --successful-receipts
+      - name: Rebuild and query the Mnemosyne index with its published SDK
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mnemosyne"
+          "$RUNNER_TEMP/mnemosyne/bin/python" -m pip install mnemosyne-memory==4.0.0
+          TARLA_MNEMOSYNE_PYTHON="$RUNNER_TEMP/mnemosyne/bin/python" cargo test --locked -p tarla-memory real_mnemosyne -- --ignored
   client:
     runs-on: ubuntu-latest
     defaults:

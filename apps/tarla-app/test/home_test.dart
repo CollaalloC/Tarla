@@ -13,7 +13,7 @@ void main() {
       await tester.pumpWidget(const TarlaApp());
       await tester.tap(find.text('连接工作空间'));
       await tester.pumpAndSettle();
-      await tester.enterText(find.byType(TextField).at(0), '研发');
+      await tester.enterText(find.byType(TextField).at(0), 'work');
       await tester.enterText(
         find.byType(TextField).at(1),
         'https://example.test',
@@ -21,7 +21,7 @@ void main() {
       await tester.enterText(find.byType(TextField).at(2), 'test-only');
       await tester.tap(find.widgetWithText(FilledButton, '连接'));
       await tester.pumpAndSettle();
-      expect(find.text('研发'), findsOneWidget);
+      expect(find.text('work'), findsOneWidget);
       for (final name in ['对话', '进行中', '等我处理', '记忆']) {
         expect(
           find.descendant(

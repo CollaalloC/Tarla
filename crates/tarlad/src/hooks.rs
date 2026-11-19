@@ -155,6 +155,7 @@ pub fn queue_proposal(s: &Service, v: &Value, run: Option<&str>) -> Result<Value
         )?;
     }
     tx.commit()?;
+    s.sync_wake.notify_one();
     s.notify.notify_waiters();
     Ok(json!({"status":"queued","proposal_id":key}))
 }
@@ -188,7 +189,7 @@ pub fn apply(s: &Service, node: &str, p: &Mutation) -> Result<Value> {
         }
     }
     let mut c = s.db()?;
-    Ok(json!(
-        SqliteMemory::new(&mut c, s.id(), s.node()).propose_mutation(p)?
-    ))
+    let result = SqliteMemory::new(&mut c, s.id(), s.node()).propose_mutation(p)?;
+    peers::mutation_committed(s, &result);
+    Ok(json!(result))
 }

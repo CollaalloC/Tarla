@@ -149,8 +149,10 @@ impl BrainBackend for ClaudeSlot {
         let text = envelope["result"]
             .as_str()
             .ok_or_else(|| BrainError::Invalid("subscription CLI returned no decision".into()))?;
-        serde_json::from_str(text).map_err(|_| {
+        let mut out: BrainTurnOutput = serde_json::from_str(text).map_err(|_| {
             BrainError::Invalid("invalid supervisor decision from subscription CLI".into())
-        })
+        })?;
+        out.text = crate::visible::public_string(&out.text);
+        Ok(out)
     }
 }

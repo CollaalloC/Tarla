@@ -616,6 +616,7 @@ fn finish(s: &Service, id: &str, status: &str, summary: &str, transcript: &str) 
         .lock()
         .map_err(|_| anyhow!("lock registry unavailable"))?
         .remove(id);
+    s.sync_wake.notify_one();
     s.notify.notify_waiters();
     Ok(())
 }

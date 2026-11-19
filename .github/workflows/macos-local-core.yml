@@ -1,0 +1,52 @@
+name: macOS bundled local core
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'apps/tarla-app/macos/**'
+      - 'apps/tarla-app/lib/local_core.dart'
+      - 'apps/tarla-app/test/local_core_test.dart'
+      - 'crates/tarlad/src/local_endpoint.rs'
+      - '.github/workflows/macos-local-core.yml'
+permissions:
+  contents: read
+concurrency:
+  group: macos-local-core-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  bundle:
+    runs-on: macos-15
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-bundled-local
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.38.3
+          channel: stable
+          cache: true
+      - name: Build and check the remote-only edition
+        working-directory: apps/tarla-app
+        run: |
+          flutter pub get
+          flutter test test/local_core_test.dart
+          flutter build macos --release
+          app=build/macos/Build/Products/Release/tarla_app.app
+          test ! -e "$app/Contents/Library/LaunchAgents/dev.tarla.client.local.tarlad.plist"
+          test ! -e "$app/Contents/Helpers/tarlad"
+      - name: Package an ad-hoc test edition
+        run: |
+          apps/tarla-app/macos/LocalCore/package.sh \
+            apps/tarla-app/build/macos/Build/Products/Release/tarla_app.app \
+            "$RUNNER_TEMP/Tarla Local.app" -
+          python3 apps/tarla-app/macos/LocalCore/verify.py "$RUNNER_TEMP/Tarla Local.app"
+          ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/Tarla Local.app" "$RUNNER_TEMP/tarla-local-macos-adhoc.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarla-local-macos-adhoc
+          path: ${{ runner.temp }}/tarla-local-macos-adhoc.zip
+          if-no-files-found: error
+          compression-level: 0

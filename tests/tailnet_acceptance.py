@@ -9,6 +9,7 @@ import shutil
 import ssl
 import subprocess
 import tempfile
+from urllib.error import URLError
 from urllib.request import HTTPSHandler, ProxyHandler, build_opener
 
 from acceptance import Node, free_port, until
@@ -21,7 +22,8 @@ def control_config(path):
     extensions.write_text("subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n")
     for cmd in [
         ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=Tarla test CA",
-         "-addext", "basicConstraints=critical,CA:TRUE", "-keyout", ca_key, "-out", ca],
+         "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+         "-keyout", ca_key, "-out", ca],
         ["req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=127.0.0.1", "-keyout", key, "-out", csr],
         ["x509", "-req", "-in", csr, "-CA", ca, "-CAkey", ca_key, "-CAcreateserial", "-days", "1",
          "-extfile", extensions, "-out", cert],
@@ -78,12 +80,24 @@ def run(path):
         service = subprocess.Popen([*head, "serve"], stdout=log, stderr=log)
         cleanup.callback(terminate, service)
 
+        last_error = None
+
         def health():
+            nonlocal last_error
             if service.poll() is not None:
                 raise RuntimeError("Headscale failed to start: " + (path / "headscale.log").read_text()[-1600:])
-            with https.open(url + "/health", timeout=3) as response:
-                return response.status == 200
-        until(health, "private Headscale control plane")
+            try:
+                with https.open(url + "/health", timeout=3) as response:
+                    return response.status == 200
+            except URLError as err:
+                last_error = err.reason
+                return False
+        try:
+            until(health, "private Headscale control plane")
+        except AssertionError as err:
+            # The service has not issued any enrollment keys yet.
+            startup = (path / "headscale.log").read_text()[-1400:]
+            raise RuntimeError(f"Headscale startup probe: {last_error}, server: {startup}") from err
         user = json.loads(subprocess.check_output([*head, "-o", "json", "users", "create", "tarla"]))
         user_id = str(user["id"])
         secret = secrets.token_hex(32)

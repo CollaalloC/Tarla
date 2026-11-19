@@ -5,6 +5,7 @@ use reqwest::{Client, Url};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, time::Duration};
 
+const MAX_PREVIEW: usize = 8192;
 const MAX_RESPONSE: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -129,6 +130,15 @@ impl BrainBackend for HttpBrain {
         messages: &[ChatMessage],
         tools: &[ToolSpec],
     ) -> Result<BrainTurnOutput, BrainError> {
+        self.generate_turn_with_preview(messages, tools, &|_| {})
+            .await
+    }
+    async fn generate_turn_with_preview(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        preview: &(dyn for<'chunk> Fn(&'chunk str) + Send + Sync),
+    ) -> Result<BrainTurnOutput, BrainError> {
         let mut request = self
             .client
             .post(self.endpoint.clone())
@@ -170,6 +180,7 @@ impl BrainBackend for HttpBrain {
         let mut pending = Vec::new();
         let mut size = 0;
         let mut stream = StreamTurn::default();
+        let mut sent = 0;
         while let Some(bytes) = response
             .chunk()
             .await
@@ -190,6 +201,19 @@ impl BrainBackend for HttpBrain {
                     consumed += end + 1;
                 }
                 pending.drain(..consumed);
+                let mut n = stream.text.text.len().min(MAX_PREVIEW);
+                while !stream.text.text.is_char_boundary(n) {
+                    n -= 1
+                }
+                if !stream.calls.is_empty() {
+                    if sent > 0 {
+                        preview("");
+                        sent = 0
+                    }
+                } else if n != sent {
+                    preview(&stream.text.text[..n]);
+                    sent = n;
+                }
             }
         }
         if json_body {
@@ -220,7 +244,7 @@ struct PartialCall {
 #[derive(Default)]
 struct StreamTurn {
     data: Vec<String>,
-    text: String,
+    text: crate::visible::VisibleText,
     calls: BTreeMap<u64, PartialCall>,
     done: bool,
     stopped: bool,
@@ -266,7 +290,7 @@ impl StreamTurn {
                 };
                 let delta = &choice["delta"];
                 if let Some(text) = delta["content"].as_str() {
-                    self.text.push_str(text);
+                    self.text.append(text);
                 }
                 for call in delta["tool_calls"].as_array().into_iter().flatten() {
                     let entry = self
@@ -289,6 +313,10 @@ impl StreamTurn {
                 }
             }
             Dialect::Anthropic => match v["type"].as_str() {
+                Some("content_block_start") if v["content_block"]["type"] == "text" => {
+                    self.text
+                        .append(v["content_block"]["text"].as_str().unwrap_or_default());
+                }
                 Some("content_block_start") if v["content_block"]["type"] == "tool_use" => {
                     let block = &v["content_block"];
                     self.calls.insert(
@@ -302,7 +330,7 @@ impl StreamTurn {
                     );
                 }
                 Some("content_block_delta") => match v["delta"]["type"].as_str() {
-                    Some("text_delta") => self.text.push_str(required_str(&v["delta"], "text")?),
+                    Some("text_delta") => self.text.append(required_str(&v["delta"], "text")?),
                     Some("input_json_delta") => {
                         let entry = self
                             .calls
@@ -346,7 +374,7 @@ impl StreamTurn {
             })
             .collect::<Result<_>>()?;
         Ok(BrainTurnOutput {
-            text: self.text,
+            text: self.text.finish(),
             tool_calls,
         })
     }
@@ -398,5 +426,6 @@ fn full_reply(dialect: Dialect, body: &[u8]) -> Result<BrainTurnOutput> {
             }
         }
     }
+    out.text = crate::visible::public_string(&out.text);
     Ok(out)
 }

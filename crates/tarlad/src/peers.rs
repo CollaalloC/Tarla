@@ -79,6 +79,42 @@ pub fn check_term(db: &mut Connection, ws: &Workspace) -> Result<()> {
     tx.commit()?;
     Ok(())
 }
+/// The authenticated hint carries only a cursor. Durable revisions still travel
+/// through the usual pull/validation/ack path, which also handles missed hints.
+pub fn memory_changed(s: &Service, seq: i64) {
+    s.s2_changed.send_if_modified(|last| {
+        if seq <= *last {
+            false
+        } else {
+            *last = seq;
+            true
+        }
+    });
+}
+pub fn mutation_committed(s: &Service, result: &tarla_memory::MutationResult) {
+    if let tarla_memory::MutationResult::Applied { memory } = result {
+        memory_changed(s, memory.sync_seq);
+    }
+}
+pub fn start_s2_notifications(s: &S) {
+    if !s.is_supervisor() {
+        return;
+    }
+    for node in s.peers.keys() {
+        let s = s.clone();
+        let node = node.clone();
+        let mut changes = s.s2_changed.subscribe();
+        tokio::spawn(async move {
+            // One in-flight hint per peer. Independent peers cannot block each other;
+            // watch coalesces bursts while a peer is unreachable or slow.
+            while changes.changed().await.is_ok() {
+                let cursor = *changes.borrow_and_update();
+                let _ = call(&s, &node, "memory_changed", &json!({"cursor":cursor})).await;
+            }
+        });
+    }
+}
+
 pub async fn call(s: &Service, node: &str, op: &str, payload: &Value) -> Result<Value> {
     let peer = s.peers.get(node).context("node is not paired")?;
     let mut p = payload.clone();
@@ -137,6 +173,23 @@ pub async fn receive(
         "sync" => {
             ensure_supervisor(&s)?;
             sync(&s, node, &v)?
+        }
+        "memory_changed" => {
+            if s.is_supervisor() || node != s.supervisor() {
+                return Err(ApiError(
+                    StatusCode::FORBIDDEN,
+                    "only the paired supervisor can signal a memory change".into(),
+                ));
+            }
+            let cursor = v["cursor"]
+                .as_i64()
+                .filter(|n| *n > 0)
+                .context("invalid memory cursor hint")?;
+            let local = SqliteMemory::new(&mut s.db()?, s.id(), s.node()).sync_cursor()?;
+            if cursor > local {
+                s.sync_wake.notify_one();
+            }
+            json!({"workspace_id":s.id(),"term":s.term()})
         }
         "ticket" | "log" | "resolve" | "forward" => {
             if node != s.supervisor() {
@@ -203,6 +256,12 @@ fn sync(s: &Service, node: &str, v: &Value) -> Result<Value> {
     )?;
     let assignments=list(&tx,"SELECT r.run_id,r.conversation_id,r.target_slot_id,r.desired_state,r.observed_state,r.mission_packet_json,p.workdir AS pinned_workdir,e.epoch AS pin_epoch FROM runs r LEFT JOIN service_run_paths p USING(run_id) LEFT JOIN service_pin_epochs e USING(run_id) WHERE target_node_id=? AND observed_state NOT IN ('failed','succeeded','cancelled') ORDER BY created_at,run_id",&[&node])?;
     tx.commit()?;
+    if v["events"]
+        .as_array()
+        .is_some_and(|events| events.iter().any(|e| e["event_type"] == "run_receipt"))
+    {
+        s.receipt_wake.notify_one();
+    }
     let cursor = v["cursor"].as_i64().context("missing memory cursor")?;
     let delta = SqliteMemory::new(&mut db, s.id(), s.node()).pull_delta_since(cursor, 32)?;
     Ok(
@@ -286,7 +345,7 @@ pub async fn replicate(s: S) {
         if let Err(e) = round(&s).await {
             eprintln!("replication deferred: {e}")
         }
-        tokio::select! {_=s.notify.notified()=>(),_=tokio::time::sleep(Duration::from_millis(900))=>()}
+        tokio::select! {_=s.sync_wake.notified()=>(),_=s.notify.notified()=>(),_=tokio::time::sleep(Duration::from_millis(900))=>()}
     }
 }
 async fn round(s: &Service) -> Result<()> {
@@ -303,6 +362,9 @@ async fn round(s: &Service) -> Result<()> {
         }
         tx.execute("UPDATE runs SET observed_state='unconfirmed',updated_at=? WHERE observed_state IN ('running','blocked','dispatch_pending') AND target_node_id IN (SELECT node_id FROM service_peers WHERE seen<?)",params![now(),now()-15])?;
         tx.commit()?;
+        if batch.iter().any(|e| e["event_type"] == "run_receipt") {
+            s.receipt_wake.notify_one();
+        }
         return Ok(());
     }
     if !s.peers.contains_key(s.supervisor()) {
@@ -425,5 +487,8 @@ async fn round(s: &Service) -> Result<()> {
     tx.commit()?;
     let delta: Vec<Memory> = serde_json::from_value(response["delta"].clone())?;
     SqliteMemory::new(&mut c, s.id(), s.node()).apply_delta(&delta)?;
+    if delta.len() == 32 {
+        s.sync_wake.notify_one();
+    }
     Ok(())
 }

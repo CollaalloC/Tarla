@@ -14,6 +14,16 @@ use std::{
 use tokio::time::sleep;
 
 impl Gateway {
+    fn platform_url(&self, url: Url) -> Url {
+        #[cfg(test)]
+        if let Some(base) = &self.test_platform_origin {
+            let mut target = base.clone();
+            target.set_path(url.path());
+            target.set_query(url.query());
+            return target;
+        }
+        url
+    }
     pub(crate) async fn core(
         &self,
         method: Method,
@@ -48,7 +58,9 @@ impl Gateway {
         let f = self.cfg.feishu.as_ref().context("Feishu disabled")?;
         let body: Value = self
             .client
-            .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
+            .post(self.platform_url(Url::parse(
+                "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            )?))
             .json(&json!({"app_id":f.app_id,"app_secret":f.app_secret}))
             .send()
             .await?
@@ -68,11 +80,20 @@ impl Gateway {
         ));
         Ok(token)
     }
-    async fn deliver(&self, route: &Route, n: i64, d: Delivery) -> Result<()> {
+    pub(crate) async fn deliver(
+        &self,
+        route: &Route,
+        n: i64,
+        d: Delivery,
+        edit: Option<&str>,
+    ) -> Result<Option<String>> {
         let (text, card) = match &d {
             Delivery::Text(s) => (s.as_str(), None),
             Delivery::Approval { title, token } => ("", Some(Card { title, token })),
             Delivery::Callback(_) => ("", None),
+            Delivery::Draft { .. } | Delivery::Final { .. } => {
+                bail!("expected a rendered delivery")
+            }
         };
         match route.platform.as_str() {
             "telegram" => {
@@ -82,6 +103,11 @@ impl Gateway {
                         "answerCallbackQuery",
                         json!({"callback_query_id":id,"text":"Recorded"}),
                     )
+                } else if let Some(id) = edit {
+                    (
+                        "editMessageText",
+                        json!({"chat_id":route.chat,"message_id":id.parse::<i64>()?,"text":text}),
+                    )
                 } else {
                     (
                         "sendMessage",
@@ -89,32 +115,50 @@ impl Gateway {
                     )
                 };
                 let url = format!("https://api.telegram.org/bot{}/{method}", t.token);
-                let response = self
+                let raw = self
                     .client
-                    .post(url)
+                    .post(self.platform_url(Url::parse(&url)?))
                     .json(&body)
                     .send()
-                    .await?
-                    .error_for_status()?
-                    .json::<Value>()
                     .await?;
+                let http_error = raw.error_for_status_ref().err();
+                let response: Value = raw.json().await?;
                 if response["ok"] != true {
+                    if edit.is_some()
+                        && response["description"]
+                            .as_str()
+                            .is_some_and(|s| s.contains("message is not modified"))
+                    {
+                        return Ok(edit.map(str::to_owned));
+                    }
+                    if let Some(err) = http_error {
+                        return Err(err.into());
+                    }
                     bail!("Telegram declined operation")
                 }
+                Ok(response["result"]["message_id"]
+                    .as_i64()
+                    .map(|v| v.to_string()))
             }
             "feishu" => {
                 let mut body = platform::feishu_payload(route, text, card);
                 body["uuid"] = json!(format!("{}-{n}", &self.instance));
                 let mut url = Url::parse("https://open.feishu.cn/open-apis/im/v1/messages")?;
-                if let Some(id) = &route.reply_to {
+                let method = if let Some(mid) = edit {
+                    url.path_segments_mut().unwrap().push(mid);
+                    body = json!({"msg_type":"text","content":json!({"text":text}).to_string()});
+                    Method::PUT
+                } else if let Some(id) = &route.reply_to {
                     url.path_segments_mut().unwrap().push(id).push("reply");
+                    Method::POST
                 } else {
                     url.query_pairs_mut()
                         .append_pair("receive_id_type", "chat_id");
-                }
+                    Method::POST
+                };
                 let res = self
                     .client
-                    .post(url)
+                    .request(method, self.platform_url(url))
                     .bearer_auth(self.feishu_token().await?)
                     .json(&body)
                     .send()
@@ -128,14 +172,25 @@ impl Gateway {
                     }
                     bail!("Feishu declined operation")
                 }
+                Ok(res["data"]["message_id"]
+                    .as_str()
+                    .or(edit)
+                    .map(str::to_owned))
             }
             "slack" => {
                 let f = self.cfg.slack.as_ref().context("Slack disabled")?;
+                let mut body = crate::workchat::slack_payload(route, text, card);
+                let endpoint = if let Some(ts) = edit {
+                    body = json!({"channel":route.chat,"ts":ts,"text":text,"mrkdwn":false,"parse":"none"});
+                    "https://slack.com/api/chat.update"
+                } else {
+                    "https://slack.com/api/chat.postMessage"
+                };
                 let r: Value = self
                     .client
-                    .post("https://slack.com/api/chat.postMessage")
+                    .post(self.platform_url(Url::parse(endpoint)?))
                     .bearer_auth(&f.bot)
-                    .json(&crate::workchat::slack_payload(route, text, card))
+                    .json(&body)
                     .send()
                     .await?
                     .error_for_status()?
@@ -144,6 +199,7 @@ impl Gateway {
                 if r["ok"] != true {
                     bail!("Slack declined operation")
                 }
+                Ok(r["ts"].as_str().or(edit).map(str::to_owned))
             }
             "discord" => {
                 let f = self.cfg.discord.as_ref().context("Discord disabled")?;
@@ -152,17 +208,26 @@ impl Gateway {
                     .unwrap()
                     .push(&route.chat)
                     .push("messages");
-                self.client
-                    .post(u)
+                let method = if let Some(id) = edit {
+                    u.path_segments_mut().unwrap().push(id);
+                    Method::PATCH
+                } else {
+                    Method::POST
+                };
+                let result: Value = self
+                    .client
+                    .request(method, self.platform_url(u))
                     .header("Authorization", format!("Bot {}", f.bot))
                     .json(&crate::workchat::discord_payload(text, card))
                     .send()
                     .await?
-                    .error_for_status()?;
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                Ok(result["id"].as_str().or(edit).map(str::to_owned))
             }
             _ => bail!("unknown platform"),
         }
-        Ok(())
     }
 }
 struct Item {
@@ -228,17 +293,9 @@ impl Work {
         let mut callback = None;
         let result: Result<()> = match self {
             Self::In => match serde_json::from_str(&i.job)? {
-                Job::Message { source, text } => g
-                    .core(
-                        Method::POST,
-                        &["conversations", &i.conv, "messages"],
-                        &[],
-                        Some(
-                            json!({"text":text,"source_msg_id":source,"channel":i.route.platform}),
-                        ),
-                    )
-                    .await
-                    .map(|_| ()),
+                Job::Message { source, text } => {
+                    crate::drafts::post(g, &i.rid, &i.route, &i.conv, &source, &text).await
+                }
                 Job::Action {
                     id,
                     resolution,
@@ -256,8 +313,7 @@ impl Work {
                 }
             },
             Self::Out => {
-                g.deliver(&i.route, i.n, serde_json::from_str(&i.job)?)
-                    .await
+                crate::drafts::send(g, &i.rid, &i.route, i.n, serde_json::from_str(&i.job)?).await
             }
         };
         let table = self.table();
@@ -265,15 +321,21 @@ impl Work {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Err(e) = result {
             let status = e.downcast_ref::<reqwest::Error>().and_then(|e| e.status());
-            let terminal = status.is_some_and(|s| {
-                s.is_client_error()
-                    && !matches!(
-                        s,
-                        StatusCode::TOO_MANY_REQUESTS
-                            | StatusCode::REQUEST_TIMEOUT
-                            | StatusCode::UNAUTHORIZED
-                    )
-            });
+            let final_reply = matches!(self, Self::Out)
+                && matches!(
+                    serde_json::from_str::<Delivery>(&i.job),
+                    Ok(Delivery::Final { .. })
+                );
+            let terminal = !final_reply
+                && status.is_some_and(|s| {
+                    s.is_client_error()
+                        && !matches!(
+                            s,
+                            StatusCode::TOO_MANY_REQUESTS
+                                | StatusCode::REQUEST_TIMEOUT
+                                | StatusCode::UNAUTHORIZED
+                        )
+                });
             if !terminal {
                 let delay = (2i64.pow((i.tries + 1).min(8) as u32)).min(300);
                 tx.execute(
@@ -284,15 +346,25 @@ impl Work {
                 return Ok(true);
             }
             if matches!(self, Self::In) {
-                tx.execute(
-                    "INSERT INTO outgoing(route,job) VALUES(?,?)",
-                    params![
-                        i.rid,
-                        serde_json::to_string(&Delivery::Text(
-                            "Tarla could not accept this request.".into()
-                        ))?
-                    ],
-                )?;
+                if let Job::Message { source, .. } = serde_json::from_str(&i.job)? {
+                    crate::drafts::abort(
+                        &tx,
+                        &i.rid,
+                        &i.route.platform,
+                        &source,
+                        "Tarla could not accept this request.",
+                    )?;
+                } else {
+                    tx.execute(
+                        "INSERT INTO outgoing(route,job) VALUES(?,?)",
+                        params![
+                            i.rid,
+                            serde_json::to_string(&Delivery::Text(
+                                "Tarla could not accept this request.".into()
+                            ))?
+                        ],
+                    )?;
+                }
             }
             callback = None;
         }
@@ -307,6 +379,7 @@ impl Work {
                 }
             }
             Self::Out => {
+                crate::drafts::ack(&tx, &i.rid, &i.job)?;
                 tx.execute("DELETE FROM outgoing WHERE n=?", [i.n])?;
             }
         }
@@ -450,6 +523,7 @@ mod tests {
             client: reqwest::Client::new(),
             feishu_token: Default::default(),
             instance: "test".into(),
+            test_platform_origin: None,
         };
         let route = Route {
             platform: "telegram".into(),
