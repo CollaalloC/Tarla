@@ -18,3 +18,4 @@ CREATE TABLE IF NOT EXISTS service_slot_paths(node_id TEXT NOT NULL,slot_id TEXT
 CREATE TABLE IF NOT EXISTS service_peer_facts(node_id TEXT NOT NULL,fact_key TEXT NOT NULL,metadata_json TEXT NOT NULL,verified_at INTEGER NOT NULL,PRIMARY KEY(node_id,fact_key));
 CREATE TABLE IF NOT EXISTS service_requirements(run_id TEXT PRIMARY KEY,role TEXT NOT NULL,model_family TEXT NOT NULL,request_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS service_osc(run_id TEXT PRIMARY KEY,approval_id TEXT NOT NULL UNIQUE,fingerprint TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS service_skill_selections(source TEXT PRIMARY KEY,name TEXT NOT NULL,instructions TEXT NOT NULL);

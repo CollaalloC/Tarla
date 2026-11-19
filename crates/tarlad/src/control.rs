@@ -104,6 +104,7 @@ pub async fn memories(s: &Service, v: &Value) -> Result<Value> {
 pub struct Plane<'a> {
     s: &'a Service,
     source: String,
+    skill: Option<skills::Selection>,
 }
 impl Plane<'_> {
     fn effect(&self, action: &str) -> String {
@@ -124,7 +125,8 @@ impl ControlPlane for Plane<'_> {
             return Ok(None);
         };
         let answer = match text.trim() {
-            "/help" => "Commands: /runs, /memories, /dispatch <goal>, /switch [node/slot], @slot [message], /unbind".into(),
+            "/help" => "Commands: /skills, /skill <name> <task>, /runs, /memories, /dispatch <goal>, /switch [node/slot], @slot [message], /unbind".into(),
+            "/skills" => skills::available(&self.s.ws)?,
             "/runs" => serde_json::to_string(&api::run_list(self.s)?)?,
             "/memories" => memories(self.s, &json!({"operation":"search"}))
                 .await?
@@ -137,7 +139,7 @@ impl ControlPlane for Plane<'_> {
                 Some(self.effect("dispatch")),
             )?
             .to_string(),
-            _=> return handoff::pinned(self.s,id,text,&self.source,self.effect("dispatch")),
+            _=> return handoff::pinned(self.s,id,text,&self.source,self.effect("dispatch"),self.skill.as_ref()),
         };
         Ok(Some(answer))
     }
@@ -163,28 +165,39 @@ impl ControlPlane for Plane<'_> {
                 supervisor_active_budget_tokens: p
                     .supervisor_active_budget_tokens
                     .checked_sub(tarla_supervisor::control_window_reserve())
-                    .context("supervisor budget too small for control tools")?,
+                    .and_then(|n| {
+                        n.checked_sub(self.skill.as_ref().map_or(0, skills::Selection::cost))
+                    })
+                    .context("selected skill and control tools exceed the supervisor budget")?,
                 compaction_high_watermark_pct: p.compaction_high_watermark_pct,
                 protected_verbatim_turns: p.protected_verbatim_turns,
             },
         )?;
-        Ok(history
+        let mut messages: Vec<_> = history
             .into_iter()
             .map(|m| match m.role.as_str() {
                 "system" => ChatMessage::System(m.content),
                 "assistant" => ChatMessage::Assistant(m.content),
                 _ => ChatMessage::User(m.content),
             })
-            .collect())
+            .collect();
+        if let Some(skill) = &self.skill {
+            messages.push(ChatMessage::User(skill.instructions.clone()));
+        }
+        Ok(messages)
     }
     async fn call_tool(&self, id: &str, tool: ControlTool, mut args: Value) -> Result<Value> {
         match tool {
             ControlTool::ListFleetAndRuns => {
                 Ok(json!({"slots":fleet::snapshots(self.s)?,"runs":api::run_list(self.s)?}))
             }
-            ControlTool::DispatchMission => {
-                fleet::dispatch(self.s, id, &args, Some(self.effect("dispatch")))
-            }
+            ControlTool::DispatchMission => fleet::dispatch_selected(
+                self.s,
+                id,
+                &args,
+                Some(self.effect("dispatch")),
+                self.skill.as_ref(),
+            ),
             ControlTool::InspectRunLog => {
                 api::read_log(
                     self.s,
@@ -271,7 +284,12 @@ pub async fn message(s: &Service, id: &str, payload: &Value) -> Result<String> {
         }
         tarla_context::append(&mut c, s.id(), id, channel, &source, "user", text)?;
     }
-    let plane = Plane { s, source: key };
+    let skill = skills::select(&s.ws, &s.db()?, &key, text)?;
+    let plane = Plane {
+        s,
+        source: key,
+        skill,
+    };
     s.brain
         .handle_trigger(
             &plane,
@@ -326,7 +344,11 @@ async fn next_wake(s: &Service) -> Result<()> {
                 "run_receipt",
                 raw,
             )?;
-            let plane = Plane { s, source };
+            let plane = Plane {
+                s,
+                source,
+                skill: None,
+            };
             let trigger = SupervisorTrigger::RunCompleted {
                 conversation_id: id.into(),
                 receipt: receipt.clone(),

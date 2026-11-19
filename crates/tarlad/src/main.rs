@@ -5,6 +5,7 @@ mod fleet;
 mod handoff;
 mod hooks;
 mod peers;
+mod skills;
 mod slot_reports;
 mod terminal;
 mod transcript;

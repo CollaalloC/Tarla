@@ -49,13 +49,29 @@ jobs:
           echo "TARLA_TEST_HERDR=$PWD/target/debug/herdr-core" >> "$GITHUB_ENV"
       - if: runner.os == 'Linux'
         run: python3 tests/install_test_networks.py "$GITHUB_ENV"
+      - name: Build daemon and CLI for acceptance
+        if: runner.os == 'Linux'
+        id: binaries
+        run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
-      - if: runner.os == 'Linux'
+      - name: Upstream terminal and network adapters
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: cargo test --locked -p tarla-sidecar --test real -- --ignored
-      - if: runner.os == 'Linux'
+      - name: Framed terminal observer
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: cargo test --locked -p tarlad private_observer_streams -- --ignored
-      - if: runner.os == 'Linux'
-        run: cargo build --workspace --locked && python3 tests/acceptance.py && python3 tests/pinned.py && python3 tests/mesh_acceptance.py
+      - name: Cross-node recovery and terminal grants
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: python3 tests/acceptance.py
+      - name: Workspace skill activation
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: python3 tests/skills.py
+      - name: Pinned sessions and handoff
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: python3 tests/pinned.py
+      - name: Isolated EasyTier mesh
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: python3 tests/mesh_acceptance.py
   client:
     runs-on: ubuntu-latest
     defaults:

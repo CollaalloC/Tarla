@@ -229,7 +229,8 @@ async fn real_easytier_two_node_private_ingress() -> io::Result<()> {
 
     let (tmp, tools, _) = fixture("TARLA_TEST_EASYTIER", "easytier")?;
     std::env::set_var("TARLA_TEST_MESH_PAIR_SECRET", "paired-test");
-    let net = |peers| NetworkSpec::EasyTier {
+    let net = |ipv4: &str, peers| NetworkSpec::EasyTierStatic {
+        ipv4: ipv4.to_owned(),
         network_name: "same-mesh".into(),
         secret_env: "TARLA_TEST_MESH_PAIR_SECRET".into(),
         peers,
@@ -238,51 +239,73 @@ async fn real_easytier_two_node_private_ingress() -> io::Result<()> {
     let b = tmp.path().join("b");
     let api = echo_server().await?;
     let other = echo_server().await?;
-    let _a = tarla_sidecar::start_network_for(&tools, &a, &net(vec![]), api).await?;
+    let _a =
+        tarla_sidecar::start_network_for(&tools, &a, &net("10.74.64.1/24", vec![]), api).await?;
     let info = timeout(Duration::from_secs(12), async {
         loop {
             if let Ok(v) = node_info(&a).await {
-                if v["ipv4_addr"].as_str().is_some_and(|s| s.contains('/')) {
+                let listeners = v["listeners"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|s| s.as_str());
+                if v["ipv4_addr"] == "10.74.64.1/24"
+                    && listeners.into_iter().any(|s| s.starts_with("tcp://"))
+                {
                     break v;
                 }
             }
             sleep(Duration::from_millis(150)).await
         }
     })
-    .await?;
-    let node_ip: Ipv4Addr = info["ipv4_addr"]
-        .as_str()
-        .unwrap()
-        .split('/')
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap();
-    let listener = info["listeners"]
+    .await
+    .map_err(|_| {
+        io::Error::other("primary overlay did not acquire configured address and TCP listener")
+    })?;
+    let node_ip = Ipv4Addr::new(10, 74, 64, 1);
+    let advertised = info["listeners"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|v| v.as_str())
-        .find(|a| a.starts_with("tcp://"))
+        .find_map(|v| v.strip_prefix("tcp://"))
         .unwrap()
-        .replace("0.0.0.0", "127.0.0.1");
-    let _b = start_network(&tools, &b, &net(vec![listener])).await?;
+        .parse::<SocketAddr>()
+        .map_err(|_| io::Error::other("unexpected EasyTier listener address"))?;
+    // Both native binaries run on this runner. Explicitly connect via loopback
+    // even when the runner advertises an external or container-only interface.
+    let listener = format!("tcp://127.0.0.1:{}", advertised.port());
+    let _b = start_network(&tools, &b, &net("10.74.64.2/24", vec![listener])).await?;
     let endpoint: serde_json::Value = serde_json::from_slice(&fs::read(b.join("easytier.json"))?)?;
     let proxy: SocketAddr = endpoint["socks5"].as_str().unwrap().parse().unwrap();
-    timeout(Duration::from_secs(20), async {
+    let mut last_error = String::new();
+    let connected = timeout(Duration::from_secs(35), async {
         loop {
-            if let Ok(Ok(())) = timeout(
-                Duration::from_secs(2),
+            match timeout(
+                Duration::from_secs(3),
                 proxy_echo(proxy, node_ip, api.port()),
             )
             .await
             {
-                break;
+                Ok(Ok(())) => break,
+                Ok(Err(e)) => last_error = e.to_string(),
+                Err(_) => last_error = "timed out waiting for TCP echo".to_owned(),
             }
-            sleep(Duration::from_millis(150)).await;
+            sleep(Duration::from_millis(200)).await;
         }
     })
-    .await?;
+    .await;
+    if connected.is_err() {
+        let b_info = node_info(&b).await?;
+        return Err(io::Error::other(format!(
+            "two-node echo failed: {}; A={}, B={}, loopback seed port={}, app port={}",
+            last_error,
+            info["ipv4_addr"],
+            b_info["ipv4_addr"],
+            advertised.port(),
+            api.port()
+        )));
+    }
     assert!(!matches!(
         timeout(
             Duration::from_secs(2),

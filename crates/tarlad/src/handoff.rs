@@ -173,10 +173,11 @@ pub fn pinned(
     text: &str,
     source: &str,
     run_id: String,
+    skill: Option<&skills::Selection>,
 ) -> Result<Option<String>> {
     let db = s.db()?;
     let command = text.trim();
-    let mut prompt = command;
+    let mut prompt = skill.map(|v| v.task.as_str()).unwrap_or(command);
     let replay=list(&db,"SELECT run_id,target_node_id,target_slot_id FROM runs WHERE run_id=? AND conversation_id=?",&[&run_id,&conv])?;
     if let Some(row) = replay.first() {
         return Ok(Some(row.to_string()));
@@ -228,7 +229,7 @@ pub fn pinned(
             context.push(prior)
         }
     }
-    Ok(Some(fleet::dispatch(s,conv,&json!({"goal":prompt,"node_id":node,"slot_id":slot,"pinned_workdir":path,"pin_epoch":epoch,"distilled_context":context}),Some(run_id))?.to_string()))
+    Ok(Some(fleet::dispatch_selected(s,conv,&json!({"goal":prompt,"node_id":node,"slot_id":slot,"pinned_workdir":path,"pin_epoch":epoch,"distilled_context":context}),Some(run_id),skill)?.to_string()))
 }
 fn epoch(db: &Connection, conv: &str) -> Result<(String, String)> {
     Ok(db

@@ -31,14 +31,16 @@ def configure(node, peer, local_ip, peer_ip, seeds):
     cfg.write_text(body + 'token_env = "TARLA_PAIR_TEST"\n')
 
 
-def info(node):
+def info(node, expected):
     endpoint = json.loads((node.dir / "runtime" / "easytier.json").read_text())
     result = subprocess.run([os.environ["TARLA_TEST_EASYTIER_CLI"], "-p", endpoint["rpc"],
                              "-o", "json", "node", "info"], capture_output=True, timeout=5)
     if result.returncode == 0:
         # Upstream includes private config in this output. Return only network addresses.
         record = json.loads(result.stdout)
-        return record.get("ipv4_addr"), record.get("listeners", [])
+        ip, listeners = record.get("ipv4_addr"), record.get("listeners", [])
+        if ip == expected + "/24" and any(url.startswith("tcp://") for url in listeners):
+            return ip, listeners
 
 
 def run(tmp):
@@ -51,13 +53,14 @@ def run(tmp):
     with contextlib.ExitStack() as cleanup:
         cleanup.callback(a.stop)
         a.start(secret)
-        reported, listeners = until(lambda: info(a), "primary EasyTier registered")
+        reported, listeners = until(lambda: info(a, ip_a), "primary EasyTier registered")
         assert reported == ip_a + "/24", "static primary overlay address"
-        seed = next(url for url in listeners if url.startswith("tcp://")).replace("0.0.0.0", "127.0.0.1")
+        listener = next(url for url in listeners if url.startswith("tcp://"))
+        seed = "tcp://127.0.0.1:" + listener.rsplit(":", 1)[1]
         configure(b, a, ip_b, ip_a, [seed])
         cleanup.callback(b.stop)
         b.start(secret)
-        reported, _ = until(lambda: info(b), "secondary EasyTier registered")
+        reported, _ = until(lambda: info(b, ip_b), "secondary EasyTier registered")
         assert reported == ip_b + "/24", "static executor overlay address"
         memory = {"memory_id": "mesh", "scope": "global", "content": "live overlay", "base_version": 0}
         assert a.api("/v1/memories", memory)["status"] == "applied"

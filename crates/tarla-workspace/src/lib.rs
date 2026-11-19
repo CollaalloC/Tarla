@@ -305,9 +305,15 @@ impl Workspace {
             soul,
         })
     }
-    pub fn skills(&self) -> Result<Vec<Skill>> {
-        let mut skills = vec![];
-        for entry in fs::read_dir(self.root.join("skills"))? {
+    /// Discover workspace-local skill names without loading any instructions.
+    pub fn skill_names(&self) -> Result<Vec<String>> {
+        let dir = self.root.join("skills");
+        ensure!(
+            fs::symlink_metadata(&dir)?.is_dir(),
+            "skills must be a workspace directory"
+        );
+        let mut names = Vec::new();
+        for entry in fs::read_dir(dir)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
@@ -317,17 +323,44 @@ impl Workspace {
                 .into_string()
                 .map_err(|_| anyhow::anyhow!("invalid skill name"))?;
             validate_name(&name)?;
-            let path = entry.path().join("SKILL.md");
-            if fs::symlink_metadata(&path).is_err() {
-                continue;
+            match fs::symlink_metadata(entry.path().join("SKILL.md")) {
+                Ok(m) if m.is_file() => names.push(name),
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
             }
-            regular(&path)?;
-            ensure!(fs::metadata(&path)?.len() <= 256 * 1024, "skill too large");
-            let content = fs::read_to_string(path)?;
-            skills.push(Skill { name, content });
         }
-        skills.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(skills)
+        names.sort();
+        Ok(names)
+    }
+    pub fn load_skill(&self, name: &str) -> Result<Skill> {
+        validate_name(name)?;
+        let dir = self.root.join("skills");
+        ensure!(
+            fs::symlink_metadata(&dir)?.is_dir(),
+            "skills must be a workspace directory"
+        );
+        let package = dir.join(name);
+        ensure!(
+            fs::symlink_metadata(&package)
+                .with_context(|| format!("unknown workspace skill '{name}'"))?
+                .is_dir(),
+            "skill directory must belong to this workspace"
+        );
+        let path = package.join("SKILL.md");
+        regular(&path)?;
+        ensure!(fs::metadata(&path)?.len() <= 256 * 1024, "skill too large");
+        let content = fs::read_to_string(path)?;
+        Ok(Skill {
+            name: name.to_owned(),
+            content,
+        })
+    }
+    pub fn skills(&self) -> Result<Vec<Skill>> {
+        self.skill_names()?
+            .iter()
+            .map(|name| self.load_skill(name))
+            .collect()
     }
 }
 #[derive(Debug, Serialize)]

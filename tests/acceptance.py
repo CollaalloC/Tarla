@@ -1,4 +1,5 @@
 """Black-box acceptance using two actual daemons, private homes, and a local model fixture."""
+import base64
 import contextlib
 import hashlib
 import json
@@ -127,7 +128,11 @@ def install_test_slot(node, binary):
         "m=json.loads(sys.argv[1])\n"
         "with open('launches', 'a') as f: print(m['run_id'],file=f,flush=True)\n"
         "print('ready', flush=True)\n"
-        "time.sleep(5)\n"
+        "if m['objective']=='terminal check':\n"
+        "    value=input().strip()\n"
+        "    with open('terminal-result','w') as f: f.write(value)\n"
+        "    print('terminal acknowledged',flush=True)\n"
+        "else: time.sleep(5)\n"
         "print('fixture job completed', flush=True)\n")
     with (node.dir/"workspace.toml").open("a") as cfg:
         cfg.write('\n[[slots]]\nslot_id="fixture"\ndriver="local"\nmodel_family="fixture"\n'
@@ -154,6 +159,47 @@ def assert_remote_execution(chief, worker, work, secret):
           "RunCompleted wake")
     assert marker.read_text().splitlines()==[run_id]
     print("PASS real private herdr-core, cross-node mission, executor and supervisor restart, exactly one launch, active completion")
+
+def websocket_status(node, path, ticket):
+    # Exercise the same HTTP Upgrade used by the App; no workspace API credential is sent.
+    key = base64.b64encode(os.urandom(16)).decode()
+    with socket.create_connection(("127.0.0.1",node.port),timeout=5) as conn:
+        headers = [f"GET {path} HTTP/1.1", f"Host: 127.0.0.1:{node.port}",
+                   "Connection: Upgrade", "Upgrade: websocket", "Sec-WebSocket-Version: 13",
+                   f"Sec-WebSocket-Key: {key}", f"Authorization: Bearer {ticket}", "", ""]
+        conn.sendall("\r\n".join(headers).encode())
+        with conn.makefile("rb") as reply:
+            return int(reply.readline().split()[1])
+
+
+def assert_remote_terminal(chief, worker, work):
+    rid = chief.api("/v1/runs",{"conversation_id":"jobs","goal":"terminal check"})["run_id"]
+    path = "/v1/runs/" + rid
+    until(lambda: chief.api(path).get("hc_terminal_id"),"terminal on paired executor")
+    observe = chief.api(path + "/attach",{"mode":"observe"})
+    assert observe["node_url"] == worker.url and observe["node_id"] == worker.name
+    ws_path = "/v1/terminal/" + rid
+    ticket = observe["ticket"]
+    assert websocket_status(chief,ws_path,ticket) == 401
+    assert websocket_status(worker,ws_path,ticket) == 101
+    assert websocket_status(worker,ws_path,ticket) == 401
+    command = [BIN/"tarla","--home",chief.home,"--workspace",SPACE,"--url",chief.url,
+               "attach",rid,"--interactive"]
+    client = subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+    try:
+        client.stdin.write(b"paired terminal input\r")
+        client.stdin.flush()
+        until(lambda: (work/"terminal-result").is_file(),"interactive input via scoped CLI")
+        assert (work/"terminal-result").read_text() == "paired terminal input"
+        until(lambda: chief.api(path)["observed_state"]=="succeeded","terminal task exit")
+    finally:
+        client.stdin.close()
+        try: client.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            client.terminate()
+            client.wait(timeout=5)
+    assert client.returncode==0, client.stderr.read().decode()
+    print("PASS remote terminal ticket scope, single redemption, authenticated CLI interactive attach")
 
 def test_nodes(path, model):
     chief = Node(path / "primary", "chief", "supervisor_only")
@@ -199,6 +245,7 @@ def test_nodes(path, model):
         assert any("pref" in str(item) for item in chief.api("/v1/actions"))
         if work is not None:
             assert_remote_execution(chief,worker,work,secret)
+            assert_remote_terminal(chief,worker,work)
         snap = path / "handover.db"
         frozen = subprocess.run([BIN/"tarla","--home",chief.home,"--workspace",SPACE,
                                  "supervisor","handover","--to","backup","--snapshot",snap],

@@ -99,6 +99,15 @@ pub fn snapshots(s: &Service) -> Result<Vec<AgentSlotSnapshot>> {
     Ok(slots)
 }
 pub fn dispatch(s: &Service, conv: &str, arg: &Value, run_id: Option<String>) -> Result<Value> {
+    dispatch_selected(s, conv, arg, run_id, None)
+}
+pub fn dispatch_selected(
+    s: &Service,
+    conv: &str,
+    arg: &Value,
+    run_id: Option<String>,
+    skill: Option<&skills::Selection>,
+) -> Result<Value> {
     if !s.is_supervisor() {
         bail!("only the designated supervisor can dispatch")
     }
@@ -178,6 +187,9 @@ pub fn dispatch(s: &Service, conv: &str, arg: &Value, run_id: Option<String>) ->
         .filter(|s| !s.trim().is_empty())
         .context("objective required")?;
     let mut decisions = strings(arg, "distilled_context")?;
+    if let Some(skill) = skill {
+        decisions.insert(0, skill.instructions.clone());
+    }
     for item in tarla_context::related_decisions(&c, conv, goal, 5)? {
         if !decisions.contains(&item) {
             decisions.push(item);
@@ -206,6 +218,11 @@ pub fn dispatch(s: &Service, conv: &str, arg: &Value, run_id: Option<String>) ->
         },
         s.ws.config.context_policy.mission_packet_max_tokens,
     )?;
+    if let Some(skill) = skill {
+        if packet.distilled_context.first() != Some(&skill.instructions) {
+            bail!("selected skill does not fit the complete bounded mission; shorten the skill or task")
+        }
+    }
     let dbtx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     insert_run(
         &dbtx,
