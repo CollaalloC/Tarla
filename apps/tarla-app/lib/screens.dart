@@ -85,6 +85,7 @@ Future<void> handleAction(
 }) async {
   final conflict = row['kind'] == 'memory_conflict';
   final login = row['kind'] == 'auth_expired';
+  final canResolve = row['kind'] == 'approval' || (conflict && !readOnly);
   final response = await showDialog<String>(
     context: context,
     builder: (ctx) => AlertDialog(
@@ -103,7 +104,7 @@ Future<void> handleAction(
           onPressed: () => Navigator.pop(ctx),
           child: const Text('关闭'),
         ),
-        if (!login && !readOnly) ...[
+        if (canResolve) ...[
           OutlinedButton(
             onPressed: () => Navigator.pop(ctx, 'rejected'),
             child: Text(conflict ? '保留当前版本' : '拒绝'),

@@ -288,6 +288,9 @@ class _SessionState extends State<Session> {
       if (mounted) await refresh();
     }
 
+    Future<void> openRun(String id) =>
+        openPage(RunPage(api: supervisor, executor: executor, id: id));
+
     void chat(String id) =>
         openPage(ChatPage(api: client, id: id, readOnly: direct));
     return Scaffold(
@@ -375,19 +378,21 @@ class _SessionState extends State<Session> {
                               overflow: TextOverflow.ellipsis,
                             ),
                             subtitle: Text('${row['observed_state']}'),
-                            onTap: () => openPage(
-                              RunPage(
-                                api: supervisor,
-                                executor: executor,
-                                id: row['run_id'] as String,
-                              ),
-                            ),
+                            onTap: () => openRun(row['run_id'] as String),
                           ),
                           2 => ListTile(
                             leading: const Icon(Icons.assignment_outlined),
                             title: Text('${row['title']}'),
-                            subtitle: Text('${row['kind']}'),
+                            subtitle: Text(
+                              row['kind'] == 'terminal_input'
+                                  ? '打开任务并接管终端'
+                                  : '${row['kind']}',
+                            ),
                             onTap: () async {
+                              if (row['kind'] == 'terminal_input') {
+                                await openRun(row['run_id'] as String);
+                                return;
+                              }
                               await handleAction(
                                 context,
                                 client,

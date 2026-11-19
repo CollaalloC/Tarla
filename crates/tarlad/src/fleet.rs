@@ -130,24 +130,59 @@ pub fn dispatch(s: &Service, conv: &str, arg: &Value, run_id: Option<String>) ->
         required_caps: strings(arg, "required_caps")?,
         exclude_model_family: arg["exclude_model_family"].as_str().map(String::from),
     };
-    if require.role==tarla_scheduler::AgentRole::Reviewer && require.exclude_model_family.is_none(){
+    if require.role == tarla_scheduler::AgentRole::Reviewer
+        && require.exclude_model_family.is_none()
+    {
         require.exclude_model_family=c.query_row("SELECT q.model_family FROM service_requirements q JOIN runs r USING(run_id) WHERE r.conversation_id=? AND q.role IN ('architect','implementer') ORDER BY r.created_at DESC,r.rowid DESC LIMIT 1",[conv],|r|r.get(0)).optional()?;
-        if require.exclude_model_family.is_none(){bail!("review requires the model family of the original author")}
+        if require.exclude_model_family.is_none() {
+            bail!("review requires the model family of the original author")
+        }
     }
-    let role=serde_json::to_value(require.role)?.as_str().context("unknown role")?.to_owned();
-    let preferred=s.ws.config.extra.get("scheduler").and_then(|v|v.get("roles")).and_then(|v|v.get(&role)).and_then(toml::Value::as_array);
-    let eligible=preferred.into_iter().flatten().filter_map(|v|v.as_str()).find_map(|id|{
-        let matching:Vec<_>=slots.iter().filter(|s|s.slot_id==id).cloned().collect();
-        select_best_slot(&require,&matching,now()).cloned()
-    });
-    let candidate=eligible.as_ref().or_else(||select_best_slot(&require,&slots,now())).context("no eligible agent slot")?;
+    let role = serde_json::to_value(require.role)?
+        .as_str()
+        .context("unknown role")?
+        .to_owned();
+    let preferred =
+        s.ws.config
+            .extra
+            .get("scheduler")
+            .and_then(|v| v.get("roles"))
+            .and_then(|v| v.get(&role))
+            .and_then(toml::Value::as_array);
+    let eligible = preferred
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .find_map(|id| {
+            let matching: Vec<_> = slots.iter().filter(|s| s.slot_id == id).cloned().collect();
+            select_best_slot(&require, &matching, now()).cloned()
+        });
+    let candidate = eligible
+        .as_ref()
+        .or_else(|| select_best_slot(&require, &slots, now()))
+        .context("no eligible agent slot")?;
     // Reject an impossible return budget before the remote program can change its workspace.
-    tarla_context::bound_receipt(RunReceipt{run_id:rid.clone(),final_state:"succeeded".into(),executive_summary:"Done.".into(),artifact_refs:vec![],s0_transcript_pointer:format!("node:{}/run:{rid}/transcript.jsonl",candidate.node_id)},s.ws.config.context_policy.run_receipt_max_tokens)?;
+    tarla_context::bound_receipt(
+        RunReceipt {
+            run_id: rid.clone(),
+            final_state: "succeeded".into(),
+            executive_summary: "Done.".into(),
+            artifact_refs: vec![],
+            s0_transcript_pointer: format!("node:{}/run:{rid}/transcript.jsonl", candidate.node_id),
+        },
+        s.ws.config.context_policy.run_receipt_max_tokens,
+    )?;
     let goal = arg["objective"]
         .as_str()
         .or_else(|| arg["goal"].as_str())
         .filter(|s| !s.trim().is_empty())
         .context("objective required")?;
+    let mut decisions = strings(arg, "distilled_context")?;
+    for item in tarla_context::related_decisions(&c, conv, goal, 5)? {
+        if !decisions.contains(&item) {
+            decisions.push(item);
+        }
+    }
     let m = SqliteMemory::new(&mut c, s.id(), s.node());
     let mut acceptance = strings(arg, "acceptance_criteria")?;
     if acceptance.is_empty() {
@@ -162,7 +197,7 @@ pub fn dispatch(s: &Service, conv: &str, arg: &Value, run_id: Option<String>) ->
             workspace_id: s.id().into(),
             objective: goal.into(),
             acceptance_criteria: acceptance,
-            distilled_context: strings(arg, "distilled_context")?,
+            distilled_context: decisions,
             project_memory_snapshot: m.prefetch_frozen_snapshot(
                 arg["scope"].as_str().unwrap_or("global"),
                 s.ws.config.memory.prefetch_token_budget,
@@ -180,7 +215,10 @@ pub fn dispatch(s: &Service, conv: &str, arg: &Value, run_id: Option<String>) ->
         &candidate.slot_id,
         &packet,
     )?;
-    dbtx.execute("INSERT INTO service_requirements VALUES(?,?,?,?)",params![rid,role,candidate.model_family,arg.to_string()])?;
+    dbtx.execute(
+        "INSERT INTO service_requirements VALUES(?,?,?,?)",
+        params![rid, role, candidate.model_family, arg.to_string()],
+    )?;
     if let Some(path) = arg["pinned_workdir"].as_str() {
         handoff::register(
             &dbtx,

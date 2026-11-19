@@ -23,14 +23,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - if: runner.os == 'Linux'
-        run: python3 tests/install_test_herdr.py "$GITHUB_ENV"
+        run: |
+          python3 tests/install_test_herdr.py "$GITHUB_ENV"
+          python3 tests/install_test_networks.py "$GITHUB_ENV"
       - run: cargo test --workspace --locked
       - if: runner.os == 'Linux'
-        run: cargo test --locked -p tarla-sidecar --test real herdr -- --ignored
+        run: cargo test --locked -p tarla-sidecar --test real -- --ignored
       - if: runner.os == 'Linux'
         run: cargo test --locked -p tarlad private_observer_streams -- --ignored
       - if: runner.os == 'Linux'
-        run: cargo build --workspace --locked && python3 tests/acceptance.py
+        run: cargo build --workspace --locked && python3 tests/acceptance.py && python3 tests/mesh_acceptance.py
   client:
     runs-on: ubuntu-latest
     defaults:

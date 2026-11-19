@@ -99,5 +99,7 @@ python3 tests/acceptance.py
 
 - [Flutter 客户端及真机/模拟器连接](apps/tarla-app/README.md)
 - [飞书、Telegram、Slack、Discord 网关的配置与配对](crates/tarla-gateway/README.md)
+- [记忆后端、外部索引与离线行为](crates/tarla-memory/README.md)
+- [运行状态、执行机权限与双网配置](crates/tarlad/README.md)
 - [原始工程规范](docs/Tarla_Architecture_Spec.md)
 - [上游组件与致谢](docs/upstreams.md)

@@ -241,10 +241,22 @@ async fn main() -> Result<()> {
                 .map(toml::Value::try_into)
                 .transpose()?
                 .unwrap_or_default();
-            let spec=if let Some(ip)=network.extra.get("easytier_ipv4").and_then(|x|x.as_str()){
-                tarla_sidecar::NetworkSpec::EasyTierStatic{network_name:network.easytier_network_name.clone(),secret_env:key,peers:seeds,ipv4:ip.into()}
-            }else{tarla_sidecar::NetworkSpec::EasyTier{network_name:network.easytier_network_name.clone(),secret_env:key,peers:seeds}};
-            specs.push(("easytier",spec));
+            let spec = if let Some(ip) = network.extra.get("easytier_ipv4").and_then(|x| x.as_str())
+            {
+                tarla_sidecar::NetworkSpec::EasyTierStatic {
+                    network_name: network.easytier_network_name.clone(),
+                    secret_env: key,
+                    peers: seeds,
+                    ipv4: ip.into(),
+                }
+            } else {
+                tarla_sidecar::NetworkSpec::EasyTier {
+                    network_name: network.easytier_network_name.clone(),
+                    secret_env: key,
+                    peers: seeds,
+                }
+            };
+            specs.push(("easytier", spec));
         }
         if network.enable_tailscale {
             specs.push(("tailscale", tarla_sidecar::NetworkSpec::Tailscale));
