@@ -1,0 +1,83 @@
+name: Flutter native builds
+on:
+  push:
+    paths:
+      - "apps/tarla-app/**"
+      - ".github/workflows/flutter-platforms.yml"
+  pull_request:
+    paths:
+      - "apps/tarla-app/**"
+      - ".github/workflows/flutter-platforms.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flutter-native-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: android
+            runner: ubuntu-24.04
+            args: apk --debug
+            artifact: build/app/outputs/flutter-apk/app-debug.apk
+          - target: ios-simulator
+            runner: macos-15
+            args: ios --simulator --debug --no-codesign
+            artifact: build/ios/iphonesimulator/Runner.app
+          - target: macos
+            runner: macos-15
+            args: macos --debug
+            artifact: build/macos/Build/Products/Debug/*.app
+          - target: linux
+            runner: ubuntu-24.04
+            args: linux --release
+            artifact: build/linux/x64/release/bundle
+          - target: windows
+            runner: windows-2022
+            args: windows --release
+            artifact: build/windows/x64/runner/Release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    defaults:
+      run:
+        working-directory: apps/tarla-app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        if: matrix.target == 'android'
+        with:
+          distribution: temurin
+          java-version: '17'
+      - if: matrix.target == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libstdc++-12-dev libsecret-1-dev libjsoncpp-dev
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.3'
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter build ${{ matrix.args }}
+      - name: Preserve bundle permissions
+        if: runner.os != 'Windows'
+        shell: bash
+        run: tar -czf ${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+      - uses: actions/upload-artifact@v4
+        if: runner.os != 'Windows'
+        with:
+          name: tarla-${{ matrix.target }}
+          path: apps/tarla-app/${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: tarla-windows
+          path: apps/tarla-app/${{ matrix.artifact }}
+          if-no-files-found: error

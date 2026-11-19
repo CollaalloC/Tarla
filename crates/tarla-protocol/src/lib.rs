@@ -54,30 +54,62 @@ impl AttachLease {
         mac.update(b"tarla/attach/v1\0");
         Ok(mac)
     }
-    pub fn issue(secret: &[u8], workspace: &str, node: &str, run: &str, terminal: &str, mode: AttachMode, now: i64) -> Result<String> {
-        for field in [workspace,node,run,terminal] {
-            ensure!(!field.is_empty() && field.len() <= 256, "invalid lease scope");
+    pub fn issue(
+        secret: &[u8],
+        workspace: &str,
+        node: &str,
+        run: &str,
+        terminal: &str,
+        mode: AttachMode,
+        now: i64,
+    ) -> Result<String> {
+        for field in [workspace, node, run, terminal] {
+            ensure!(
+                !field.is_empty() && field.len() <= 256,
+                "invalid lease scope"
+            );
         }
         let lease = Self {
-            workspace_id: workspace.into(), node_id: node.into(), run_id: run.into(),
-            hc_terminal_id: terminal.into(), mode, nonce: Uuid::new_v4().to_string(),
+            workspace_id: workspace.into(),
+            node_id: node.into(),
+            run_id: run.into(),
+            hc_terminal_id: terminal.into(),
+            mode,
+            nonce: Uuid::new_v4().to_string(),
             expires_at: now.checked_add(60).context("invalid clock")?,
         };
         let payload = B64.encode(serde_json::to_vec(&lease)?);
         let mut mac = Self::mac(secret)?;
         mac.update(payload.as_bytes());
-        Ok(format!("{}.{}", payload, B64.encode(mac.finalize().into_bytes())))
+        Ok(format!(
+            "{}.{}",
+            payload,
+            B64.encode(mac.finalize().into_bytes())
+        ))
     }
     /// The executor must atomically consume the verified nonce before bridging any bytes.
-    pub fn verify(ticket: &str, secret: &[u8], workspace: &str, node: &str, now: i64) -> Result<Self> {
+    pub fn verify(
+        ticket: &str,
+        secret: &[u8],
+        workspace: &str,
+        node: &str,
+        now: i64,
+    ) -> Result<Self> {
         ensure!(ticket.len() <= 8192, "ticket too large");
         let (body, signature) = ticket.split_once('.').context("invalid ticket")?;
         let mut mac = Self::mac(secret)?;
         mac.update(body.as_bytes());
-        mac.verify_slice(&B64.decode(signature)?).map_err(|_| anyhow::anyhow!("invalid signature"))?;
+        mac.verify_slice(&B64.decode(signature)?)
+            .map_err(|_| anyhow::anyhow!("invalid signature"))?;
         let lease: Self = serde_json::from_slice(&B64.decode(body)?)?;
-        ensure!(lease.workspace_id == workspace && lease.node_id == node, "wrong ticket audience");
-        ensure!(lease.expires_at > now && lease.expires_at <= now.saturating_add(60), "ticket outside validity window");
+        ensure!(
+            lease.workspace_id == workspace && lease.node_id == node,
+            "wrong ticket audience"
+        );
+        ensure!(
+            lease.expires_at > now && lease.expires_at <= now.saturating_add(60),
+            "ticket outside validity window"
+        );
         Ok(lease)
     }
 }
@@ -87,14 +119,20 @@ mod tests {
     use super::*;
     #[test]
     fn ticket_is_bound_to_audience_key_and_time() {
-        let key = [73;32];
-        let t=AttachLease::issue(&key,"w","n","r","terminal",AttachMode::Observe,5).unwrap();
-        let lease=AttachLease::verify(&t,&key,"w","n",64).unwrap();
-        assert_eq!(lease.mode,AttachMode::Observe);
-        assert_eq!(lease.hc_terminal_id,"terminal");
-        for (w,n,time) in [("other","n",5),("w","other",5),("w","n",65),("w","n",0)] {
-            assert!(AttachLease::verify(&t,&key,w,n,time).is_err());
+        let key = [73; 32];
+        let t =
+            AttachLease::issue(&key, "w", "n", "r", "terminal", AttachMode::Observe, 5).unwrap();
+        let lease = AttachLease::verify(&t, &key, "w", "n", 64).unwrap();
+        assert_eq!(lease.mode, AttachMode::Observe);
+        assert_eq!(lease.hc_terminal_id, "terminal");
+        for (w, n, time) in [
+            ("other", "n", 5),
+            ("w", "other", 5),
+            ("w", "n", 65),
+            ("w", "n", 0),
+        ] {
+            assert!(AttachLease::verify(&t, &key, w, n, time).is_err());
         }
-        assert!(AttachLease::verify(&t,&[21;32],"w","n",5).is_err());
+        assert!(AttachLease::verify(&t, &[21; 32], "w", "n", 5).is_err());
     }
 }

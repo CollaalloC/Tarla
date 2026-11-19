@@ -1,0 +1,17 @@
+name: tarla_app
+description: Tarla workspace client for mobile and desktop
+publish_to: none
+version: 0.1.0+1
+environment:
+  sdk: ">=3.6.0 <4.0.0"
+dependencies:
+  flutter:
+    sdk: flutter
+  xterm: ^4.0.0
+  crypto: ^3.0.6
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  test: ^1.26.0
+flutter:
+  uses-material-design: true

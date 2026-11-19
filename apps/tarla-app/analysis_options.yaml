@@ -1,0 +1,6 @@
+linter:
+  rules:
+    - avoid_print
+    - await_only_futures
+    - cancel_subscriptions
+    - use_build_context_synchronously

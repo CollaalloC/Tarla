@@ -1,0 +1,23 @@
+[package]
+name = "tarla-gateway"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aes = "0.8"
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["macros","rt-multi-thread","net","time","sync"] }
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
+ring = "0.17"
+hex = "0.4"
+serde_urlencoded = "0.7"

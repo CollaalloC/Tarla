@@ -1,0 +1,24 @@
+[package]
+name = "tarla-cli"
+version.workspace = true
+edition.workspace = true
+publish = false
+[[bin]]
+name = "tarla"
+path = "src/main.rs"
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+toml.workspace = true
+uuid.workspace = true
+tarla-workspace = { path = "../tarla-workspace" }
+clap = { version = "4", features = ["derive","env"] }
+futures-util = "0.3"
+tokio-tungstenite = {version = "0.28", features=["rustls-tls-webpki-roots"]}
+crossterm = "0.29"
+rusqlite.workspace = true
+tempfile.workspace = true
+fs2 = "0.4"
+sha2.workspace = true

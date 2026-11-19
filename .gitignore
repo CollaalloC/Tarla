@@ -5,3 +5,4 @@
 *.token
 .env
 *.db*
+__pycache__/
