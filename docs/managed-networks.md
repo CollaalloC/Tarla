@@ -51,7 +51,7 @@ tailscale --socket="$HOME/.tarla/workspaces/work/runtime/ts.sock" up --accept-dn
 
 ## 验证
 
-`tests/mesh_acceptance.py` 启动两个真实的 `tarlad` 和两个 EasyTier 进程，检查经过虚拟 IP 的 S2 同步，并在执行节点重启后验证离线增量补传。Rust 集成测试另外验证旁路端口不能通过 EasyTier 访问。网络测试的本地运行命令如下。环境变量应指向与 CI 一致的上游二进制。
+`tests/mesh_acceptance.py` 启动两个真实的 `tarlad` 和两个 EasyTier 进程，检查经过虚拟 IP 的 S2 同步，并分别重启主管和执行节点，验证固定种子端口可以恢复组网并补传离线增量。Rust 集成测试另外验证旁路端口不能通过 EasyTier 访问。网络测试的本地运行命令如下。环境变量应指向与 CI 一致的上游二进制。
 
 ```sh
 cargo build --locked --workspace
@@ -61,4 +61,13 @@ cargo test --locked -p tarla-sidecar real_easytier -- --ignored
 python3 tests/mesh_acceptance.py
 ```
 
-`real_tailscale_loopback_socks` 验证 Tailscale 1.82.0 用户态守护进程启动及 SOCKS5 握手。测试连接独立 tailnet 并验证双节点登录需要有效的 Tailscale 身份。
+`real_tailscale_loopback_socks` 验证 Tailscale 1.82.0 用户态守护进程启动及 SOCKS5 握手。`tests/tailnet_acceptance.py` 已在 Linux CI 上通过双节点端到端验证。它启动 Headscale 0.26.1、本地 DERP 中继和私有 TLS CA，为两个独立的 `tailscaled` 签发一次性入网密钥，再通过各自的私有控制套接字完成登录。两个 `tarlad` 重启后复用已保存的节点身份，并通过真实 tailnet IP 同步 S2 记忆。复现该测试需要以下三种上游可执行文件。
+
+```sh
+export TARLA_TEST_HEADSCALE=/path/to/headscale
+export TARLA_TEST_TAILSCALED=/path/to/tailscaled
+export TARLA_TEST_TAILSCALE_CLI=/path/to/tailscale
+python3 tests/tailnet_acceptance.py
+```
+
+连入用户自己的 Tailscale 托管网络时，使用该 tailnet 的登录方式和管理员设定的 grants/ACL。
