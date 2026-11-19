@@ -112,21 +112,6 @@ jobs:
           xcrun simctl install "$device_id" build/ios/iphonesimulator/Runner.app
           xcrun simctl launch "$device_id" dev.tarla.client
           xcrun simctl terminate "$device_id" dev.tarla.client
-      - name: Enable Android emulator acceleration
-        if: matrix.target == 'android'
-        run: |
-          sudo chgrp "$(id -gn)" /dev/kvm
-          sudo chmod g+rw /dev/kvm
-      - name: Launch Tarla on Android emulator
-        if: matrix.target == 'android'
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 35
-          arch: x86_64
-          script: |
-            adb install -r apps/tarla-app/build/app/outputs/flutter-apk/app-debug.apk
-            adb shell am start -W -n dev.tarla.client/.MainActivity
-            adb shell pidof dev.tarla.client
       - name: Preserve bundle permissions
         if: runner.os != 'Windows'
         shell: bash
@@ -143,3 +128,31 @@ jobs:
           name: tarla-windows
           path: apps/tarla-app/${{ matrix.artifact }}
           if-no-files-found: error
+
+  android-emulator:
+    name: Android API 35 launch
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarla-android
+      - name: Extract the tested APK
+        run: tar -xzf android.tar.gz build/app/outputs/flutter-apk/app-debug.apk
+      - name: Enable Android emulator acceleration
+        run: |
+          sudo chgrp "$(id -gn)" /dev/kvm
+          sudo chmod g+rw /dev/kvm
+      - name: Launch Tarla on Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          disk-size: 2048M
+          ram-size: 2048M
+          script: |
+            adb install -r build/app/outputs/flutter-apk/app-debug.apk
+            adb shell am start -W -n dev.tarla.client/.MainActivity
+            adb shell pidof dev.tarla.client

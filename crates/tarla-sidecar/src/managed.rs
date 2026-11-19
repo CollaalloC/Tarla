@@ -388,7 +388,10 @@ async fn start_network_impl(
                     "socks5_proxy = \"socks5://{}\"\n",
                     "tcp_whitelist = [\"{}\"]\nudp_whitelist = [\"0\"]\n",
                     "[network_identity]\nnetwork_name = {}\nnetwork_secret = {}\n",
-                    "[flags]\nno_tun = true\nprivate_mode = true\n"
+                    // With no kernel TUN there are no overlay routes to exclude.
+                    // Pinning a connector to a physical NIC prevents loopback
+                    // (and some split-routed) bootstrap addresses from working.
+                    "[flags]\nno_tun = true\nbind_device = false\nprivate_mode = true\n"
                 ),
                 easytier_identity(&runtime)?,
                 address_config(spec)?,

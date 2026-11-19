@@ -181,6 +181,33 @@ async fn real_easytier_two_node_private_ingress() -> io::Result<()> {
         }
         Ok(serde_json::from_slice(&rst.stdout)?)
     }
+    async fn peer_summary(runtime: &std::path::Path) -> String {
+        let Some(cli) = std::env::var_os("TARLA_TEST_EASYTIER_CLI") else {
+            return "missing CLI".into();
+        };
+        let record = fs::read(runtime.join("easytier.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+        let Some(rpc) = record.as_ref().and_then(|r| r["rpc"].as_str()) else {
+            return "missing endpoint".into();
+        };
+        // This fixture owns synthetic peers only. 'peer' contains routing
+        // metadata, unlike 'node info', which can include network credentials.
+        let result = timeout(
+            Duration::from_secs(3),
+            tokio::process::Command::new(cli)
+                .args(["-p", rpc, "-o", "json", "peer"])
+                .output(),
+        )
+        .await;
+        match result {
+            Ok(Ok(r)) => String::from_utf8_lossy(&r.stdout)
+                .chars()
+                .take(2000)
+                .collect(),
+            _ => "peer diagnostics unavailable".into(),
+        }
+    }
     async fn proxy_echo(proxy: SocketAddr, target: Ipv4Addr, port: u16) -> io::Result<()> {
         let mut conn = TcpStream::connect(proxy).await?;
         conn.write_all(&[5, 1, 0]).await?;
@@ -298,12 +325,12 @@ async fn real_easytier_two_node_private_ingress() -> io::Result<()> {
     if connected.is_err() {
         let b_info = node_info(&b).await?;
         return Err(io::Error::other(format!(
-            "two-node echo failed: {}; A={}, B={}, loopback seed port={}, app port={}",
+            "two-node echo failed: {}; A={}, B={}, loopback seed port={}, app port={}, A peers={}, B peers={}",
             last_error,
             info["ipv4_addr"],
             b_info["ipv4_addr"],
             advertised.port(),
-            api.port()
+            api.port(), peer_summary(&a).await, peer_summary(&b).await
         )));
     }
     assert!(!matches!(

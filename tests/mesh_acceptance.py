@@ -43,6 +43,13 @@ def info(node, expected):
             return ip, listeners
 
 
+def peer_summary(node):
+    endpoint = json.loads((node.dir / "runtime/easytier.json").read_text())
+    result = subprocess.run([os.environ["TARLA_TEST_EASYTIER_CLI"], "-p", endpoint["rpc"],
+                             "-o", "json", "peer"], capture_output=True, timeout=5)
+    return result.stdout.decode(errors="replace")[:2000]
+
+
 def run(tmp):
     a = Node(tmp / "a", "chief", "supervisor_only")
     b = Node(tmp / "b", "worker", "executor_only")
@@ -64,7 +71,10 @@ def run(tmp):
         assert reported == ip_b + "/24", "static executor overlay address"
         memory = {"memory_id": "mesh", "scope": "global", "content": "live overlay", "base_version": 0}
         assert a.api("/v1/memories", memory)["status"] == "applied"
-        until(lambda: any(m["content"] == "live overlay" for m in b.api("/v1/memories")), "replication over overlay")
+        try:
+            until(lambda: any(m["content"] == "live overlay" for m in b.api("/v1/memories")), "replication over overlay")
+        except AssertionError as err:
+            raise AssertionError(f"overlay replication failed; primary: {peer_summary(a)}; worker: {peer_summary(b)}") from err
         identity = b.dir / "runtime/easytier-instance"
         before = identity.read_text()
         b.stop()
