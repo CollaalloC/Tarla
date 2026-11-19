@@ -127,8 +127,7 @@ fn switch(s: &Service, conv: &str, target: &str, source: &str) -> Result<String>
     let slots = fleet::snapshots(s)?;
     let old = slots
         .iter()
-        .find(|x| x.node_id == node && x.slot_id == slot)
-        .context("previous slot no longer available; use explicit binding")?;
+        .find(|x| x.node_id == node && x.slot_id == slot);
     let matches = |s: &AgentSlotSnapshot| {
         target.is_empty()
             || s.slot_id == target
@@ -140,13 +139,18 @@ fn switch(s: &Service, conv: &str, target: &str, source: &str) -> Result<String>
         .filter(|x| matches(x))
         .cloned()
         .collect::<Vec<_>>();
-    let choice = select_handoff(&req(s), old, &candidates, TurnBoundary::Checkpointed, now())
-        .map(|x| x.slot);
-    let selected = match choice {
-        Some(slot) => slot,
-        None if !target.is_empty() && matches(old) => old,
-        None => bail!("no eligible destination slot"),
-    };
+    let selected = if let Some(old) = old {
+        select_handoff(&req(s), old, &candidates, TurnBoundary::Checkpointed, now())
+            .map(|h| h.slot)
+            .or_else(|| {
+                (!target.is_empty() && matches(old))
+                    .then(|| select_best_slot(&req(s), std::slice::from_ref(old), now()))
+                    .flatten()
+            })
+    } else {
+        select_best_slot(&req(s), &candidates, now())
+    }
+    .context("no eligible destination slot")?;
     change(
         &tx,
         conv,
@@ -203,8 +207,7 @@ pub fn pinned(
         let old = slots
             .iter()
             .find(|x| x.node_id == node && x.slot_id == slot);
-        if old.is_some_and(|x| select_best_slot(&req(s), std::slice::from_ref(x), now()).is_none())
-        {
+        if old.is_none_or(|x| select_best_slot(&req(s), std::slice::from_ref(x), now()).is_none()) {
             switch(s, conv, "", source)?;
         }
     }
@@ -278,22 +281,23 @@ fn metadata_path(root: &Path, id: &str) -> PathBuf {
 fn argv_for(slot: &fleet::Slot, prompt: String, session: Option<&str>) -> Result<Vec<String>> {
     let mut args = slot.argv.clone();
     for opt in args.iter().skip(1) {
-        if matches!(
-            opt.split('=').next().unwrap_or(""),
-            "--ephemeral"
-                | "--last"
-                | "--continue"
-                | "-c-session"
-                | "--resume"
-                | "-r"
-                | "--session-id"
-                | "--no-session-persistence"
-                | "--fork-session"
-                | "--output-format"
-                | "--json"
-                | "resume"
-                | "fork"
-        ) {
+        if (slot.snapshot.driver != "codex" && opt == "-c")
+            || matches!(
+                opt.split('=').next().unwrap_or(""),
+                "--ephemeral"
+                    | "--last"
+                    | "--continue"
+                    | "--resume"
+                    | "-r"
+                    | "--session-id"
+                    | "--no-session-persistence"
+                    | "--fork-session"
+                    | "--output-format"
+                    | "--json"
+                    | "resume"
+                    | "fork"
+            )
+        {
             bail!("pinned driver manages its own session and output options")
         }
     }
@@ -472,4 +476,115 @@ pub fn peer_paths(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn slot(driver: &str) -> fleet::Slot {
+        let snapshot:AgentSlotSnapshot=serde_json::from_value(json!({"workspace_id":"work","node_id":"pc","slot_id":"s","driver":driver,"model_family":driver,
+        "supported_roles":["implementer"],"billing_tier":"prepaid_subscription","window_used_pct":2,"health":"healthy"})).unwrap();
+        fleet::Slot {
+            snapshot,
+            workdir: ".".into(),
+            argv: if driver == "codex" {
+                vec!["codex".into(), "exec".into()]
+            } else {
+                vec!["claude".into()]
+            },
+        }
+    }
+    #[test]
+    fn resume_exact_native_id_on_next_turn() {
+        let id = Uuid::now_v7().to_string();
+        for driver in ["claude", "codex"] {
+            let s = slot(driver);
+            let first = argv_for(&s, "first".into(), None).unwrap();
+            let mut out = Outcome::default();
+            if driver == "codex" {
+                assert_eq!(first, ["codex", "exec", "--json", "first"]);
+                extract(
+                    driver,
+                    &json!({"type":"thread.started","thread_id":id}),
+                    &mut out,
+                );
+                extract(
+                    driver,
+                    &json!({"type":"item.completed","item":{"type":"agent_message","text":"done"}}),
+                    &mut out,
+                );
+            } else {
+                assert_eq!(
+                    first,
+                    ["claude", "--print", "--output-format", "json", "first"]
+                );
+                extract(
+                    driver,
+                    &json!({"type":"result","result":"done","session_id":id}),
+                    &mut out,
+                );
+            }
+            assert_eq!(out.answer, "done");
+            assert_eq!(out.session.as_deref(), Some(id.as_str()));
+            let resumed = argv_for(&s, "next".into(), out.session.as_deref()).unwrap();
+            if driver == "codex" {
+                assert_eq!(resumed, ["codex", "exec", "resume", "--json", &id, "next"])
+            } else {
+                assert_eq!(
+                    resumed,
+                    [
+                        "claude",
+                        "--print",
+                        "--output-format",
+                        "json",
+                        "--resume",
+                        &id,
+                        "next"
+                    ]
+                )
+            }
+        }
+    }
+    #[test]
+    fn unfinished_turn_fences_changes_and_old_generation_cannot_dispatch() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE conversations(conversation_id PRIMARY KEY,binding_mode,pinned_node_id,pinned_slot_id,pinned_workdir);
+        CREATE TABLE runs(run_id PRIMARY KEY,conversation_id,target_node_id,target_slot_id,observed_state,created_at,mission_packet_json,receipt_summary,artifacts_json);
+        INSERT INTO conversations VALUES('c','orchestrator',NULL,NULL,NULL);").unwrap();
+        c.execute_batch(MIGRATIONS).unwrap();
+        change(&c, "c", "node", "a", "/work").unwrap();
+        let (old, _) = epoch(&c, "c").unwrap();
+        c.execute(
+            "INSERT INTO runs VALUES('r','c','node','a','unconfirmed',1,'{}','ok','[]')",
+            [],
+        )
+        .unwrap();
+        register(
+            &c,
+            "c",
+            "r",
+            "node",
+            "a",
+            "/work",
+            &json!({"pin_epoch":old}),
+        )
+        .unwrap();
+        assert!(change(&c, "c", "node", "b", "/different").is_err());
+        c.execute("UPDATE runs SET observed_state='succeeded'", [])
+            .unwrap();
+        change(&c, "c", "node", "b", "/different").unwrap();
+        let (new, check) = epoch(&c, "c").unwrap();
+        assert_ne!(old, new);
+        assert!(check.contains("ok"));
+        assert!(register(
+            &c,
+            "c",
+            "next",
+            "node",
+            "b",
+            "/different",
+            &json!({"pin_epoch":old})
+        )
+        .is_err());
+    }
 }

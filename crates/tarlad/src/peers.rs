@@ -244,8 +244,19 @@ fn accept_events(c: &Connection, s: &Service, node: &str, events: &[Value]) -> R
                     }
                     c.execute("UPDATE runs SET observed_state=?,hc_terminal_id=coalesce(?,hc_terminal_id),updated_at=? WHERE run_id=?",params![next,p["terminal"].as_str(),now(),id])?;
                     if let Some(a) = p.get("approval").filter(|v| v.is_object()) {
+                        if a["kind"] == "terminal_input" {
+                            c.execute("INSERT INTO service_osc VALUES(?,?,?) ON CONFLICT(run_id) DO UPDATE SET approval_id=excluded.approval_id,fingerprint=excluded.fingerprint",params![id,string(a,"approval_id")?,string(a,"fingerprint")?])?;
+                        }
                         c.execute("INSERT OR IGNORE INTO approvals(approval_id,workspace_id,run_id,node_id,tool_or_cmd,risk_reason,created_at) VALUES(?,?,?,?,?,?,?)",params![string(a,"approval_id")?,s.id(),id,node,string(a,"tool_or_cmd")?,string(a,"risk_reason")?,now()])?;
                     }
+                }
+                "terminal_input_closed" => {
+                    let aid = string(&p, "approval_id")?;
+                    c.execute("UPDATE approvals SET resolution='handled_at_terminal',resolved_at=? WHERE run_id=? AND approval_id=? AND resolution='pending'",params![now(),id,aid])?;
+                    c.execute(
+                        "DELETE FROM service_osc WHERE run_id=? AND approval_id=?",
+                        params![id, aid],
+                    )?;
                 }
                 "state_changed" => {}
                 "run_receipt" => {
@@ -256,6 +267,7 @@ fn accept_events(c: &Connection, s: &Service, node: &str, events: &[Value]) -> R
                     if terminal && state != r.final_state {
                         bail!("conflicting terminal state")
                     }
+                    c.execute("UPDATE approvals SET resolution='ended',resolved_at=? WHERE run_id=? AND resolution='pending'",params![now(),id])?;
                     c.execute("UPDATE runs SET observed_state=?,receipt_summary=?,artifacts_json=?,updated_at=? WHERE run_id=?",params![r.final_state,r.executive_summary,serde_json::to_string(&r.artifact_refs)?,now(),id])?;
                     c.execute("INSERT OR IGNORE INTO service_wakes(event_id,conversation_id,receipt) VALUES(?,?,?)",params![eid,conv,serde_json::to_string(&r)?])?;
                 }
@@ -342,12 +354,15 @@ async fn round(s: &Service) -> Result<()> {
         control::ensure_conversation(&tx, s, conv)?;
         let current = list(
             &tx,
-            "SELECT target_slot_id,mission_packet_json,conversation_id FROM runs WHERE run_id=?",
+            "SELECT r.target_slot_id,r.mission_packet_json,r.conversation_id,p.workdir AS pinned_workdir,e.epoch AS pin_epoch FROM runs r LEFT JOIN service_run_paths p USING(run_id) LEFT JOIN service_pin_epochs e USING(run_id) WHERE r.run_id=?",
             &[&id],
         )?;
         if let Some(old) = current.first() {
             if old["target_slot_id"] != slot
                 || old["conversation_id"] != conv
+                || old["pinned_workdir"] != item["pinned_workdir"]
+                || old["pin_epoch"].as_str().unwrap_or("legacy")
+                    != item["pin_epoch"].as_str().unwrap_or("legacy")
                 || old["mission_packet_json"] != serde_json::to_string(&packet)?
             {
                 bail!("conflicting immutable run claim")

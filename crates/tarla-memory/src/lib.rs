@@ -20,14 +20,21 @@ pub fn open(path: &Path, workspace: &str) -> Result<Connection> {
     db.busy_timeout(Duration::from_secs(5))?;
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    match tx.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? {
+    let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    match version {
         0 => {
             tx.execute_batch(include_str!("schema.sql"))?;
             tx.execute("INSERT INTO workspace_identity VALUES(1,?1)", [workspace])?;
-            tx.pragma_update(None, "user_version", 1)?;
         }
-        1 => verify_workspace(&tx, workspace)?,
+        1 | 2 => verify_workspace(&tx, workspace)?,
         version => bail!("unsupported database schema version {version}"),
+    }
+    if version < 2 {
+        tx.execute_batch("CREATE TRIGGER prevent_archived_message_delete BEFORE DELETE ON messages BEGIN
+            SELECT RAISE(ABORT,'conversation archive is immutable'); END;
+            CREATE INDEX idx_active_messages ON messages(conversation_id,seq_no) WHERE compacted_into IS NULL;
+            CREATE INDEX idx_trigger_turns ON messages(conversation_id,seq_no) WHERE sender_role IN ('user','run_receipt');")?;
+        tx.pragma_update(None, "user_version", 2)?;
     }
     tx.commit()?;
     Ok(db)
@@ -563,6 +570,58 @@ mod tests {
             assert!(a.apply_delta(&[bad]).is_err());
         }
         std::fs::remove_file(path)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod concurrent_tests {
+    use super::*;
+    #[test]
+    fn simultaneous_versions_have_one_winner_and_one_reviewable_conflict() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("state.db");
+        let db = open(&path, "work")?;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2)
+            .map(|i| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || -> Result<MutationResult> {
+                    let mut db = open(&path, "work")?;
+                    let mut store = SqliteMemory::new(&mut db, "work", "supervisor");
+                    let p = Mutation {
+                        proposal_id: format!("p{i}"),
+                        memory_id: "project".into(),
+                        scope: "global".into(),
+                        content: format!("decision {i}"),
+                        base_version: 0,
+                        source_node_id: format!("node-{i}"),
+                        source_run_id: None,
+                        is_deleted: false,
+                        hlc_timestamp: None,
+                    };
+                    barrier.wait();
+                    store.propose_mutation(&p)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut winners = 0;
+        for task in workers {
+            if matches!(task.join().unwrap()?, MutationResult::Applied { .. }) {
+                winners += 1;
+            }
+        }
+        assert_eq!(winners, 1);
+        assert_eq!(cursor(&db)?, 1);
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM memory_candidates WHERE status='pending'",
+                [],
+                |r| r.get::<_, usize>(0)
+            )?,
+            1
+        );
         Ok(())
     }
 }

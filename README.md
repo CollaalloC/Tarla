@@ -2,6 +2,8 @@
 
 Tarla 是按工作空间运行的个人智能体。每个空间指定一个主管节点，执行节点保存任务现场。手机、桌面、CLI 和消息网关都通过同一个业务 API 接入。服务器运行 `tarlad`，命令行程序名为 `tarla`。
 
+[预编译核心程序和校验方法](docs/core-binaries.md)适用于 Linux x86-64、Linux ARM64、macOS Apple Silicon 和 Windows x64。
+
 ## 在一台机器上启动
 
 从仓库根目录执行以下命令。需要稳定版 Rust。SQLite 随 Rust 依赖编译。
@@ -101,5 +103,6 @@ python3 tests/acceptance.py
 - [飞书、Telegram、Slack、Discord 网关的配置与配对](crates/tarla-gateway/README.md)
 - [记忆后端、外部索引与离线行为](crates/tarla-memory/README.md)
 - [运行状态、执行机权限与双网配置](crates/tarlad/README.md)
+- [EasyTier、Tailscale 及节点入站地址设置](docs/managed-networks.md)
 - [原始工程规范](docs/Tarla_Architecture_Spec.md)
 - [上游组件与致谢](docs/upstreams.md)

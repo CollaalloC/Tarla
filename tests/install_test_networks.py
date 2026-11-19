@@ -2,16 +2,17 @@
 import hashlib
 import io
 from pathlib import Path
+import subprocess
 import sys
 import tarfile
 import tempfile
-from urllib.request import urlopen
 import zipfile
 
 
 def fetch(url, expected_digest):
-    with urlopen(url, timeout=90) as response:
-        archive = response.read(100 * 1024 * 1024)
+    archive = subprocess.check_output(["curl", "--fail", "--location", "--silent", "--show-error",
+                                       "--retry", "2", "--max-time", "90",
+                                       "--proto", "=https", "--proto-redir", "=https", url])
     if hashlib.sha256(archive).hexdigest() != expected_digest:
         raise ValueError("Network sidecar release checksum mismatch")
     return io.BytesIO(archive)

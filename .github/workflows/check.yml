@@ -22,17 +22,40 @@ jobs:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - if: runner.os == 'Linux'
+      - name: Install pinned Herdr release
+        id: herdr_release
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: python3 tests/install_test_herdr.py "$GITHUB_ENV"
+      - name: Fetch Herdr release sources when the binary mirror is unavailable
+        if: runner.os == 'Linux' && steps.herdr_release.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          repository: herdrdev/herdr-core
+          ref: 06793ede1bedb1fed8d22d3cae476d3eb239edf0
+          submodules: true
+          persist-credentials: false
+          path: .upstream-herdr
+      - if: runner.os == 'Linux' && steps.herdr_release.outcome == 'failure'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: 0.16.0
+      - name: Build the exact upstream Herdr release
+        if: runner.os == 'Linux' && steps.herdr_release.outcome == 'failure'
+        working-directory: .upstream-herdr
         run: |
-          python3 tests/install_test_herdr.py "$GITHUB_ENV"
-          python3 tests/install_test_networks.py "$GITHUB_ENV"
+          cargo build --locked -p herdr-core
+          echo "TARLA_TEST_HC=$PWD/target/debug/herdr-core" >> "$GITHUB_ENV"
+          echo "TARLA_TEST_HERDR=$PWD/target/debug/herdr-core" >> "$GITHUB_ENV"
+      - if: runner.os == 'Linux'
+        run: python3 tests/install_test_networks.py "$GITHUB_ENV"
       - run: cargo test --workspace --locked
       - if: runner.os == 'Linux'
         run: cargo test --locked -p tarla-sidecar --test real -- --ignored
       - if: runner.os == 'Linux'
         run: cargo test --locked -p tarlad private_observer_streams -- --ignored
       - if: runner.os == 'Linux'
-        run: cargo build --workspace --locked && python3 tests/acceptance.py && python3 tests/mesh_acceptance.py
+        run: cargo build --workspace --locked && python3 tests/acceptance.py && python3 tests/pinned.py && python3 tests/mesh_acceptance.py
   client:
     runs-on: ubuntu-latest
     defaults:

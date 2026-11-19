@@ -1,0 +1,112 @@
+name: Core binaries
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'crates/**'
+      - '.github/workflows/core-packages.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-packages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+    env:
+      RUST_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify native target and build the locked release
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -vV | tr -d '\r' | grep -Fx "host: $RUST_TARGET"
+          cargo build --release --locked --target "$RUST_TARGET" -p tarla-cli -p tarlad -p tarla-gateway --bins
+
+      - name: Verify executables and archive them with SHA-256 checksums
+        shell: python
+        run: |
+          import hashlib
+          import os
+          from pathlib import Path
+          import subprocess
+          import tarfile
+          import tempfile
+          import zipfile
+
+          target = os.environ["RUST_TARGET"]
+          suffix = ".exe" if os.name == "nt" else ""
+          release = Path("target") / target / "release"
+          files = {name + suffix: release / (name + suffix)
+                   for name in ("tarla", "tarlad", "tarla-gateway")}
+
+          for name in ("tarla", "tarlad"):
+              subprocess.run([str(files[name + suffix]), "--version"], check=True)
+
+          # The standalone gateway validates its workspace before opening a network listener.
+          env = os.environ.copy()
+          env.pop("TARLA_WORKSPACE_DIR", None)
+          check = subprocess.run([str(files["tarla-gateway" + suffix])], env=env,
+                                 capture_output=True, text=True, timeout=10)
+          if check.returncode == 0 or "TARLA_WORKSPACE_DIR" not in check.stderr:
+              raise RuntimeError("standalone gateway failed its startup check")
+
+          def digest(path):
+              with path.open("rb") as source:
+                  return hashlib.file_digest(source, "sha256").hexdigest()
+
+          out = Path("dist")
+          out.mkdir()
+          stem = "tarla-core-" + target
+          with tempfile.TemporaryDirectory() as temp:
+              checksums = Path(temp) / "SHA256SUMS"
+              checksums.write_bytes("".join(f"{digest(p)}  {n}\n" for n, p in files.items()).encode())
+              files[checksums.name] = checksums
+              if os.name == "nt":
+                  archive = out / (stem + ".zip")
+                  with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+                      for name, path in files.items():
+                          bundle.write(path, name)
+              else:
+                  archive = out / (stem + ".tar.gz")
+                  with tarfile.open(archive, "w:gz") as bundle:
+                      for name, path in files.items():
+                          bundle.add(path, arcname=name, recursive=False)
+          (out / (archive.name + ".sha256")).write_bytes(f"{digest(archive)}  {archive.name}\n".encode())
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarla-core-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0

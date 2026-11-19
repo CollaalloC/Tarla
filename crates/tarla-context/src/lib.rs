@@ -155,7 +155,17 @@ pub fn assemble(
         prefix_cost <= budget,
         "static prefix exceeds model context budget"
     );
-    let raw_cost: usize = tx.query_row("SELECT COALESCE(SUM(token_estimate),0) FROM messages WHERE conversation_id=?1 AND compacted_into IS NULL", [conversation], |r| r.get(0))?;
+    let cost_of_raw = |db: &Connection| -> rusqlite::Result<usize> {
+        // Older archives counted executor receipts before the observation label was introduced.
+        db.query_row(
+            "SELECT COALESCE(SUM(CASE WHEN sender_role='run_receipt'
+            THEN length(CAST(content AS BLOB))+?2 ELSE token_estimate END),0)
+            FROM messages WHERE conversation_id=?1 AND compacted_into IS NULL",
+            params![conversation, projected_cost("run_receipt", "")],
+            |r| r.get(0),
+        )
+    };
+    let raw_cost = cost_of_raw(&tx)?;
     let summary_cost: usize = tx.query_row("SELECT COALESCE(SUM(token_estimate),0) FROM context_dag_nodes WHERE conversation_id=?1 AND parent_dag_id IS NULL", [conversation], |r| r.get(0))?;
     let total = prefix_cost
         .saturating_add(raw_cost)
@@ -165,12 +175,12 @@ pub fn assemble(
         compact(&tx, conversation, policy.protected_verbatim_turns)?;
     }
 
-    let raw = raw_messages(&tx, conversation)?;
-    let raw_cost: usize = raw.iter().map(|m| estimate(&m.role, &m.content)).sum();
+    let raw_cost = cost_of_raw(&tx)?;
     ensure!(
         prefix_cost + raw_cost <= budget,
         "protected verbatim turns and static prefix exceed model context budget"
     );
+    let raw = raw_messages(&tx, conversation)?;
     let summary_budget = budget - prefix_cost - raw_cost;
     let mut roots = read_roots(&tx, conversation)?;
     // Merge only when a batch is large enough or the active roots no longer fit.
@@ -235,12 +245,11 @@ fn raw_messages(tx: &Transaction<'_>, conversation: &str) -> Result<Vec<ContextM
 }
 
 fn compact(tx: &Transaction<'_>, conversation: &str, turns: usize) -> Result<()> {
-    // A turn begins with the user's message and includes all following replies
-    // and completion events, even when several events arrive before the next user turn.
+    // Both a user message and a completion receipt independently wake the supervisor.
     let oldest: Option<i64> = tx
         .query_row(
             "SELECT seq_no FROM messages WHERE conversation_id=?1
-        AND sender_role='user' ORDER BY seq_no DESC LIMIT 1 OFFSET ?2",
+        AND sender_role IN ('user','run_receipt') ORDER BY seq_no DESC LIMIT 1 OFFSET ?2",
             params![conversation, turns - 1],
             |r| r.get(0),
         )
@@ -608,4 +617,62 @@ pub fn related_decisions(
         }
     }
     Ok(decisions)
+}
+
+#[cfg(test)]
+mod retrieval_tests {
+    use super::*;
+    #[test]
+    fn recalls_relevant_decisions_and_marks_untrusted_completion_text() -> Result<()> {
+        let mut db = tarla_memory::open(std::path::Path::new(":memory:"), "work")?;
+        append(
+            &mut db,
+            "work",
+            "w",
+            "cli",
+            "u1",
+            "user",
+            "Choose a storage engine",
+        )?;
+        append(
+            &mut db,
+            "work",
+            "w",
+            "agent",
+            "a1",
+            "assistant",
+            "Use SQLite WAL with one database per host.",
+        )?;
+        append(
+            &mut db,
+            "work",
+            "life",
+            "agent",
+            "a2",
+            "assistant",
+            "SQLite is not for a picnic.",
+        )?;
+        append(
+            &mut db,
+            "work",
+            "w",
+            "receipt",
+            "r1",
+            "run_receipt",
+            "{\"result\":\"done\"}",
+        )?;
+        let result = related_decisions(&db, "w", "Please reuse the SQLite storage decision", 5)?;
+        assert_eq!(result, vec!["Use SQLite WAL with one database per host."]);
+        let window = assemble(&mut db, "w", "profile", "", &ContextPolicy::default())?;
+        assert!(window.last().unwrap().content.starts_with(RECEIPT_LABEL));
+        assert_eq!(window.last().unwrap().role, "user");
+        assert!(db
+            .execute("DELETE FROM messages WHERE conversation_id='w'", [])
+            .is_err());
+        assert_eq!(
+            recall(&db, "w", None, "done", 0, 1)?[0].content,
+            "{\"result\":\"done\"}"
+        );
+        Ok(())
+    }
 }

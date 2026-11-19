@@ -447,22 +447,45 @@ async fn step(s: &Service, job: &Value) -> Result<()> {
                 .as_str()
                 .or(status["title"].as_str())
                 .unwrap_or("The agent requires human input.");
-            let aid = format!("{:x}", Sha256::digest(format!("{rid}\n{status}")));
             let mut c = s.db()?;
             let tx = c.transaction()?;
-            tx.execute("INSERT OR IGNORE INTO approvals(approval_id,workspace_id,run_id,node_id,tool_or_cmd,risk_reason,created_at) VALUES(?,?,?,?,?,?,?)",params![aid,s.id(),rid,s.node(),status["tool"].as_str().unwrap_or("agent request"),reason,now()])?;
-            update(
-                &tx,
-                s,
-                rid,
-                "blocked",
-                Some(&t),
-                Some(
-                    json!({"approval_id":aid,"risk_reason":reason,"tool_or_cmd":status["tool"].as_str().unwrap_or("agent request")}),
-                ),
-            )?;
+            let fingerprint = format!("{:x}", Sha256::digest(status.to_string()));
+            let existing = tx
+                .query_row(
+                    "SELECT fingerprint FROM service_osc WHERE run_id=?",
+                    [rid],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            if existing.as_deref() != Some(&fingerprint) {
+                clear_osc(&tx, rid)?;
+                let aid = uid();
+                let title = status["title"]
+                    .as_str()
+                    .filter(|x| !x.is_empty())
+                    .unwrap_or("Open the terminal to respond");
+                tx.execute("INSERT INTO approvals(approval_id,workspace_id,run_id,node_id,tool_or_cmd,risk_reason,created_at) VALUES(?,?,?,?,?,?,?)",params![aid,s.id(),rid,s.node(),title,reason,now()])?;
+                tx.execute(
+                    "INSERT INTO service_osc VALUES(?,?,?)",
+                    params![rid, aid, fingerprint],
+                )?;
+                update(
+                    &tx,
+                    s,
+                    rid,
+                    "blocked",
+                    Some(&t),
+                    Some(
+                        json!({"approval_id":aid,"kind":"terminal_input","fingerprint":fingerprint,"risk_reason":reason,"tool_or_cmd":title}),
+                    ),
+                )?;
+            }
             tx.commit()?;
         } else {
+            let mut db = s.db()?;
+            let tx = db.transaction()?;
+            clear_osc(&tx, rid)?;
+            tx.commit()?;
             let pending = s.db()?.query_row(
                 "SELECT exists(SELECT 1 FROM approvals WHERE run_id=? AND resolution='pending')",
                 [rid],
@@ -476,6 +499,26 @@ async fn step(s: &Service, job: &Value) -> Result<()> {
             )?;
         }
     };
+    Ok(())
+}
+fn clear_osc(c: &Connection, id: &str) -> Result<()> {
+    let aid: Option<String> = c
+        .query_row(
+            "SELECT approval_id FROM service_osc WHERE run_id=?",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(aid) = aid {
+        c.execute("UPDATE approvals SET resolution='handled_at_terminal',resolved_at=? WHERE approval_id=?",params![now(),aid])?;
+        c.execute("DELETE FROM service_osc WHERE run_id=?", [id])?;
+        push(
+            c,
+            id,
+            "terminal_input_closed",
+            &json!({"run_id":id,"approval_id":aid}),
+        )?;
+    }
     Ok(())
 }
 fn state(s: &Service, id: &str, next: &str, t: Option<&str>) -> Result<()> {
@@ -493,7 +536,7 @@ fn update(
     t: Option<&str>,
     approval: Option<Value>,
 ) -> Result<()> {
-    if c.execute("UPDATE runs SET observed_state=?,hc_terminal_id=coalesce(?,hc_terminal_id),updated_at=? WHERE run_id=? AND observed_state!=?",params![next,t,now(),id,next])?==0{return Ok(())}
+    if c.execute("UPDATE runs SET observed_state=?,hc_terminal_id=coalesce(?,hc_terminal_id),updated_at=? WHERE run_id=? AND observed_state!=?",params![next,t,now(),id,next])?==0 && approval.is_none(){return Ok(())}
     push(
         c,
         id,
@@ -537,6 +580,8 @@ fn finish(s: &Service, id: &str, status: &str, summary: &str, transcript: &str) 
         tarla_context::bound_receipt(receipt, s.ws.config.context_policy.run_receipt_max_tokens)?;
     let mut c = s.db()?;
     let tx = c.transaction()?;
+    clear_osc(&tx, id)?;
+    tx.execute("UPDATE approvals SET resolution='ended',resolved_at=? WHERE run_id=? AND resolution='pending'",params![now(),id])?;
     tx.execute("UPDATE runs SET observed_state=?,receipt_summary=?,s0_log_local_path=?,updated_at=? WHERE run_id=?",params![status,receipt.executive_summary,path.to_string_lossy(),now(),id])?;
     tx.execute(
         "UPDATE service_claims SET phase='finished',updated_at=? WHERE run_id=?",

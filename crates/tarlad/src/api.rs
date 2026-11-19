@@ -150,7 +150,7 @@ pub async fn facts(State(s): State<S>) -> Api {
 }
 pub async fn actions(State(s): State<S>) -> Api {
     let c = s.db()?;
-    let mut a=list(&c,"SELECT approval_id AS id,'approval' AS kind,tool_or_cmd AS title,run_id,node_id,risk_reason,created_at FROM approvals WHERE resolution='pending'",&[])?;
+    let mut a=list(&c,"SELECT a.approval_id AS id,CASE WHEN o.approval_id IS NULL THEN 'approval' ELSE 'terminal_input' END AS kind,a.tool_or_cmd AS title,a.run_id,a.node_id,a.risk_reason,a.created_at FROM approvals a LEFT JOIN service_osc o ON a.approval_id=o.approval_id WHERE a.resolution='pending'",&[])?;
     a.extend(list(&c,"SELECT c.candidate_id AS id,'memory_conflict' AS kind,c.memory_id AS title,c.memory_id,c.base_version,coalesce(m.version,0) AS current_version,coalesce(m.content,'') AS content,c.proposed_text,c.created_at FROM memory_candidates c LEFT JOIN memories m USING(memory_id) WHERE c.status='pending'",&[])?);
     for slot in fleet::snapshots(&s)? {
         if let SlotHealth::AuthExpired { message } = slot.health {
@@ -201,6 +201,14 @@ pub fn resolve_local_approval(s: &Service, id: &str, v: &str) -> Result<Value> {
         bail!("invalid approval outcome")
     }
     let c = s.db()?;
+    if c.query_row(
+        "SELECT exists(SELECT 1 FROM service_osc WHERE approval_id=?)",
+        [id],
+        |r| r.get::<_, bool>(0),
+    )? {
+        bail!("use the run's interactive terminal to answer this prompt")
+    }
+
     let n=c.execute("UPDATE approvals SET resolution=?,resolved_by='paired_user',resolved_at=? WHERE approval_id=? AND resolution='pending'",params![v,now(),id])?;
     if n != 1 {
         let prior = c
