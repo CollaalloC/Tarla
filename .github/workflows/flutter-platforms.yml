@@ -63,6 +63,23 @@ jobs:
           flutter-version: '3.38.3'
           channel: stable
           cache: true
+      - name: Resolve Flutter build plugins from their published repositories
+        if: matrix.target == 'android'
+        shell: bash
+        run: |
+          gradle_home="$RUNNER_TEMP/tarla-gradle"
+          mkdir -p "$gradle_home/init.d"
+          cat > "$gradle_home/init.d/flutter-repositories.gradle" <<'GRADLE'
+          beforeSettings { settings ->
+              if (settings.settingsDir.name == 'gradle' && settings.settingsDir.parentFile.name == 'flutter_tools') {
+                  settings.pluginManagement.repositories {
+                      mavenCentral()
+                      gradlePluginPortal()
+                  }
+              }
+          }
+          GRADLE
+          echo "GRADLE_USER_HOME=$gradle_home" >> "$GITHUB_ENV"
       - run: flutter pub get
       - name: Record resolved dependencies
         if: matrix.target == 'linux'
