@@ -55,6 +55,12 @@ class ApiError implements Exception {
   String toString() => 'HTTP $status · $message';
 }
 
+bool unavailable(Object error) =>
+    error is SocketException ||
+    error is TimeoutException ||
+    error is HttpException ||
+    (error is ApiError && [502, 503, 504].contains(error.status));
+
 String identifier() {
   final random = Random.secure();
   return List.generate(

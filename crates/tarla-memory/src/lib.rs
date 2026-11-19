@@ -1,5 +1,7 @@
 //! The SQLite file belongs to one workspace on one host. Replication sends revisions,
 //! never the file or its WAL. Executor and supervisor authorization is enforced by tarlad.
+mod hosted;
+pub use hosted::{HostedIndex, Projection};
 mod mnemosyne;
 pub use mnemosyne::MnemosyneIndex;
 

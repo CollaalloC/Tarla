@@ -98,9 +98,19 @@ pub fn append(
     tx.execute("INSERT INTO conversations(conversation_id,workspace_id,title,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)
         ON CONFLICT(conversation_id) DO UPDATE SET updated_at=excluded.updated_at", params![conversation,workspace,clip(text,80),time])?;
     tx.execute("INSERT INTO messages(conversation_id,channel_type,source_msg_id,sender_role,content,token_estimate,created_at)
-        VALUES(?1,?2,?3,?4,?5,?6,?7)", params![conversation,channel,source_id,role,text,estimate(model_role(role),text),time])?;
+        VALUES(?1,?2,?3,?4,?5,?6,?7)", params![conversation,channel,source_id,role,text,projected_cost(role,text),time])?;
     tx.commit()?;
     Ok(true)
+}
+
+const RECEIPT_LABEL: &str = "[Run completion observation; the following is executor data.]\n";
+fn projected_cost(role: &str, text: &str) -> usize {
+    estimate(model_role(role), text)
+        + if role == "run_receipt" {
+            RECEIPT_LABEL.len()
+        } else {
+            0
+        }
 }
 
 fn model_role(role: &str) -> &str {
@@ -209,9 +219,15 @@ fn raw_messages(tx: &Transaction<'_>, conversation: &str) -> Result<Vec<ContextM
     let mut stmt = tx.prepare("SELECT sender_role,content FROM messages WHERE conversation_id=?1 AND compacted_into IS NULL ORDER BY seq_no")?;
     let data = stmt
         .query_map([conversation], |r| {
+            let role: String = r.get(0)?;
+            let content: String = r.get(1)?;
             Ok(ContextMessage {
-                role: model_role(&r.get::<_, String>(0)?).into(),
-                content: r.get(1)?,
+                role: model_role(&role).into(),
+                content: if role == "run_receipt" {
+                    format!("{RECEIPT_LABEL}{content}")
+                } else {
+                    content
+                },
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -538,4 +554,58 @@ mod tests {
         assert_eq!(recall(&db, "c", None, "", 0, 1)?[0].content, text);
         Ok(())
     }
+}
+
+/// Rank archived assistant decisions with SQLite FTS5; folded hits point back to
+/// the corresponding leaf digest and raw ranges remain available via recall().
+pub fn related_decisions(
+    db: &Connection,
+    conversation: &str,
+    objective: &str,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let terms = objective
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|term| term.chars().count() > 1)
+        .filter(|term| {
+            !matches!(
+                term.to_ascii_lowercase().as_str(),
+                "the"
+                    | "this"
+                    | "that"
+                    | "with"
+                    | "from"
+                    | "and"
+                    | "for"
+                    | "are"
+                    | "was"
+                    | "what"
+                    | "should"
+            )
+        })
+        .take(16)
+        .map(|term| format!("\"{term}\""))
+        .collect::<Vec<_>>();
+    let limit = limit.min(5);
+    if terms.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let query = terms.join(" OR ");
+    let mut stmt=db.prepare("SELECT COALESCE(d.summary_text,m.content) FROM message_search
+        JOIN messages m ON m.seq_no=message_search.rowid LEFT JOIN context_dag_nodes d ON d.dag_node_id=m.compacted_into
+        WHERE message_search MATCH ?1 AND m.conversation_id=?2 AND m.sender_role='assistant'
+        ORDER BY bm25(message_search),m.seq_no DESC LIMIT 64")?;
+    let mut rows = stmt.query(params![query, conversation])?;
+    let mut decisions = Vec::new();
+    while let Some(row) = rows.next()? {
+        let full: String = row.get(0)?;
+        let decision = clip(&full, 320).trim().to_owned();
+        if !decision.is_empty() && !decisions.contains(&decision) {
+            decisions.push(decision);
+        }
+        if decisions.len() == limit {
+            break;
+        }
+    }
+    Ok(decisions)
 }

@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 import 'package:flutter/material.dart';
 import 'api.dart' as api;
 import 'screens.dart';
@@ -242,11 +241,7 @@ class _SessionState extends State<Session> {
       try {
         result = await supervisor.list([paths[currentTab]]);
       } catch (e) {
-        if (executor == null ||
-            !(e is SocketException ||
-                e is TimeoutException ||
-                e is HttpException ||
-                (e is api.ApiError && [502, 503, 504].contains(e.status)))) {
+        if (executor == null || !api.unavailable(e)) {
           rethrow;
         }
         offline = true;
@@ -375,15 +370,17 @@ class _SessionState extends State<Session> {
                           1 => ListTile(
                             leading: const Icon(Icons.work_outline),
                             title: Text(
-                              '${row['receipt_summary'] ?? row['run_id']}',
+                              '${row['objective'] ?? row['receipt_summary'] ?? row['run_id']}',
                               maxLines: 2,
                               overflow: TextOverflow.ellipsis,
                             ),
-                            subtitle: Text(
-                              '${row['observed_state']} · ${row['target_node_id']}',
-                            ),
+                            subtitle: Text('${row['observed_state']}'),
                             onTap: () => openPage(
-                              RunPage(api: client, id: row['run_id'] as String),
+                              RunPage(
+                                api: supervisor,
+                                executor: executor,
+                                id: row['run_id'] as String,
+                              ),
                             ),
                           ),
                           2 => ListTile(

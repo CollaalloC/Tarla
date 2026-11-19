@@ -1633,11 +1633,14 @@ name = "tarla-memory"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
  "wait-timeout",
 ]
 
@@ -1672,6 +1675,8 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1709,6 +1714,7 @@ dependencies = [
  "clap",
  "fs2",
  "futures-util",
+ "hmac",
  "reqwest",
  "rusqlite",
  "serde",

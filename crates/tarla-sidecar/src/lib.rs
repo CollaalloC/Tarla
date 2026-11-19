@@ -1,9 +1,11 @@
 //! Private workspace-owned execution and network sidecars.
 mod herdr;
 mod managed;
+mod secrets;
 pub use herdr::{Herdr, TerminalEvent, TerminalReader, TerminalStatus, TerminalWriter};
 pub use managed::{
-    credential_environment, start_network, try_lock_slot, ManagedNetwork, NetworkSpec, Toolchain,
+    credential_environment, start_network, start_network_for, try_lock_slot, ManagedNetwork,
+    NetworkSpec, Toolchain,
 };
 
 use std::{fs, io, path::Path};

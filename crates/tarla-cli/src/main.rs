@@ -68,6 +68,18 @@ enum Command {
         #[command(subcommand)]
         action: admin::Operation,
     },
+    /// Issue a five-minute code binding a channel actor to a conversation.
+    PairChannel {
+        platform: String,
+        actor: String,
+        conversation: String,
+        #[arg(long)]
+        approvals: bool,
+    },
+    ChannelPairings,
+    UnpairChannel {
+        id: String,
+    },
     Status,
     Conversations,
     Runs,
@@ -88,6 +100,8 @@ enum Command {
     Dispatch {
         conversation: String,
         goal: String,
+        #[arg(long)]
+        request_id: Option<String>,
         #[arg(long = "accept")]
         acceptance: Vec<String>,
         #[arg(long, default_value = "implementer")]
@@ -262,23 +276,53 @@ async fn main() -> Result<()> {
         base: cli.url,
         token,
     };
-    let result=match cli.command{
-        Command::Status=>c.get(&["health"]).await?,
-        Command::Conversations=>c.get(&["v1","conversations"]).await?, Command::Runs=>c.get(&["v1","runs"]).await?,
-        Command::Actions=>c.get(&["v1","actions"]).await?, Command::Memories=>c.get(&["v1","memories"]).await?,
-        Command::Nodes=>c.get(&["v1","nodes"]).await?,Command::Slots=>c.get(&["v1","slots"]).await?,Command::Facts=>c.get(&["v1","facts"]).await?,
-        Command::Chat{conversation,text,source_id}=>c.post(&["v1","conversations",&conversation,"messages"],json!({"text":text,"channel":"cli","source_msg_id":source_id.unwrap_or_else(||uuid::Uuid::now_v7().to_string())})).await?,
-        Command::History{conversation}=>c.get(&["v1","conversations",&conversation,"messages"]).await?,
-        Command::Dispatch{conversation,goal,acceptance,role}=>c.post(&["v1","runs"],json!({"conversation_id":conversation,"goal":goal,"acceptance":acceptance,"role":role})).await?,
-        Command::Run{id}=>c.get(&["v1","runs",&id]).await?,
-        Command::Cancel{id}=>c.post(&["v1","runs",&id,"cancel"],json!({})).await?,
-        Command::Log{id,offset,limit}=>c.api(Method::GET,&["v1","runs",&id,"log"],None,&[("offset",offset.to_string()),("limit",limit.to_string())]).await?,
-        Command::Resolve{id,resolution,expected_version}=>c.post(&["v1","actions",&id],json!({"resolution":match resolution{Decision::Approved=>"approved",Decision::Rejected=>"rejected"},"expected_version":expected_version})).await?,
-        Command::Remember{id,scope,content,base_version}=>c.post(&["v1","memories"],json!({"memory_id":id,"scope":scope,"content":content,"base_version":base_version})).await?,
-        Command::Bind{conversation,node,slot,workdir}=>c.api(Method::PUT,&["v1","conversations",&conversation,"binding"],Some(json!({"mode":"pinned","node_id":node,"slot_id":slot,"workdir":workdir})),&[]).await?,
-        Command::Unbind{conversation}=>c.api(Method::PUT,&["v1","conversations",&conversation,"binding"],Some(json!({"mode":"orchestrator"})),&[]).await?,
-        Command::Attach{id,interactive}=>return attach(&c,&id,interactive).await,
-        Command::Init{..}|Command::Skills|Command::Supervisor{..}|Command::InstallTool{..}|Command::Pair{..}=>unreachable!(),
+    let result = match cli.command {
+        Command::PairChannel { platform, actor, conversation, approvals } => {
+            c.post(&["gateway", "pairings"], json!({
+                "platform": platform, "actor_id": actor, "conversation_id": conversation, "approvals": approvals
+            })).await?
+        }
+        Command::ChannelPairings => c.get(&["gateway", "pairings"]).await?,
+        Command::UnpairChannel { id } => c.api(Method::DELETE, &["gateway", "pairings", &id], None, &[]).await?,
+        Command::Status => c.get(&["health"]).await?,
+        Command::Conversations => c.get(&["v1", "conversations"]).await?,
+        Command::Runs => c.get(&["v1", "runs"]).await?,
+        Command::Actions => c.get(&["v1", "actions"]).await?,
+        Command::Memories => c.get(&["v1", "memories"]).await?,
+        Command::Nodes => c.get(&["v1", "nodes"]).await?,
+        Command::Slots => c.get(&["v1", "slots"]).await?,
+        Command::Facts => c.get(&["v1", "facts"]).await?,
+        Command::Chat { conversation, text, source_id } => {
+            let id = source_id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+            c.post(&["v1", "conversations", &conversation, "messages"],
+                json!({"text":text, "channel":"cli", "source_msg_id":id})).await?
+        }
+        Command::History { conversation } => c.get(&["v1", "conversations", &conversation, "messages"]).await?,
+        Command::Dispatch { conversation, goal, acceptance, role, request_id } => {
+            c.post(&["v1", "runs"], json!({
+                "conversation_id": conversation, "goal":goal, "acceptance":acceptance,
+                "role":role, "request_id":request_id
+            })).await?
+        }
+        Command::Run { id } => c.get(&["v1", "runs", &id]).await?,
+        Command::Cancel { id } => c.post(&["v1", "runs", &id, "cancel"], json!({})).await?,
+        Command::Log { id, offset, limit } => c.api(Method::GET, &["v1", "runs", &id, "log"],
+            None, &[("offset",offset.to_string()),("limit",limit.to_string())]).await?,
+        Command::Resolve { id, resolution, expected_version } => {
+            let choice = match resolution { Decision::Approved => "approved", Decision::Rejected => "rejected" };
+            c.post(&["v1", "actions", &id], json!({"resolution":choice, "expected_version":expected_version})).await?
+        }
+        Command::Remember { id, scope, content, base_version } => c.post(&["v1", "memories"],
+            json!({"memory_id":id, "scope":scope, "content":content, "base_version":base_version})).await?,
+        Command::Bind { conversation, node, slot, workdir } => {
+            c.api(Method::PUT, &["v1", "conversations", &conversation, "binding"],
+                Some(json!({"mode":"pinned","node_id":node,"slot_id":slot,"workdir":workdir})), &[]).await?
+        }
+        Command::Unbind { conversation } => c.api(Method::PUT,
+            &["v1", "conversations", &conversation, "binding"], Some(json!({"mode":"orchestrator"})), &[]).await?,
+        Command::Attach { id, interactive } => return attach(&c, &id, interactive).await,
+        Command::Init { .. } | Command::Skills | Command::Supervisor { .. } |
+        Command::InstallTool { .. } | Command::Pair { .. } => unreachable!(),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())

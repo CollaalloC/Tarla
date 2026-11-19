@@ -7,10 +7,8 @@ from pathlib import Path
 import secrets
 import shutil
 import socket
-import sqlite3
 import subprocess
 import sys
-from contextlib import suppress
 import tempfile
 import threading
 import time
@@ -188,13 +186,35 @@ def test_nodes(path, model):
         until(lambda: any(m["content"]=="285 mm" for m in worker.api("/v1/memories")), "S2 replication")
         chief.stop()
         assert worker.api("/v1/memories")[0]["content"]=="285 mm"
+        offline=worker.api("/v1/memories",{"memory_id":"offline","content":"field result",
+                      "scope":"global","base_version":0,"proposal_id":"offline-1"})
+        assert offline["status"]=="queued", offline
         chief.start(secret)
+        for origin in [chief,worker]:
+            until(lambda: any(m["memory_id"]=="offline" and m["version"]==1
+                              for m in origin.api("/v1/memories")),"offline proposal replay")
         assert len(chief.api(endpoint)) == 2 and Model.calls == calls
         conflict=chief.api("/v1/memories",{**memory, "content":"stale"})
         assert conflict["status"]=="conflict", conflict
         assert any("pref" in str(item) for item in chief.api("/v1/actions"))
         if work is not None:
             assert_remote_execution(chief,worker,work,secret)
+        snap = path / "handover.db"
+        frozen = subprocess.run([BIN/"tarla","--home",chief.home,"--workspace",SPACE,
+                                 "supervisor","handover","--to","backup","--snapshot",snap],
+                                capture_output=True)
+        assert frozen.returncode!=0 and not snap.exists(), "active supervisor must hold exclusive authority lock"
+        chief.stop()
+        chief.cli("supervisor","handover","--to","backup","--snapshot",str(snap))
+        replacement = Node(path/"backup","backup","executor_only")
+        replacement.cli("supervisor","restore","--snapshot",str(snap))
+        cleanup.callback(replacement.stop)
+        replacement.start(secret)
+        info=replacement.api("/health")
+        assert info["supervisor_node_id"]=="backup" and info["supervisor_term"]==2, info
+        assert any(m["content"]=="285 mm" for m in replacement.api("/v1/memories"))
+        assert len(replacement.api(endpoint))==2
+        print("PASS live migration lock, offline supervisor handover, restored history, incremented authority term")
         print("PASS CLI, model failover, message replay, workspace authentication, peer replication, offline search, restart, memory conflict")
 
 

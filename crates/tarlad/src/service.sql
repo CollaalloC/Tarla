@@ -7,3 +7,13 @@ CREATE TABLE IF NOT EXISTS service_responses(channel TEXT NOT NULL, source TEXT 
 CREATE TABLE IF NOT EXISTS service_frozen(conversation_id TEXT PRIMARY KEY, content TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS service_leases(nonce TEXT PRIMARY KEY, expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS service_run_paths(run_id TEXT PRIMARY KEY,workdir TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS service_receipt_drafts(run_id TEXT PRIMARY KEY,receipt TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS service_proposals(id TEXT PRIMARY KEY,proposal TEXT NOT NULL,result TEXT);
+CREATE TABLE IF NOT EXISTS service_telemetry(slot_id TEXT PRIMARY KEY,report TEXT NOT NULL,updated_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS service_forwards(source TEXT PRIMARY KEY,run_id TEXT NOT NULL,sent INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS service_binding_epochs(conversation_id TEXT PRIMARY KEY, epoch TEXT NOT NULL, checkpoint TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS service_pin_epochs(run_id TEXT PRIMARY KEY,epoch TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS service_handoffs(source TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,result TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS service_slot_paths(node_id TEXT NOT NULL,slot_id TEXT NOT NULL,workdir TEXT NOT NULL,PRIMARY KEY(node_id,slot_id));
+CREATE TABLE IF NOT EXISTS service_peer_facts(node_id TEXT NOT NULL,fact_key TEXT NOT NULL,metadata_json TEXT NOT NULL,verified_at INTEGER NOT NULL,PRIMARY KEY(node_id,fact_key));
+CREATE TABLE IF NOT EXISTS service_requirements(run_id TEXT PRIMARY KEY,role TEXT NOT NULL,model_family TEXT NOT NULL,request_json TEXT NOT NULL);

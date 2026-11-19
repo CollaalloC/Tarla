@@ -425,14 +425,21 @@ class _ChatPageState extends State<ChatPage> {
 
 class RunPage extends StatefulWidget {
   final core.TarlaApi api;
+  final core.TarlaApi? executor;
   final String id;
-  const RunPage({required this.api, required this.id, super.key});
+  const RunPage({
+    required this.api,
+    required this.id,
+    this.executor,
+    super.key,
+  });
   @override
   State<RunPage> createState() => _RunPageState();
 }
 
 class _RunPageState extends State<RunPage> {
   core.Row? row;
+  late core.TarlaApi source = widget.api;
   String? error;
   bool loading = false;
   Timer? timer;
@@ -455,9 +462,18 @@ class _RunPageState extends State<RunPage> {
     if (loading) return;
     loading = true;
     try {
-      final data = await widget.api.get(['runs', widget.id]);
+      var endpoint = widget.api;
+      core.Row data;
+      try {
+        data = await endpoint.get(['runs', widget.id]);
+      } catch (e) {
+        if (widget.executor == null || !core.unavailable(e)) rethrow;
+        endpoint = widget.executor!;
+        data = await endpoint.get(['runs', widget.id]);
+      }
       if (mounted)
         setState(() {
+          source = endpoint;
           row = data;
           error = null;
         });
@@ -474,6 +490,11 @@ class _RunPageState extends State<RunPage> {
     body: ListView(
       padding: const EdgeInsets.all(20),
       children: [
+        if (source != widget.api)
+          const ListTile(
+            leading: Icon(Icons.lan_outlined),
+            title: Text('主管离线，已直连执行节点'),
+          ),
         if (error != null) SelectableText(error!),
         if (row == null && error == null) const LinearProgressIndicator(),
         if (row != null) ...[
@@ -496,7 +517,7 @@ class _RunPageState extends State<RunPage> {
             onPressed: () => Navigator.push(
               context,
               MaterialPageRoute(
-                builder: (_) => LogPage(client: widget.api, id: widget.id),
+                builder: (_) => LogPage(client: source, id: widget.id),
               ),
             ),
           ),
@@ -513,7 +534,7 @@ class _RunPageState extends State<RunPage> {
                         context,
                         MaterialPageRoute(
                           builder: (_) => TerminalPage(
-                            api: widget.api,
+                            api: source,
                             id: widget.id,
                             mode: mode,
                           ),

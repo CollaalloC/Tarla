@@ -213,7 +213,7 @@ where
     let d = dir.to_owned();
     tokio::task::spawn_blocking(move || {
         let mut journal = Journal::open(&d)?;
-        if !d.join("finished").is_file() {
+        if !d.join("finished").is_file() && !d.join("finalizing").is_file() {
             action(&mut journal)?;
         }
         Ok(())
@@ -222,16 +222,13 @@ where
 }
 async fn capture(dir: &Path, terminal: &str, hc: &Herdr) -> Result<()> {
     let (mut reader, mut writer) = hc.attach(terminal, true, 80, 24).await?;
-    disk(dir,|j|j.append([json!({"time":stamp(),"kind":"gap","text":"Capture attached. Output before this paint, including any offline interval, may be missing."})])).await?;
+    begin_stream(dir).await?;
     loop {
         match reader.next().await? {
             TerminalEvent::Output(bytes)=>{
-                let count=bytes.len();
-                // Limit RAM and time holding the write lock for a large terminal frame.
-                for chunk in bytes.chunks(64*1024) {
-                    let payload=chunk.to_vec();disk(dir,move|j|j.append(payload_records("output",&payload))).await?;
-                }
-                writer.credit(count).await?;
+                let n=bytes.len();
+                store_output(dir,&bytes).await?;
+                writer.credit(n).await?;
             }
             TerminalEvent::Resize(cols,rows)=>disk(dir,move|j|j.append([json!({"time":stamp(),"kind":"resize","text":format!("Viewport {cols} × {rows}; subsequent output may include an updated screen.")})])).await?,
             TerminalEvent::Closed(_)=>return Ok(()),
@@ -239,6 +236,18 @@ async fn capture(dir: &Path, terminal: &str, hc: &Herdr) -> Result<()> {
     }
 }
 
+async fn begin_stream(dir: &Path) -> Result<()> {
+    disk(dir,|j|j.append([json!({"time":stamp(),"kind":"gap","text":"Capture attached. Output before this paint, including any offline interval, may be missing."})])).await
+}
+
+async fn store_output(dir: &Path, bytes: &[u8]) -> Result<()> {
+    // Limit memory and time holding the append lock for a large terminal frame.
+    for chunk in bytes.chunks(64 * 1024) {
+        let payload = chunk.to_vec();
+        disk(dir, move |j| j.append(payload_records("output", &payload))).await?;
+    }
+    Ok(())
+}
 /// A final screen is a bounded reconstruction supplied by Herdr, distinct from the
 /// continuous byte stream. It also covers short processes that exited before attach.
 pub fn finish(root: &Path, id: &str, state: &str, final_screen: &str) -> Result<PathBuf> {
@@ -248,6 +257,27 @@ pub fn finish(root: &Path, id: &str, state: &str, final_screen: &str) -> Result<
     if dir.join("finished").is_file() {
         return Ok(path);
     }
+    // A failed finalization may have appended only part of the terminal snapshot.
+    // Roll back to the saved live-stream boundary before making a second attempt.
+    let mut pending = open_private(&dir.join("finalizing"))?;
+    if pending.metadata()?.len() == 8 {
+        let mut n = [0; 8];
+        pending.read_exact(&mut n)?;
+        let count = u64::from_le_bytes(n);
+        ensure!(
+            count <= j.index.metadata()?.len() / 8,
+            "invalid finalization checkpoint"
+        );
+        let data_end = read_end(&mut j.index, count)?;
+        j.data.set_len(data_end)?;
+        j.index.set_len(count * 8)?;
+        j.data.seek(SeekFrom::End(0))?;
+        j.index.seek(SeekFrom::End(0))?;
+    } else {
+        pending.set_len(0)?;
+        pending.write_all(&(j.index.metadata()?.len() / 8).to_le_bytes())?;
+        pending.sync_data()?;
+    }
     if j.index.metadata()?.len() == 0 {
         j.append([json!({"time":stamp(),"kind":"gap","text":"No live capture was available before the terminal exited."})])?;
     }
@@ -256,6 +286,8 @@ pub fn finish(root: &Path, id: &str, state: &str, final_screen: &str) -> Result<
     }
     j.append([json!({"time":stamp(),"kind":"finished","text":state})])?;
     open_private(&dir.join("finished"))?.sync_data()?;
+    drop(pending);
+    fs::remove_file(dir.join("finalizing"))?;
     Ok(path)
 }
 
@@ -391,6 +423,27 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stream_store_keeps_long_output_across_capture_epochs() {
+        let root = Temp::new();
+        let d = location(&root.0, "run").unwrap();
+        let payload = (0..1500)
+            .map(|i| format!("metric-{i}\r\n"))
+            .collect::<String>();
+        begin_stream(&d).await.unwrap();
+        store_output(&d, payload.as_bytes()).await.unwrap();
+        begin_stream(&d).await.unwrap();
+        store_output(&d, b"after reconnect\n").await.unwrap();
+        assert_eq!(
+            page(&root.0, "run", 1, 1, "").unwrap()["lines"],
+            json!(["metric-0"])
+        );
+        let last = page(&root.0, "run", 1500, 3, "").unwrap();
+        assert_eq!(last["lines"][0], "metric-1499");
+        assert_eq!(last["records"][1]["kind"], "gap");
+        assert_eq!(last["lines"][2], "after reconnect");
+    }
+
     #[test]
     fn binary_output_round_trips_and_missing_live_capture_is_marked() {
         let root = Temp::new();
@@ -405,5 +458,91 @@ mod tests {
         finish(&root.0, "short", "failed", "").unwrap();
         let value = page(&root.0, "short", 0, 10, "").unwrap();
         assert_eq!(value["records"][0]["kind"], "gap");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod observer_test {
+    use super::*;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioReader},
+        net::{UnixListener, UnixStream},
+    };
+    async fn frame(w: &mut UnixStream, ch: u32, kind: u8, bytes: &[u8]) {
+        w.write_u32_le(ch).await.unwrap();
+        w.write_u8(kind).await.unwrap();
+        w.write_u32_le(bytes.len() as u32).await.unwrap();
+        w.write_all(bytes).await.unwrap();
+    }
+    async fn read_frame(s: &mut UnixStream) -> (u32, u8, Vec<u8>) {
+        let ch = s.read_u32_le().await.unwrap();
+        let kind = s.read_u8().await.unwrap();
+        let n = s.read_u32_le().await.unwrap();
+        let mut bytes = vec![0; n as usize];
+        s.read_exact(&mut bytes).await.unwrap();
+        (ch, kind, bytes)
+    }
+    async fn observe(s: UnixStream, output: &[u8]) {
+        let mut r = TokioReader::new(s);
+        let mut hello = String::new();
+        r.read_line(&mut hello).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&hello).unwrap()["method"],
+            "hello"
+        );
+        let mut s = r.into_inner();
+        s.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"framed\":true}}\n")
+            .await
+            .unwrap();
+        let (_, _, attach) = read_frame(&mut s).await;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&attach).unwrap()["params"]["observe"],
+            true
+        );
+        frame(
+            &mut s,
+            0,
+            0,
+            br#"{"jsonrpc":"2.0","id":2,"result":{"channel":7,"terminal":{"address":"t1"}}}"#,
+        )
+        .await;
+        frame(&mut s, 7, 0, output).await;
+        let (ch, kind, ack) = read_frame(&mut s).await;
+        assert_eq!((ch, kind), (7, 1));
+        assert_eq!(
+            u32::from_le_bytes(ack.try_into().unwrap()) as usize,
+            output.len()
+        );
+        frame(&mut s, 7, 2, b"").await;
+    }
+    #[tokio::test]
+    #[ignore = "requires OS permission to bind a filesystem Unix socket"]
+    async fn private_observer_streams_over_one_thousand_lines_then_marks_reconnect() {
+        let root = std::env::temp_dir().join(format!("tc-{}", uuid::Uuid::now_v7()));
+        let dir = location(&root, "run").unwrap();
+        let runtime = root.join("runtime");
+        private_dir(&runtime).unwrap();
+        let hc = Herdr::new(&runtime).unwrap();
+        let sock = UnixListener::bind(runtime.join("hc.sock")).unwrap();
+        let server = tokio::spawn(async move {
+            let payload = (0..1500)
+                .map(|i| format!("metric-{i}\r\n"))
+                .collect::<String>();
+            observe(sock.accept().await.unwrap().0, payload.as_bytes()).await;
+            observe(sock.accept().await.unwrap().0, b"after reconnect\n").await;
+        });
+        capture(&dir, "t1", &hc).await.unwrap();
+        // A fresh recording session reopens the same run after tarlad restarts.
+        capture(&dir, "t1", &hc).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            page(&root, "run", 1, 1, "").unwrap()["lines"],
+            json!(["metric-0"])
+        );
+        let last = page(&root, "run", 1500, 3, "").unwrap();
+        assert_eq!(last["lines"][0], "metric-1499");
+        assert_eq!(last["records"][1]["kind"], "gap");
+        assert_eq!(last["lines"][2], "after reconnect");
+        fs::remove_dir_all(root).unwrap();
     }
 }

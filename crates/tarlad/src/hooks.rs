@@ -1,0 +1,194 @@
+//! Scoped executor callbacks. An agent can report facts about its own run and poll
+//! a human decision. It cannot approve requests, dispatch, read a different run,
+//! or modify the supervisor's memory ledger directly.
+use super::*;
+use axum::{
+    extract::{Path as Route, State},
+    http::HeaderMap,
+};
+use hmac::{Hmac, Mac};
+use rusqlite::{params, OptionalExtension};
+use tarla_memory::{MemoryBackend, Mutation, SqliteMemory};
+use tarla_protocol::RunReceipt;
+
+pub fn token(s: &Service, id: &str) -> Result<String> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(s.ws.attach_key.as_bytes())?;
+    mac.update(b"tarla/run-hook/v1\0");
+    mac.update(id.as_bytes());
+    Ok(format!("{:x}", mac.finalize().into_bytes()))
+}
+pub async fn callback(
+    State(s): State<S>,
+    Route((id, op)): Route<(String, String)>,
+    headers: HeaderMap,
+    Json(v): Json<Value>,
+) -> Api {
+    let supplied = headers
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let expected = token(&s, &id)?;
+    if !secret_equal(supplied, &expected) {
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "invalid run hook credential".into(),
+        ));
+    }
+    let row = api::one(&s, &id)?;
+    if row["target_node_id"] != s.node()
+        || matches!(
+            row["observed_state"].as_str(),
+            Some("failed" | "succeeded" | "cancelled")
+        )
+    {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "run is not active on this executor".into(),
+        ));
+    }
+    let out = match op.as_str() {
+        "approval" => {
+            let request = string(&v, "request_id")?;
+            validate_id(request)?;
+            let aid = format!("{:x}", Sha256::digest(format!("{id}\n{request}")));
+            let mut c = s.db()?;
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let tool = string(&v, "tool_or_cmd")?;
+            let reason = string(&v, "risk_reason")?;
+            if tool.len() > 2048 || reason.len() > 2048 {
+                return Err(anyhow!("approval exceeds size limit").into());
+            }
+            let new=tx.execute("INSERT OR IGNORE INTO approvals(approval_id,workspace_id,run_id,node_id,tool_or_cmd,risk_reason,created_at) VALUES(?,?,?,?,?,?,?)",params![aid,s.id(),id,s.node(),tool,reason,now()])?;
+            let (old_tool, old_reason, resolution): (String, String, String) = tx.query_row(
+                "SELECT tool_or_cmd,risk_reason,resolution FROM approvals WHERE approval_id=?",
+                [&aid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            if old_tool != tool || old_reason != reason {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "request id already refers to another action".into(),
+                ));
+            }
+            if new != 0 {
+                let payload = json!({"run_id":id,"state":"blocked","approval":{"approval_id":aid,"tool_or_cmd":tool,"risk_reason":reason}});
+                tx.execute(
+                    "UPDATE runs SET observed_state='blocked' WHERE run_id=?",
+                    [&id],
+                )?;
+                tx.execute("INSERT INTO outbox_events(event_id,run_id,event_type,payload_json,created_at) VALUES(?,?,'state_changed',?,?)",params![uid(),id,payload.to_string(),now()])?;
+            }
+            tx.commit()?;
+            s.notify.notify_waiters();
+            json!({"approval_id":aid,"resolution":resolution})
+        }
+        "memory" => queue_proposal(&s, &v, Some(&id))?,
+        "receipt" => {
+            let receipt = tarla_context::bound_receipt(
+                RunReceipt {
+                    run_id: id.clone(),
+                    final_state: "succeeded".into(),
+                    executive_summary: string(&v, "executive_summary")?.into(),
+                    artifact_refs: serde_json::from_value(
+                        v.get("artifact_refs").cloned().unwrap_or(json!([])),
+                    )
+                    .map_err(anyhow::Error::from)?,
+                    s0_transcript_pointer: format!("node:{}/run:{id}/transcript.jsonl", s.node()),
+                },
+                s.ws.config.context_policy.run_receipt_max_tokens,
+            )?;
+            s.db()?.execute("INSERT INTO service_receipt_drafts VALUES(?,?) ON CONFLICT(run_id) DO UPDATE SET receipt=excluded.receipt",params![id,json!(receipt).to_string()])?;
+            json!({"stored":true})
+        }
+        "telemetry" => {
+            slot_reports::store(&s, string(&row, "target_slot_id")?, &v)?;
+            json!({"stored":true})
+        }
+        _ => return Err(ApiError(StatusCode::NOT_FOUND, "unknown run hook".into())),
+    };
+    Ok(Json(out))
+}
+pub fn queue_proposal(s: &Service, v: &Value, run: Option<&str>) -> Result<Value> {
+    let key = v["proposal_id"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(uid);
+    validate_id(&key)?;
+    let proposal = Mutation {
+        proposal_id: format!("{:x}", Sha256::digest(format!("{}:{key}", s.node()))),
+        memory_id: string(v, "memory_id")?.into(),
+        scope: v["scope"].as_str().unwrap_or("global").into(),
+        content: v["content"].as_str().unwrap_or_default().into(),
+        base_version: v["base_version"].as_i64().context("missing base_version")?,
+        source_node_id: s.node().into(),
+        source_run_id: run.map(String::from),
+        is_deleted: v["operation"] == "archive",
+        hlc_timestamp: Some(tarla_memory::Hlc {
+            physical_ms: now() * 1000,
+            logical: 0,
+            node_id: s.node().into(),
+        }),
+    };
+    let mut c = s.db()?;
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let existing: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT proposal,result FROM service_proposals WHERE id=?",
+            [&proposal.proposal_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((p, result)) = existing {
+        let mut orig: Mutation = serde_json::from_str(&p)?;
+        orig.hlc_timestamp = proposal.hlc_timestamp.clone();
+        if serde_json::to_value(orig)? != serde_json::to_value(&proposal)? {
+            bail!("conflicting proposal id")
+        }
+        if let Some(result) = result {
+            return Ok(serde_json::from_str(&result)?);
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO service_proposals VALUES(?,?,NULL)",
+            params![proposal.proposal_id, serde_json::to_string(&proposal)?],
+        )?;
+    }
+    tx.commit()?;
+    s.notify.notify_waiters();
+    Ok(json!({"status":"queued","proposal_id":key}))
+}
+pub async fn flush_memory(s: &Service) -> Result<()> {
+    let rows = list(
+        &s.db()?,
+        "SELECT id,proposal FROM service_proposals WHERE result IS NULL ORDER BY rowid LIMIT 16",
+        &[],
+    )?;
+    for row in rows {
+        let p: Mutation = serde_json::from_str(string(&row, "proposal")?)?;
+        let result = if s.is_supervisor() {
+            apply(s, s.node(), &p)?
+        } else {
+            peers::call(s, s.supervisor(), "propose", &json!({"proposal":p})).await?
+        };
+        s.db()?.execute(
+            "UPDATE service_proposals SET result=? WHERE id=?",
+            params![result.to_string(), p.proposal_id],
+        )?;
+    }
+    Ok(())
+}
+pub fn apply(s: &Service, node: &str, p: &Mutation) -> Result<Value> {
+    if node != p.source_node_id {
+        bail!("proposal source mismatch")
+    }
+    if let Some(id) = &p.source_run_id {
+        if api::one(s, id)?["target_node_id"] != node {
+            bail!("proposal does not own this run")
+        }
+    }
+    let mut c = s.db()?;
+    Ok(json!(
+        SqliteMemory::new(&mut c, s.id(), s.node()).propose_mutation(p)?
+    ))
+}

@@ -158,3 +158,138 @@ fn lock_is_exclusive_and_released_on_drop() {
     assert!(tarla_sidecar::try_lock_slot(tmp.path(), "a").is_ok());
     assert!(tarla_sidecar::try_lock_slot(tmp.path(), "..").is_err());
 }
+
+#[tokio::test]
+#[ignore = "requires real EasyTier core and CLI"]
+async fn real_easytier_two_node_private_ingress() -> io::Result<()> {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn node_info(runtime: &std::path::Path) -> io::Result<serde_json::Value> {
+        let info: serde_json::Value =
+            serde_json::from_slice(&fs::read(runtime.join("easytier.json"))?)?;
+        let rpc = info["rpc"].as_str().unwrap();
+        let cli = std::env::var_os("TARLA_TEST_EASYTIER_CLI")
+            .ok_or_else(|| io::Error::other("set TARLA_TEST_EASYTIER_CLI"))?;
+        let rst = tokio::process::Command::new(cli)
+            .args(["-p", rpc, "-o", "json", "node", "info"])
+            .output()
+            .await?;
+        if !rst.status.success() {
+            return Err(io::Error::other("node info unavailable"));
+        }
+        Ok(serde_json::from_slice(&rst.stdout)?)
+    }
+    async fn proxy_echo(proxy: SocketAddr, target: Ipv4Addr, port: u16) -> io::Result<()> {
+        let mut conn = TcpStream::connect(proxy).await?;
+        conn.write_all(&[5, 1, 0]).await?;
+        let mut auth = [0u8; 2];
+        conn.read_exact(&mut auth).await?;
+        let mut req = vec![5, 1, 0, 1];
+        req.extend(target.octets());
+        req.extend(port.to_be_bytes());
+        conn.write_all(&req).await?;
+        let mut rep = [0u8; 4];
+        conn.read_exact(&mut rep).await?;
+        if rep[1] != 0 {
+            return Err(io::Error::other("mesh connect rejected"));
+        }
+        let rest = match rep[3] {
+            1 => 6,
+            4 => 18,
+            3 => conn.read_u8().await? as usize + 2,
+            _ => return Err(io::Error::other("invalid address")),
+        };
+        conn.read_exact(&mut vec![0; rest]).await?;
+        conn.write_all(b"mesh").await?;
+        let mut bytes = [0u8; 4];
+        conn.read_exact(&mut bytes).await?;
+        if bytes != *b"mesh" {
+            return Err(io::Error::other("bad echo"));
+        }
+        Ok(())
+    }
+    async fn echo_server() -> io::Result<SocketAddr> {
+        let server = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let addr = server.local_addr()?;
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = server.accept().await else {
+                    return;
+                };
+                let mut data = [0u8; 4];
+                if s.read_exact(&mut data).await.is_ok() {
+                    let _ = s.write_all(&data).await;
+                }
+            }
+        });
+        Ok(addr)
+    }
+
+    let (tmp, tools, _) = fixture("TARLA_TEST_EASYTIER", "easytier")?;
+    std::env::set_var("TARLA_TEST_MESH_PAIR_SECRET", "paired-test");
+    let net = |peers| NetworkSpec::EasyTier {
+        network_name: "same-mesh".into(),
+        secret_env: "TARLA_TEST_MESH_PAIR_SECRET".into(),
+        peers,
+    };
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    let api = echo_server().await?;
+    let other = echo_server().await?;
+    let _a = tarla_sidecar::start_network_for(&tools, &a, &net(vec![]), api).await?;
+    let info = timeout(Duration::from_secs(12), async {
+        loop {
+            if let Ok(v) = node_info(&a).await {
+                if v["ipv4_addr"].as_str().is_some_and(|s| s.contains('/')) {
+                    break v;
+                }
+            }
+            sleep(Duration::from_millis(150)).await
+        }
+    })
+    .await?;
+    let node_ip: Ipv4Addr = info["ipv4_addr"]
+        .as_str()
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let listener = info["listeners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .find(|a| a.starts_with("tcp://"))
+        .unwrap()
+        .replace("0.0.0.0", "127.0.0.1");
+    let _b = start_network(&tools, &b, &net(vec![listener])).await?;
+    let endpoint: serde_json::Value = serde_json::from_slice(&fs::read(b.join("easytier.json"))?)?;
+    let proxy: SocketAddr = endpoint["socks5"].as_str().unwrap().parse().unwrap();
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if let Ok(Ok(())) = timeout(
+                Duration::from_secs(2),
+                proxy_echo(proxy, node_ip, api.port()),
+            )
+            .await
+            {
+                break;
+            }
+            sleep(Duration::from_millis(150)).await;
+        }
+    })
+    .await?;
+    assert!(!matches!(
+        timeout(
+            Duration::from_secs(2),
+            proxy_echo(proxy, node_ip, other.port())
+        )
+        .await,
+        Ok(Ok(()))
+    ));
+    Ok(())
+}

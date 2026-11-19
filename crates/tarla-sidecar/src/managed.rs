@@ -202,6 +202,12 @@ pub enum NetworkSpec {
         secret_env: String,
         peers: Vec<String>,
     },
+    EasyTierStatic {
+        network_name: String,
+        secret_env: String,
+        peers: Vec<String>,
+        ipv4: String,
+    },
     Tailscale,
 }
 pub struct ManagedNetwork {
@@ -279,6 +285,69 @@ pub async fn start_network(
     runtime: &Path,
     spec: &NetworkSpec,
 ) -> io::Result<Option<ManagedNetwork>> {
+    start_network_impl(tools, runtime, spec, None).await
+}
+
+/// Publish only the authenticated API port through a managed userspace mesh.
+/// Both backends connect incoming tailnet/overlay TCP flows to local IPv4
+/// loopback on the same port. Tailscale's grants are set by the tailnet admin.
+pub async fn start_network_for(
+    tools: &Toolchain,
+    runtime: &Path,
+    spec: &NetworkSpec,
+    api: SocketAddr,
+) -> io::Result<Option<ManagedNetwork>> {
+    if !api.is_ipv4() || !(api.ip().is_loopback() || api.ip().is_unspecified()) || api.port() == 0 {
+        return Err(invalid(
+            "managed mesh ingress requires a bound IPv4 loopback-compatible API address",
+        ));
+    }
+    start_network_impl(tools, runtime, spec, Some(api.port())).await
+}
+
+fn easytier_identity(runtime: &Path) -> io::Result<uuid::Uuid> {
+    let file = runtime.join("easytier-instance");
+    match fs::read_to_string(&file) {
+        Ok(id) => uuid::Uuid::parse_str(id.trim())
+            .map_err(|_| invalid("invalid saved EasyTier instance id")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let id = uuid::Uuid::new_v4();
+            write_record(&file, id.to_string().as_bytes())?;
+            Ok(id)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn address_config(spec: &NetworkSpec) -> io::Result<String> {
+    if let NetworkSpec::EasyTierStatic { ipv4, .. } = spec {
+        let (ip, prefix) = ipv4.split_once('/').unwrap_or((ipv4, "24"));
+        let ip = ip
+            .parse::<Ipv4Addr>()
+            .map_err(|_| invalid("invalid EasyTier IPv4 address"))?;
+        let prefix = prefix
+            .parse::<u8>()
+            .map_err(|_| invalid("invalid EasyTier prefix length"))?;
+        if ip.is_loopback()
+            || ip.is_unspecified()
+            || ip.is_multicast()
+            || ip.is_broadcast()
+            || prefix == 0
+            || prefix > 32
+        {
+            return Err(invalid("invalid EasyTier virtual IPv4 CIDR"));
+        }
+        return Ok(format!("dhcp = false\nipv4 = \"{ip}/{prefix}\""));
+    }
+    Ok("dhcp = true".into())
+}
+
+async fn start_network_impl(
+    tools: &Toolchain,
+    runtime: &Path,
+    spec: &NetworkSpec,
+    api_port: Option<u16>,
+) -> io::Result<Option<ManagedNetwork>> {
     if matches!(spec, NetworkSpec::ReuseHostNetwork) {
         return Ok(None);
     }
@@ -296,19 +365,38 @@ pub async fn start_network(
             network_name,
             secret_env,
             peers,
+        }
+        | NetworkSpec::EasyTierStatic {
+            network_name,
+            secret_env,
+            peers,
+            ..
         } => {
             if network_name.is_empty() || secret_env.is_empty() {
                 return Err(invalid("EasyTier requires a private network identity"));
             }
-            let secret = std::env::var(secret_env)
-                .map_err(|_| invalid("EasyTier secret environment variable unavailable"))?;
+            let secret = crate::secrets::resolve(secret_env).await?;
             if secret.is_empty() {
                 return Err(invalid("EasyTier secret must be nonempty"));
             }
             // v2.7.0's --socks5 accepts only a port and binds 0.0.0.0. Use
             // the structured config to explicitly constrain SOCKS to loopback.
             let q = |s: &str| serde_json::to_string(s).map_err(io::Error::from);
-            let mut toml=format!("dhcp = true\nlisteners = [\"tcp://0.0.0.0:0\"]\nsocks5_proxy = \"socks5://{socks}\"\n[network_identity]\nnetwork_name = {}\nnetwork_secret = {}\n[flags]\nno_tun = true\n",q(network_name)?,q(&secret)?);
+            let mut toml = format!(
+                concat!(
+                    "instance_id = \"{}\"\n{}\nlisteners = [\"tcp://0.0.0.0:0\"]\n",
+                    "socks5_proxy = \"socks5://{}\"\n",
+                    "tcp_whitelist = [\"{}\"]\nudp_whitelist = [\"0\"]\n",
+                    "[network_identity]\nnetwork_name = {}\nnetwork_secret = {}\n",
+                    "[flags]\nno_tun = true\nprivate_mode = true\n"
+                ),
+                easytier_identity(&runtime)?,
+                address_config(spec)?,
+                socks,
+                api_port.unwrap_or(0),
+                q(network_name)?,
+                q(&secret)?
+            );
             for peer in peers {
                 toml.push_str(&format!("[[peer]]\nuri = {}\n", q(peer)?));
             }
@@ -390,7 +478,7 @@ pub async fn start_network(
     let record = runtime.join(format!("{name}.json"));
     write_record(
         &record,
-        &serde_json::to_vec(&json!({"pid":pid,"socks5":socks,"rpc":rpc}))?,
+        &serde_json::to_vec(&json!({"pid":pid,"socks5":socks,"rpc":rpc,"api_port":api_port}))?,
     )?;
     Ok(Some(ManagedNetwork {
         child,
