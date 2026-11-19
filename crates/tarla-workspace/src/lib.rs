@@ -84,6 +84,7 @@ pub struct Network {
     pub enable_tailscale: bool,
     pub easytier_network_name: String,
     pub easytier_network_secret_ref: String,
+    pub easytier_listen: Option<std::net::SocketAddr>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
 }
@@ -95,6 +96,7 @@ impl Default for Network {
             enable_tailscale: false,
             easytier_network_name: String::new(),
             easytier_network_secret_ref: String::new(),
+            easytier_listen: None,
             extra: BTreeMap::new(),
         }
     }

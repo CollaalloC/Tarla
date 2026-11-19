@@ -285,7 +285,21 @@ pub async fn start_network(
     runtime: &Path,
     spec: &NetworkSpec,
 ) -> io::Result<Option<ManagedNetwork>> {
-    start_network_impl(tools, runtime, spec, None).await
+    start_network_impl(tools, runtime, spec, None, None).await
+}
+
+pub struct NetworkPorts {
+    pub api: SocketAddr,
+    pub easytier_listen: Option<SocketAddr>,
+}
+
+impl From<SocketAddr> for NetworkPorts {
+    fn from(api: SocketAddr) -> Self {
+        Self {
+            api,
+            easytier_listen: None,
+        }
+    }
 }
 
 /// Publish only the authenticated API port through a managed userspace mesh.
@@ -295,14 +309,18 @@ pub async fn start_network_for(
     tools: &Toolchain,
     runtime: &Path,
     spec: &NetworkSpec,
-    api: SocketAddr,
+    ports: impl Into<NetworkPorts>,
 ) -> io::Result<Option<ManagedNetwork>> {
+    let NetworkPorts {
+        api,
+        easytier_listen,
+    } = ports.into();
     if !api.is_ipv4() || !(api.ip().is_loopback() || api.ip().is_unspecified()) || api.port() == 0 {
         return Err(invalid(
             "managed mesh ingress requires a bound IPv4 loopback-compatible API address",
         ));
     }
-    start_network_impl(tools, runtime, spec, Some(api.port())).await
+    start_network_impl(tools, runtime, spec, Some(api.port()), easytier_listen).await
 }
 
 fn easytier_identity(runtime: &Path) -> io::Result<uuid::Uuid> {
@@ -347,6 +365,7 @@ async fn start_network_impl(
     runtime: &Path,
     spec: &NetworkSpec,
     api_port: Option<u16>,
+    easytier_listen: Option<SocketAddr>,
 ) -> io::Result<Option<ManagedNetwork>> {
     if matches!(spec, NetworkSpec::ReuseHostNetwork) {
         return Ok(None);
@@ -382,9 +401,10 @@ async fn start_network_impl(
             // v2.7.0's --socks5 accepts only a port and binds 0.0.0.0. Use
             // the structured config to explicitly constrain SOCKS to loopback.
             let q = |s: &str| serde_json::to_string(s).map_err(io::Error::from);
+            let listen = easytier_listen.unwrap_or_else(|| (Ipv4Addr::UNSPECIFIED, 0).into());
             let mut toml = format!(
                 concat!(
-                    "instance_id = \"{}\"\n{}\nlisteners = [\"tcp://0.0.0.0:0\"]\n",
+                    "instance_id = \"{}\"\n{}\nlisteners = [\"tcp://{}\"]\n",
                     "socks5_proxy = \"socks5://{}\"\n",
                     "tcp_whitelist = [\"{}\"]\nudp_whitelist = [\"0\"]\n",
                     "[network_identity]\nnetwork_name = {}\nnetwork_secret = {}\n",
@@ -395,6 +415,7 @@ async fn start_network_impl(
                 ),
                 easytier_identity(&runtime)?,
                 address_config(spec)?,
+                listen,
                 socks,
                 api_port.unwrap_or(0),
                 q(network_name)?,
@@ -417,6 +438,12 @@ async fn start_network_impl(
         }
         NetworkSpec::Tailscale => {
             let mut c = clean_command(&tools.verified("tailscale")?);
+            // The host may trust a private CA for a self-hosted Headscale server.
+            for key in ["SSL_CERT_FILE", "SSL_CERT_DIR"] {
+                if let Some(value) = std::env::var_os(key) {
+                    c.env(key, value);
+                }
+            }
             #[cfg(not(windows))]
             let socket = runtime.join("ts.sock").into_os_string();
             #[cfg(windows)]

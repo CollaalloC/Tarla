@@ -9,10 +9,10 @@ import shutil
 import subprocess
 import tempfile
 
-from acceptance import Node, until
+from acceptance import Node, free_port, until
 
 
-def configure(node, peer, local_ip, peer_ip, seeds):
+def configure(node, peer, local_ip, peer_ip, seeds, listen=None):
     bin_dir = node.home / "bin"
     executable = bin_dir / "easytier" / "2.7.0" / "easytier-core"
     executable.parent.mkdir(parents=True)
@@ -27,6 +27,9 @@ def configure(node, peer, local_ip, peer_ip, seeds):
             .replace('easytier_network_secret_ref = ""',
                      'easytier_network_secret_ref = "env:TARLA_TEST_NETWORK_KEY"'
                      + f'\neasytier_ipv4 = "{local_ip}/24"\neasytier_peers = ' + json.dumps(seeds)))
+    if listen:
+        body = body.replace("enable_easytier = true",
+                            f'enable_easytier = true\neasytier_listen = "{listen}"')
     body += f'\n[[peers]]\nnode_id = "{peer.name}"\nurl = "http://{peer_ip}:{peer.port}"\n'
     cfg.write_text(body + 'token_env = "TARLA_PAIR_TEST"\n')
 
@@ -56,14 +59,15 @@ def run(tmp):
     ip_a, ip_b = "10.74.63.1", "10.74.63.2"
     secret = secrets.token_hex(32)
     os.environ["TARLA_TEST_NETWORK_KEY"] = secrets.token_hex(32)
-    configure(a, b, ip_a, ip_b, [])
+    listen = f"127.0.0.1:{free_port()}"
+    seed = "tcp://" + listen
+    configure(a, b, ip_a, ip_b, [], listen=listen)
     with contextlib.ExitStack() as cleanup:
         cleanup.callback(a.stop)
         a.start(secret)
         reported, listeners = until(lambda: info(a, ip_a), "primary EasyTier registered")
         assert reported == ip_a + "/24", "static primary overlay address"
-        listener = next(url for url in listeners if url.startswith("tcp://"))
-        seed = "tcp://127.0.0.1:" + listener.rsplit(":", 1)[1]
+        assert seed in listeners, "fixed bootstrap listener"
         configure(b, a, ip_b, ip_a, [seed])
         cleanup.callback(b.stop)
         b.start(secret)
@@ -82,7 +86,14 @@ def run(tmp):
         b.start(secret)
         assert identity.read_text() == before
         until(lambda: any(m["content"] == "offline delta" for m in b.api("/v1/memories")), "resync after restart")
-        print("PASS two authenticated tarlad daemons exchanged memory over real isolated EasyTier processes, including executor restart")
+        b.stop()
+        a.stop()
+        b.start(secret)
+        a.start(secret)
+        a.api("/v1/memories", {**memory, "content": "both restarted", "base_version": 2})
+        until(lambda: any(m["content"] == "both restarted" for m in b.api("/v1/memories")),
+              "rediscover the fixed seed after both nodes restart")
+        print("PASS two paired daemons exchanged memory over EasyTier before and after both nodes restarted")
 
 
 if __name__ == "__main__":

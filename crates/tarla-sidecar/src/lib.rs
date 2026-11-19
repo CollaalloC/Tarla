@@ -5,7 +5,7 @@ mod secrets;
 pub use herdr::{Herdr, TerminalEvent, TerminalReader, TerminalStatus, TerminalWriter};
 pub use managed::{
     credential_environment, start_network, start_network_for, try_lock_slot, ManagedNetwork,
-    NetworkSpec, Toolchain,
+    NetworkPorts, NetworkSpec, Toolchain,
 };
 
 use std::{fs, io, path::Path};

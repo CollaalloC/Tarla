@@ -263,8 +263,11 @@ async fn main() -> Result<()> {
             specs.push(("tailscale", tarla_sidecar::NetworkSpec::Tailscale));
         }
         for (name, spec) in specs {
-            if let Some(net) =
-                tarla_sidecar::start_network_for(&tc, &runtime, &spec, actual).await?
+            let ports = tarla_sidecar::NetworkPorts {
+                api: actual,
+                easytier_listen: network.easytier_listen,
+            };
+            if let Some(net) = tarla_sidecar::start_network_for(&tc, &runtime, &spec, ports).await?
             {
                 transports.push((name, net))
             }

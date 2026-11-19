@@ -72,6 +72,9 @@ jobs:
       - name: Isolated EasyTier mesh
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: python3 tests/mesh_acceptance.py
+      - name: Self-hosted Tailscale mesh
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: python3 tests/tailnet_acceptance.py
   client:
     runs-on: ubuntu-latest
     defaults:

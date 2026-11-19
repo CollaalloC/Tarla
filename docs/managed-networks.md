@@ -19,6 +19,8 @@ easytier_peers = ["tcp://seed.example.net:11010"]
 
 在执行节点把 `easytier_ipv4` 改为 `10.74.63.2/24`。若省略这个字段，EasyTier 使用 DHCP。固定地址便于在配对记录中保存稳定的 URL。Tarla 将本实例标识写入工作空间的 `runtime/easytier-instance`，重启后继续使用。
 
+两台机器中若有一台可被另一台直接访问，可以由它充当种子。例如主管的局域网地址为 `192.168.1.20`，就在主管的 `[network]` 中配置 `easytier_listen = "192.168.1.20:11010"` 和 `easytier_peers = []`，在执行机配置 `easytier_peers = ["tcp://192.168.1.20:11010"]`。两端重启后，执行机仍从这个固定入口加入网络。未指定监听地址时，EasyTier 使用系统分配的动态 TCP 端口。SOCKS 与管理端口始终独立绑定回环。
+
 为两个守护进程设置相同的 `TARLA_RESEARCH_MESH_SECRET`。另设独立的 `TARLA_RESEARCH_PAIR` 供应用层鉴权。随后分别运行以下命令并启动对应守护进程。
 
 ```sh
