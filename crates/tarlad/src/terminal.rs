@@ -74,7 +74,7 @@ pub async fn socket(
     }
     let observe = lease.mode == AttachMode::Observe;
     let (mut reader, mut writer) = fleet::herdr(&s)?
-        .attach(&lease.hc_terminal_id, observe, 80, 24)
+        .attach(&lease.run_id, &lease.hc_terminal_id, observe, 80, 24)
         .await
         .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e.to_string()))?;
     Ok(upgrade.max_message_size(65536).on_upgrade(move|socket|async move{

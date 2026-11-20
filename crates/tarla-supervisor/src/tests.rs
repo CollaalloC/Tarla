@@ -363,6 +363,9 @@ printf '%s\n' '{"result":"{\"text\":\"via slot\",\"tool_calls\":[]}"}'
     let args = fs::read_to_string(credential_dir.join("args")).unwrap();
     assert!(args.contains("--tools\n\n"));
     assert!(args.contains("--safe-mode"));
+    assert!(args.contains("--disallowedTools\nmcp__*\n"));
+    assert!(args.contains("--strict-mcp-config\n--mcp-config\n{\"mcpServers\":{}}\n"));
+    assert!(args.contains("--max-turns\n1\n"));
     assert!(args.contains("--no-session-persistence"));
     assert!(!args.contains("hello"));
     let prompt: Value =

@@ -5,7 +5,9 @@ mod facts;
 mod fleet;
 mod handoff;
 mod hooks;
+mod launch;
 mod local_endpoint;
+mod maintenance;
 mod peers;
 mod skills;
 mod slot_reports;
@@ -69,6 +71,7 @@ struct Service {
     s2_changed: tokio::sync::watch::Sender<i64>,
     sync_wake: tokio::sync::Notify,
     receipt_wake: tokio::sync::Notify,
+    context_wake: tokio::sync::Notify,
 }
 type S = Arc<Service>;
 impl Service {
@@ -193,14 +196,23 @@ fn ensure_supervisor(s: &Service) -> Api<()> {
 }
 
 const MIGRATIONS: &str = include_str!("service.sql");
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("--executor-launch-helper"))
+    {
+        std::process::exit(launch::helper(std::env::args_os().skip(2))?);
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--pinned-turn-helper")) {
         let path = std::env::args_os()
             .nth(2)
             .context("missing pinned launch record")?;
         std::process::exit(handoff::helper(Path::new(&path))?);
     }
+    serve()
+}
+
+#[tokio::main]
+async fn serve() -> Result<()> {
     let a = Args::parse();
     if a.publish_local_endpoint && !a.listen.ip().is_loopback() {
         bail!("local endpoint discovery requires a loopback listener");
@@ -238,6 +250,7 @@ async fn main() -> Result<()> {
     let db_path = ws.root.join("state.db");
     let mut initial = tarla_memory::open(&db_path, &a.workspace)?;
     initial.execute_batch(MIGRATIONS)?;
+    initial.execute_batch(launch::SCHEMA)?;
     drafts::migrate(&mut initial)?;
     peers::check_term(&mut initial, &ws)?;
     facts::configure(&mut initial, &conf, &ws.config.workspace.node_id)?;
@@ -329,9 +342,10 @@ async fn main() -> Result<()> {
         }
     }
     let brain = SupervisorEngine::new(
-        tarla_supervisor::backends_from_config(
+        tarla_supervisor::backends_from_config_with_slots(
             &ws.config.supervisor.brain.fallback_chain,
             &table.try_into()?,
+            Some(&fleet::subscription_registry(&home, &db_path, &slots)?),
         )?,
         ws.config.supervisor.brain.max_tool_steps,
     )
@@ -389,6 +403,7 @@ async fn main() -> Result<()> {
         s2_changed: tokio::sync::watch::channel(0).0,
         sync_wake: Default::default(),
         receipt_wake: Default::default(),
+        context_wake: Default::default(),
     });
 
     let routes = Router::new()
@@ -403,6 +418,7 @@ async fn main() -> Result<()> {
         .route("/v1/runs/{id}", get(api::get_run))
         .route("/v1/runs/{id}/log", get(api::logs))
         .route("/v1/runs/{id}/cancel", post(api::cancel))
+        .route("/v1/runs/{id}/abandon", post(launch::abandon))
         .route("/v1/runs/{id}/attach", post(terminal::issue))
         .route("/v1/memories", get(api::memories).post(api::put_memory))
         .route("/v1/actions", get(api::actions))
@@ -443,6 +459,7 @@ async fn main() -> Result<()> {
     peers::start_s2_notifications(&service);
     tokio::spawn(peers::replicate(service.clone()));
     tokio::spawn(control::deliver_receipts(service.clone()));
+    tokio::spawn(maintenance::maintain_context(service.clone()));
     if service.hosted_index.is_some() {
         tokio::spawn(control::publish_memories(service.clone()));
     }

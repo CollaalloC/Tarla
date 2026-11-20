@@ -326,6 +326,13 @@ fn accept_events(c: &Connection, s: &Service, node: &str, events: &[Value]) -> R
                     if terminal && state != r.final_state {
                         bail!("conflicting terminal state")
                     }
+                    // A peer may reissue its final receipt under a different outbox ID.
+                    // The first accepted completion remains the single conversation wake.
+                    if c.query_row("SELECT exists(SELECT 1 FROM service_wakes WHERE conversation_id=? AND json_extract(receipt,'$.run_id')=?)",
+                        params![conv, id], |row| row.get::<_,bool>(0))? {
+                        ack.push(eid.to_owned());
+                        continue;
+                    }
                     c.execute("UPDATE approvals SET resolution='ended',resolved_at=? WHERE run_id=? AND resolution='pending'",params![now(),id])?;
                     c.execute("UPDATE runs SET observed_state=?,receipt_summary=?,artifacts_json=?,updated_at=? WHERE run_id=?",params![r.final_state,r.executive_summary,serde_json::to_string(&r.artifact_refs)?,now(),id])?;
                     c.execute("INSERT OR IGNORE INTO service_wakes(event_id,conversation_id,receipt) VALUES(?,?,?)",params![eid,conv,serde_json::to_string(&r)?])?;

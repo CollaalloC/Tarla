@@ -31,7 +31,6 @@ async fn real_herdr_holder_and_scoped_stream() -> io::Result<()> {
     let (tmp, tools, binary) = fixture("TARLA_TEST_HERDR", "herdr-core")?;
     let rt = tmp.path().join("rt");
     let core = Herdr::new(&rt)?;
-    tools.ensure_herdr(&core).await?;
     struct Stop(PathBuf, PathBuf);
     impl Drop for Stop {
         fn drop(&mut self) {
@@ -45,7 +44,21 @@ async fn real_herdr_holder_and_scoped_stream() -> io::Result<()> {
                 .output();
         }
     }
+    // Even a timed-out startup may finish in the background. The cleanup
+    // command addresses only this test's socket and state directory.
     let _cleanup = Stop(binary, rt.clone());
+    tools.ensure_herdr(&core).await?;
+    // In the released core the 20th terminal has the first non-decimal
+    // address. Create terminals through the real API so allocator changes and
+    // launch results are covered, including rediscovery after reconnect.
+    let core_id = core.machine_id().await?;
+    for n in 1..20 {
+        let run = format!("seed-{n}");
+        let address = core
+            .start_run(&run, &["/bin/true".into()], tmp.path(), &BTreeMap::new())
+            .await?;
+        assert_eq!(core.find_run(&run).await?, Some(address));
+    }
     let id = core
         .start_run(
             "fixture",
@@ -54,15 +67,16 @@ async fn real_herdr_holder_and_scoped_stream() -> io::Result<()> {
             &BTreeMap::new(),
         )
         .await?;
+    assert_eq!(id, "t1b");
     assert_eq!(core.find_run("fixture").await?, Some(id.clone()));
-    assert_eq!(core.status(&id).await?.state, "live");
-    let (mut obs, mut reader_controls) = core.attach(&id, true, 80, 24).await?;
+    assert_eq!(core.status("fixture", &id).await?.state, "live");
+    let (mut obs, mut reader_controls) = core.attach("fixture", &id, true, 80, 24).await?;
     assert_eq!(
         reader_controls.input(b"x").await.unwrap_err().kind(),
         io::ErrorKind::PermissionDenied
     );
     assert!(reader_controls.resize(90, 45).await.is_err());
-    let (_input_reader, mut input) = core.attach(&id, false, 80, 24).await?;
+    let (_input_reader, mut input) = core.attach("fixture", &id, false, 80, 24).await?;
     input.resize(81, 25).await?;
     input.input(b"tarla-paint-probe\r").await?;
     timeout(Duration::from_secs(5), async {
@@ -83,21 +97,52 @@ async fn real_herdr_holder_and_scoped_stream() -> io::Result<()> {
         io::Result::Ok(())
     })
     .await??;
-    assert!(core.read(&id, 5).await?.contains("tarla-paint-probe"));
+    assert!(core
+        .read("fixture", &id, 5)
+        .await?
+        .contains("tarla-paint-probe"));
     reader_controls.close().await?;
     input.close().await?;
     // A fresh tarlad client sees the same authoritative terminal after detach.
     let second = Herdr::new(&rt)?;
+    assert_eq!(second.machine_id().await?, core_id);
+    assert_eq!(
+        second.status("seed-1", &id).await.unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        second.read("seed-1", &id, 5).await.unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(
+        matches!(second.attach("seed-1", &id, false, 80, 24).await, Err(e) if e.kind() == io::ErrorKind::PermissionDenied)
+    );
+    assert_eq!(
+        second
+            .send("seed-1", &id, "unrelated input")
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        second.cancel("seed-1", &id).await.unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(second.status("fixture", &id).await?.state, "live");
     assert_eq!(second.find_run("fixture").await?, Some(id.clone()));
-    second.cancel(&id).await?;
+    second.cancel("fixture", &id).await?;
     timeout(Duration::from_secs(5), async {
-        while second.status(&id).await?.state != "finished" {
+        while second.status("fixture", &id).await?.state != "finished" {
             sleep(Duration::from_millis(50)).await
         }
         io::Result::Ok(())
     })
     .await??;
-    assert!(second.attach("other/t1", false, 80, 24).await.is_err());
+    assert!(second
+        .attach("fixture", "other/t1", false, 80, 24)
+        .await
+        .is_err());
     Ok(())
 }
 

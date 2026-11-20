@@ -56,12 +56,13 @@ impl Captures {
             .map_err(|_| anyhow::anyhow!("capture registry unavailable"))?;
         active.retain(|_, task| !task.is_finished());
         if !active.contains_key(id) {
+            let run_id = id.to_owned();
             let terminal = terminal.to_owned();
             let hc = hc.clone();
             active.insert(
                 id.to_owned(),
                 tokio::spawn(async move {
-                    if let Err(e) = capture(&dir, &terminal, &hc).await {
+                    if let Err(e) = capture(&dir, &run_id, &terminal, &hc).await {
                         eprintln!("terminal capture interrupted: {e}");
                     }
                 }),
@@ -220,8 +221,8 @@ where
     })
     .await?
 }
-async fn capture(dir: &Path, terminal: &str, hc: &Herdr) -> Result<()> {
-    let (mut reader, mut writer) = hc.attach(terminal, true, 80, 24).await?;
+async fn capture(dir: &Path, run_id: &str, terminal: &str, hc: &Herdr) -> Result<()> {
+    let (mut reader, mut writer) = hc.attach(run_id, terminal, true, 80, 24).await?;
     begin_stream(dir).await?;
     loop {
         match reader.next().await? {
@@ -484,6 +485,11 @@ mod observer_test {
     }
     async fn observe(s: UnixStream, output: &[u8]) {
         let mut r = TokioReader::new(s);
+        let mut get = String::new();
+        r.read_line(&mut get).await.unwrap();
+        let request: Value = serde_json::from_str(&get).unwrap();
+        assert_eq!(request["method"], "terminal.get");
+        r.get_mut().write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"address\":\"t1\",\"labels\":{\"tarla_run\":\"run\"}}}\n").await.unwrap();
         let mut hello = String::new();
         r.read_line(&mut hello).await.unwrap();
         assert_eq!(
@@ -503,7 +509,7 @@ mod observer_test {
             &mut s,
             0,
             0,
-            br#"{"jsonrpc":"2.0","id":2,"result":{"channel":7,"terminal":{"address":"t1"}}}"#,
+            br#"{"jsonrpc":"2.0","id":2,"result":{"channel":7,"terminal":{"address":"t1","labels":{"tarla_run":"run"}}}}"#,
         )
         .await;
         frame(&mut s, 7, 0, output).await;
@@ -531,9 +537,9 @@ mod observer_test {
             observe(sock.accept().await.unwrap().0, payload.as_bytes()).await;
             observe(sock.accept().await.unwrap().0, b"after reconnect\n").await;
         });
-        capture(&dir, "t1", &hc).await.unwrap();
+        capture(&dir, "run", "t1", &hc).await.unwrap();
         // A fresh recording session reopens the same run after tarlad restarts.
-        capture(&dir, "t1", &hc).await.unwrap();
+        capture(&dir, "run", "t1", &hc).await.unwrap();
         server.await.unwrap();
         assert_eq!(
             page(&root, "run", 1, 1, "").unwrap()["lines"],

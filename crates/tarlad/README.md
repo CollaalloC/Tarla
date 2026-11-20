@@ -6,6 +6,17 @@ Start one service per initialized workspace with `tarlad --home ~/.tarla --works
 
 The supervisor commits an immutable run ID and target. The executor commits a unique claim before asking its private Herdr holder to launch the configured argv. An ambiguous launch reconciles using the run's permanent label. If the executor cannot establish whether a process started, it keeps that run unconfirmed. Confirmed completions and pending human requests enter a durable outbox. The supervisor acknowledges events after committing their effects and the completion wake. An executor reconnects to poll assignments and replay unacknowledged events. The supervisor's term and workspace ID must match the configured epoch on both ends.
 
+Each new claim carries a durable one-use launch permit. Its Herdr-owned helper holds the slot's account lock until the worker exits, including across a daemon restart. Cancellation is checked in the same SQLite write transaction as process creation. When a missing holder never consumed its permit, reconciliation revokes the permit and closes the original run. An admitted or older command with a missing holder stays `unconfirmed` because its previous effects are unknown.
+
+To release such a slot, inspect the executor's local processes and worktree, including any artifacts the command may already have written. Once you have established that the command has stopped, target that executor directly:
+
+```sh
+tarla --url http://127.0.0.1:7878 --workspace work abandon RUN_ID --confirm-stopped --reason "Checked the executor and worktree; recorded the partial changes."
+```
+
+The executor checks its private Herdr inventory for a retained terminal. It records the owner's reason and closes the original run as cancelled. A later task on the same slot obtains a fresh run ID. If the inventory is unavailable, restore the private Herdr service and repeat the command.
+
+
 For a slot of type `local`, the last argv entry is a JSON mission. The executable is selected by the operator.
 
 ```toml

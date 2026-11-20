@@ -102,18 +102,31 @@ pub async fn memories(s: &Service, v: &Value) -> Result<Value> {
     Ok(json!(reply))
 }
 
+pub fn context_policy(s: &Service, skill_cost: usize) -> Result<tarla_context::ContextPolicy> {
+    let p = &s.ws.config.context_policy;
+    let available = p
+        .supervisor_active_budget_tokens
+        .checked_sub(tarla_supervisor::control_window_reserve())
+        .and_then(|n| n.checked_sub(skill_cost))
+        .context("selected skill and control tools exceed the supervisor budget")?;
+    // Keep room for a bounded archive page and the assistant tool call that requested it.
+    Ok(tarla_context::ContextPolicy {
+        supervisor_active_budget_tokens: available - (available / 4).min(1536),
+        compaction_high_watermark_pct: p.compaction_high_watermark_pct,
+        protected_verbatim_turns: p.protected_verbatim_turns,
+    })
+}
+
 pub struct Plane<'a> {
     s: &'a Service,
     source: String,
     skill: Option<skills::Selection>,
     draft: Option<drafts::Live<'a>>,
+    completion: Option<(&'a str, &'a str)>,
 }
 impl Plane<'_> {
     fn effect(&self, action: &str) -> String {
-        format!(
-            "{:x}",
-            Sha256::digest(format!("{}\n{action}", self.source).as_bytes())
-        )
+        effect_key(&self.source, action)
     }
 }
 #[async_trait]
@@ -139,11 +152,13 @@ impl ControlPlane for Plane<'_> {
                 .await?
                 .to_string(),
             "/unbind" => set_binding(self.s, id, &json!({"mode":"orchestrator"}))?.to_string(),
-            t if t.starts_with("/dispatch ") => fleet::dispatch(
+            t if t.starts_with("/dispatch ") => fleet::dispatch_selected(
                 self.s,
                 id,
                 &json!({"goal":t[10..].trim()}),
                 Some(self.effect("dispatch")),
+                None,
+                Some(fleet::Acknowledgement::Command(&self.source)),
             )?
             .to_string(),
             _=> return handoff::pinned(self.s,id,text,&self.source,self.effect("dispatch"),self.skill.as_ref()),
@@ -160,26 +175,22 @@ impl ControlPlane for Plane<'_> {
             } => conversation_id,
         };
         let mut c = self.s.db()?;
-        let prefix = SqliteMemory::new(&mut c, self.s.id(), self.s.node())
-            .prefetch_frozen_snapshot("global", self.s.ws.config.memory.prefetch_token_budget)?;
-        let p = &self.s.ws.config.context_policy;
-        let history = tarla_context::assemble(
-            &mut c,
-            id,
-            &self.s.ws.soul,
-            &prefix,
-            &tarla_context::ContextPolicy {
-                supervisor_active_budget_tokens: p
-                    .supervisor_active_budget_tokens
-                    .checked_sub(tarla_supervisor::control_window_reserve())
-                    .and_then(|n| {
-                        n.checked_sub(self.skill.as_ref().map_or(0, skills::Selection::cost))
-                    })
-                    .context("selected skill and control tools exceed the supervisor budget")?,
-                compaction_high_watermark_pct: p.compaction_high_watermark_pct,
-                protected_verbatim_turns: p.protected_verbatim_turns,
-            },
+        let frozen: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversation_prefix WHERE conversation_id=?1)",
+            [id],
+            |r| r.get(0),
         )?;
+        let prefix = if frozen {
+            String::new()
+        } else {
+            SqliteMemory::new(&mut c, self.s.id(), self.s.node())
+                .prefetch_frozen_snapshot("global", self.s.ws.config.memory.prefetch_token_budget)?
+        };
+        let policy = context_policy(
+            self.s,
+            self.skill.as_ref().map_or(0, skills::Selection::cost),
+        )?;
+        let history = tarla_context::assemble(&mut c, id, &self.s.ws.soul, &prefix, &policy)?;
         let mut messages: Vec<_> = history
             .into_iter()
             .map(|m| match m.role.as_str() {
@@ -204,6 +215,7 @@ impl ControlPlane for Plane<'_> {
                 &args,
                 Some(self.effect("dispatch")),
                 self.skill.as_ref(),
+                Some(fleet::Acknowledgement::Supervisor(&self.source)),
             ),
             ControlTool::InspectRunLog => {
                 api::read_log(
@@ -215,14 +227,7 @@ impl ControlPlane for Plane<'_> {
                 )
                 .await
             }
-            ControlTool::SessionRecall => Ok(json!(tarla_context::recall(
-                &self.s.db()?,
-                id,
-                args["dag_node_id"].as_str(),
-                args["query"].as_str().unwrap_or(""),
-                args["after_seq"].as_i64().unwrap_or(0),
-                args["limit"].as_u64().unwrap_or(10).min(50) as usize
-            )?)),
+            ControlTool::SessionRecall => tarla_context::recall_tool(&self.s.db()?, id, &args),
             ControlTool::MemoryManage => {
                 if args["operation"] == "create" {
                     if args["memory_id"].is_null() {
@@ -239,19 +244,66 @@ impl ControlPlane for Plane<'_> {
         }
     }
     async fn deliver(&self, id: &str, reply: &str) -> Result<()> {
-        tarla_context::append(
-            &mut self.s.db()?,
+        let mut db = self.s.db()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tarla_context::append_in(
+            &tx,
             self.s.id(),
             id,
-            "supervisor",
-            &self.source,
+            ("supervisor", &self.source),
             "assistant",
             reply,
+            self.completion.map(|(_, run)| run),
         )?;
+        if let Some((event, _)) = self.completion {
+            tx.execute(
+                "UPDATE service_wakes SET delivered=1 WHERE event_id=? AND conversation_id=?",
+                params![event, id],
+            )?;
+        }
+        tx.commit()?;
+        self.s.context_wake.notify_one();
         Ok(())
     }
 }
-pub async fn message(s: &Service, id: &str, payload: &Value) -> Result<String> {
+fn effect_key(source: &str, action: &str) -> String {
+    format!("{:x}", Sha256::digest(format!("{source}\n{action}")))
+}
+
+pub fn record_run_reply(
+    tx: &rusqlite::Transaction<'_>,
+    workspace: &str,
+    conversation: &str,
+    source: &str,
+    run: &str,
+    reply: &str,
+) -> Result<()> {
+    tarla_context::append_in(
+        tx,
+        workspace,
+        conversation,
+        ("supervisor", source),
+        "assistant",
+        reply,
+        Some(run),
+    )?;
+    Ok(())
+}
+
+fn message_result(id: &str, reply: String, run: Option<String>) -> Value {
+    let run = run.or_else(|| {
+        serde_json::from_str::<Value>(&reply)
+            .ok()
+            .and_then(|value| value["run_id"].as_str().map(String::from))
+    });
+    let mut out = json!({"conversation_id":id, "reply":reply});
+    if let Some(run) = run {
+        out["run_id"] = json!(run);
+    }
+    out
+}
+
+pub async fn message(s: &Service, id: &str, payload: &Value) -> Result<Value> {
     validate_id(id)?;
     let text = string(payload, "text")?;
     let channel = payload["channel"].as_str().unwrap_or("cli");
@@ -282,13 +334,30 @@ pub async fn message(s: &Service, id: &str, payload: &Value) -> Result<String> {
         key = drafts::reply_key(&c, id, channel, &source)?;
         let replay = c
             .query_row(
-                "SELECT content FROM messages WHERE channel_type='supervisor' AND conversation_id=? AND source_msg_id=?",
+                "SELECT content,run_id FROM messages WHERE channel_type='supervisor' AND conversation_id=? AND source_msg_id=?",
                 params![id,key],
-                |r| r.get::<_, String>(0),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_,Option<String>>(1)?)),
             )
             .optional()?;
-        if let Some(v) = replay {
-            return Ok(v);
+        if let Some((reply, run)) = replay {
+            return Ok(message_result(id, reply, run));
+        }
+        // Older databases could commit the mission before archiving its answer.
+        // Recover the exact response shape without asking a model to recreate the decision.
+        let rid = effect_key(&key, "dispatch");
+        let committed = c.query_row("SELECT r.target_node_id,r.target_slot_id,p.run_id IS NOT NULL FROM runs r LEFT JOIN service_pin_epochs p USING(run_id) WHERE r.conversation_id=? AND r.run_id=?",
+            params![id,rid], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?))).optional()?;
+        if let Some((node, slot, pinned)) = committed {
+            let reply = if pinned || text.trim().starts_with("/dispatch ") {
+                json!({"run_id":rid,"target_node_id":node,"target_slot_id":slot}).to_string()
+            } else {
+                tarla_supervisor::dispatch_acknowledgement(&rid)
+            };
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            record_run_reply(&tx, s.id(), id, &key, &rid, &reply)?;
+            tx.commit()?;
+            s.context_wake.notify_one();
+            return Ok(message_result(id, reply, Some(rid)));
         }
         tarla_context::append(&mut c, s.id(), id, channel, &source, "user", text)?;
     }
@@ -297,9 +366,11 @@ pub async fn message(s: &Service, id: &str, payload: &Value) -> Result<String> {
         s,
         source: key,
         draft: Some(s.drafts.begin(id, channel, &source)),
+        completion: None,
         skill,
     };
-    s.brain
+    let reply = s
+        .brain
         .handle_trigger(
             &plane,
             &SupervisorTrigger::UserMessage {
@@ -307,76 +378,128 @@ pub async fn message(s: &Service, id: &str, payload: &Value) -> Result<String> {
                 text: text.into(),
             },
         )
-        .await
+        .await?;
+    let run = s.db()?.query_row(
+        "SELECT run_id FROM messages WHERE conversation_id=? AND channel_type='supervisor' AND source_msg_id=?",
+        params![id, plane.source], |r| r.get::<_,Option<String>>(0))?;
+    s.context_wake.notify_one();
+    Ok(message_result(id, reply, run))
 }
 
 pub async fn deliver_receipts(s: S) {
+    use futures_util::{stream::FuturesUnordered, StreamExt};
+    use std::collections::BTreeSet;
+
+    if !s.is_supervisor() {
+        return;
+    }
+    let mut active = BTreeSet::new();
+    let mut workers = FuturesUnordered::new();
+    let mut cursor = String::new();
     loop {
-        if s.is_supervisor() {
-            let result = next_wake(&s).await;
-            if let Err(e) = result {
-                eprintln!("receipt notification deferred: {e}")
+        if active.len() < 16 {
+            let pending = s.db().and_then(|db| {
+                list(
+                    &db,
+                    "SELECT DISTINCT conversation_id FROM service_wakes WHERE delivered=0
+                 ORDER BY conversation_id<=?,conversation_id",
+                    &[&cursor],
+                )
+            });
+            match pending {
+                Ok(rows) => {
+                    for row in rows {
+                        let Some(id) = row["conversation_id"].as_str() else {
+                            continue;
+                        };
+                        if active.insert(id.to_owned()) {
+                            cursor = id.to_owned();
+                            let service = s.clone();
+                            let conversation = id.to_owned();
+                            workers.push(async move {
+                                if let Err(e) = deliver_next_receipt(&service, &conversation).await
+                                {
+                                    eprintln!(
+                                        "receipt notification deferred for {conversation}: {e}"
+                                    );
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                }
+                                conversation
+                            });
+                            if active.len() == 16 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => eprintln!("receipt scan deferred: {e}"),
             }
         }
-        tokio::select! {_=s.receipt_wake.notified()=>(),_=s.notify.notified()=>(),_=tokio::time::sleep(Duration::from_secs(2))=>()}
+        tokio::select! {
+            Some(id) = workers.next(), if !workers.is_empty() => { active.remove(&id); },
+            _ = s.receipt_wake.notified() => (),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => (),
+        }
     }
 }
-async fn next_wake(s: &Service) -> Result<()> {
-    let entries = list(
-        &s.db()?,
-        "SELECT * FROM service_wakes WHERE delivered=0 ORDER BY rowid LIMIT 32",
-        &[],
-    )?;
-    for v in entries {
-        let id = string(&v, "conversation_id")?;
-        let event = string(&v, "event_id")?;
-        let raw = string(&v, "receipt")?;
-        let _lock = s.lock(id).await;
-        let source = format!("wake:{event}");
-        let c = s.db()?;
-        let existing = c
-            .query_row(
-                "SELECT 1 FROM messages WHERE channel_type='supervisor' AND source_msg_id=?",
-                [&source],
-                |r| r.get::<_, i32>(0),
-            )
-            .optional()?
-            .is_some();
-        if !existing {
-            let receipt: Value = serde_json::from_str(raw)?;
-            tarla_context::append(
-                &mut s.db()?,
-                s.id(),
-                id,
-                "receipt",
-                event,
-                "run_receipt",
-                raw,
-            )?;
-            let plane = Plane {
-                s,
-                source,
-                skill: None,
-                draft: None,
-            };
-            let trigger = SupervisorTrigger::RunCompleted {
-                conversation_id: id.into(),
-                receipt: receipt.clone(),
-            };
-            if s.brain.handle_trigger(&plane, &trigger).await.is_err() {
-                let fallback = format!(
-                    "Run {} {}. {}",
-                    receipt["run_id"].as_str().unwrap_or(""),
-                    receipt["final_state"].as_str().unwrap_or("completed"),
-                    receipt["executive_summary"].as_str().unwrap_or("")
-                );
-                plane.deliver(id, &fallback).await?;
-            }
-        }
-        c.execute(
-            "UPDATE service_wakes SET delivered=1 WHERE event_id=?",
-            [event],
+
+async fn deliver_next_receipt(s: &Service, id: &str) -> Result<()> {
+    let _lock = s.lock(id).await;
+    let db = s.db()?;
+    let wake = db.query_row("SELECT event_id,receipt FROM service_wakes WHERE conversation_id=? AND delivered=0 ORDER BY rowid LIMIT 1",
+        [id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?;
+    let Some((event, raw)) = wake else {
+        return Ok(());
+    };
+    let receipt: tarla_protocol::RunReceipt = serde_json::from_str(&raw)?;
+    let source = format!("wake:{event}");
+    let existing = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM messages WHERE channel_type='supervisor' AND conversation_id=? AND source_msg_id=?)",
+        params![id,source], |r| r.get::<_,bool>(0))?;
+    if existing {
+        // Previous daemon versions archived the report before marking the wake delivered.
+        db.execute(
+            "UPDATE service_wakes SET delivered=1 WHERE event_id=? AND conversation_id=?",
+            params![event, id],
         )?;
+        return Ok(());
+    }
+    {
+        let mut db = s.db()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tarla_context::append_in(
+            &tx,
+            s.id(),
+            id,
+            ("receipt", &event),
+            "run_receipt",
+            &raw,
+            Some(&receipt.run_id),
+        )?;
+        tx.commit()?;
+    }
+    let plane = Plane {
+        s,
+        source,
+        skill: None,
+        draft: None,
+        completion: Some((&event, &receipt.run_id)),
+    };
+    let trigger = SupervisorTrigger::RunCompleted {
+        conversation_id: id.into(),
+        receipt: serde_json::to_value(&receipt)?,
+    };
+    let reported = tokio::time::timeout(
+        Duration::from_secs(30),
+        s.brain.handle_trigger(&plane, &trigger),
+    )
+    .await;
+    if !matches!(reported, Ok(Ok(_))) {
+        let fallback = format!(
+            "Run {} {}. {}",
+            receipt.run_id, receipt.final_state, receipt.executive_summary
+        );
+        plane.deliver(id, &fallback).await?;
     }
     Ok(())
 }

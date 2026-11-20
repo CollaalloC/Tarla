@@ -60,12 +60,21 @@ jobs:
       - name: Single-node supervisor, execution, receipt and host isolation
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: python3 tests/stage1_core.py
+      - name: Long conversations, exact recall and budgeted packets
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: python3 tests/stage1_history.py
+      - name: Executor recovery, cancellation and account ownership
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: python3 tests/executor_recovery.py
       - name: Framed terminal observer
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: cargo test --locked -p tarlad private_observer_streams -- --ignored
       - name: Cross-node recovery and terminal grants
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: python3 tests/acceptance.py
+      - name: Atomic dispatch, reviewer provenance and independent receipt delivery
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: python3 tests/dispatch_recovery.py
       - name: Workspace skill activation
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: python3 tests/skills.py

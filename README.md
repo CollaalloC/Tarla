@@ -40,7 +40,7 @@ endpoint = "http://127.0.0.1:11434/v1/chat/completions"
 model = "qwen3"
 ```
 
-远端 HTTP 后端可通过 `api_key_env` 引用环境变量。Anthropic 后端使用 `kind = "anthropic"` 及完整 Messages 端点。Claude 订阅工位可配置 `slot_borrow:<名称>` 和 `kind = "claude_slot"`，指定可执行文件、独立凭证目录。模型只接触规范中的六个控制面工具。
+远端 HTTP 后端可通过 `api_key_env` 引用环境变量。Anthropic 后端使用 `kind = "anthropic"` 及完整 Messages 端点。主管也可在每轮决策中按剩余配额借用本机 Claude 订阅工位。配置方法、CLI 能力要求和回退规则见[订阅工位配置](docs/subscription-slots.md)。
 
 执行主机需要单独安装 herdr-core 和实际要运行的 Agent CLI。从所选上游发行渠道验证下载后，以下命令将已解包的可执行文件复制到私有缓存。最后一个参数是可执行文件本身的 SHA-256。
 
@@ -101,7 +101,7 @@ python3 tests/acceptance.py
 
 | 工程规范阶段 | 可以复核的验收内容 | 入口 |
 | --- | --- | --- |
-| 一 · 单机主管 | 连续 150 轮对话的上下文预算、模型回退、完成回执、工作空间技能 | [上下文测试](crates/tarla-context/src/lib.rs) · [双节点验收脚本](tests/acceptance.py) · [技能验收](tests/skills.py) |
+| 一 · 单机主管 | 156 轮真实接口对话、异步派单与主动回报、宿主 Herdr 隔离、执行器重启与消息重放 | [单机使用与验收](docs/stage1.md) · [长会话测试](tests/stage1_history.py) · [执行恢复测试](tests/executor_recovery.py) |
 | 二 · 配对与同步 | 在独立进程间同步 S2 记忆，断线补传和重启对账，验证限时终端票据及工位交接 | [核心 CI](https://github.com/CollaalloC/Tarla/actions/workflows/check.yml) · [双网配置](docs/managed-networks.md) · [双节点延迟实测](docs/replication-latency.md) · [工位验收](tests/pinned.py) |
 | 三 · 网关与客户端 | 对话、任务、审批和记忆的客户端接口，四个 IM 平台的入站和出站协议，以及原生应用构建和模拟器启动 | [客户端对真实守护进程的测试](apps/tarla-app/test/daemon_contract_test.dart) · [网关配置](crates/tarla-gateway/README.md) · [客户端构建与下载](https://github.com/CollaalloC/Tarla/actions/workflows/flutter-platforms.yml) |
 

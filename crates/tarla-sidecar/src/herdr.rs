@@ -38,12 +38,30 @@ pub struct TerminalStatus {
 }
 
 fn local_terminal(id: &str) -> io::Result<()> {
-    // Only immutable local addresses returned by terminal.run, never machine aliases.
-    if !id
-        .strip_prefix('t')
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    // herdr-core 0.1.19 terminals::id_shaped. Names and remote-qualified
+    // addresses must never be resolved on a user's behalf.
+    let Some(rest) = id.strip_prefix('t') else {
+        return Err(invalid("invalid local terminal address"));
+    };
+    if !rest.starts_with(|c: char| matches!(c, '1'..='9'))
+        || !rest
+            .bytes()
+            .all(|b| b"0123456789bcdfghjkmnpqrstvwxyz".contains(&b))
     {
         return Err(invalid("invalid local terminal address"));
+    }
+    Ok(())
+}
+
+fn check_owner(record: &Value, run_id: &str, address: &str) -> io::Result<()> {
+    if run_id.is_empty()
+        || record["address"].as_str() != Some(address)
+        || record["labels"]["tarla_run"].as_str() != Some(run_id)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "terminal no longer belongs to this run",
+        ));
     }
     Ok(())
 }
@@ -125,7 +143,15 @@ impl Herdr {
         .await?
     }
     pub async fn available(&self) -> io::Result<()> {
-        self.rpc("hello", json!({"generation":1})).await.map(|_| ())
+        self.machine_id().await.map(|_| ())
+    }
+    pub async fn machine_id(&self) -> io::Result<String> {
+        let hello = self.rpc("hello", json!({"generation":1})).await?;
+        hello["core"]["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| invalid("missing core identity"))
     }
     pub async fn find_run(&self, run_id: &str) -> io::Result<Option<String>> {
         let list = self
@@ -139,14 +165,18 @@ impl Herdr {
             .ok_or_else(|| invalid("missing terminal list"))?;
         let mut matches = terminals
             .iter()
-            .filter(|t| t["labels"]["tarla_run"].as_str() == Some(run_id))
-            .filter_map(|t| t["address"].as_str())
-            .filter(|t| local_terminal(t).is_ok());
-        let first = matches.next().map(str::to_owned);
+            .filter(|t| t["labels"]["tarla_run"].as_str() == Some(run_id));
+        let Some(record) = matches.next() else {
+            return Ok(None);
+        };
         if matches.next().is_some() {
             return Err(invalid("multiple local terminals claim this run"));
         }
-        Ok(first)
+        let address = record["address"]
+            .as_str()
+            .ok_or_else(|| invalid("missing terminal address"))?;
+        local_terminal(address)?;
+        Ok(Some(address.to_owned()))
     }
     /// Call only after persisting the executor's unique run claim. A timeout is
     /// ambiguous. Reconcile with find_run instead of dispatching again.
@@ -173,18 +203,44 @@ impl Herdr {
             .as_str()
             .ok_or_else(|| invalid("missing terminal address"))?;
         local_terminal(addr)?;
+        check_owner(&result, run_id, addr)?;
         Ok(addr.into())
     }
-    pub async fn status(&self, terminal: &str) -> io::Result<TerminalStatus> {
+    // Keep both requests on one connection. A replacement core may reuse the
+    // same address, but cannot inherit this connection. Addresses are immutable
+    // within a core. Check the retained, workspace-private run label every time.
+    async fn scoped_socket(
+        &self,
+        run_id: &str,
+        terminal: &str,
+    ) -> io::Result<(BufReader<Ipc>, Value)> {
         local_terminal(terminal)?;
-        Ok(serde_json::from_value(
-            self.rpc("terminal.get", json!({"terminal":terminal}))
-                .await?,
-        )?)
+        let mut socket = self.socket().await?;
+        let record = plain(&mut socket, "terminal.get", json!({"terminal":terminal})).await?;
+        check_owner(&record, run_id, terminal)?;
+        Ok((socket, record))
     }
-    pub async fn read(&self, terminal: &str, lines: u32) -> io::Result<String> {
-        local_terminal(terminal)?;
-        self.rpc(
+    async fn run_rpc(
+        &self,
+        run_id: &str,
+        terminal: &str,
+        method: &str,
+        params: Value,
+    ) -> io::Result<Value> {
+        timeout(RPC_TIMEOUT, async {
+            let (mut socket, _) = self.scoped_socket(run_id, terminal).await?;
+            plain(&mut socket, method, params).await
+        })
+        .await?
+    }
+    pub async fn status(&self, run_id: &str, terminal: &str) -> io::Result<TerminalStatus> {
+        let (_, record) = timeout(RPC_TIMEOUT, self.scoped_socket(run_id, terminal)).await??;
+        Ok(serde_json::from_value(record)?)
+    }
+    pub async fn read(&self, run_id: &str, terminal: &str, lines: u32) -> io::Result<String> {
+        self.run_rpc(
+            run_id,
+            terminal,
             "terminal.read",
             json!({"terminal":terminal,"lines":lines.min(1000)}),
         )
@@ -193,38 +249,43 @@ impl Herdr {
             .map(str::to_owned)
             .ok_or_else(|| invalid("missing terminal text"))
     }
-    pub async fn cancel(&self, terminal: &str) -> io::Result<()> {
-        local_terminal(terminal)?;
-        self.rpc("terminal.kill", json!({"terminal":terminal}))
-            .await
-            .map(|_| ())
+    pub async fn cancel(&self, run_id: &str, terminal: &str) -> io::Result<()> {
+        self.run_rpc(
+            run_id,
+            terminal,
+            "terminal.kill",
+            json!({"terminal":terminal}),
+        )
+        .await?;
+        Ok(())
     }
-    pub async fn send(&self, terminal: &str, text: &str) -> io::Result<()> {
-        local_terminal(terminal)?;
+    pub async fn send(&self, run_id: &str, terminal: &str, text: &str) -> io::Result<()> {
         if text.len() > MAX_INPUT {
             return Err(invalid("message too long"));
         }
-        self.rpc(
+        self.run_rpc(
+            run_id,
+            terminal,
             "terminal.send",
             json!({"terminal":terminal,"text":text,"wait":false}),
         )
-        .await
-        .map(|_| ())
+        .await?;
+        Ok(())
     }
     pub async fn attach(
         &self,
+        run_id: &str,
         terminal: &str,
         observe: bool,
         cols: u16,
         rows: u16,
     ) -> io::Result<(TerminalReader, TerminalWriter)> {
-        local_terminal(terminal)?;
         if cols == 0 || rows == 0 {
             return Err(invalid("invalid viewport"));
         }
         timeout(RPC_TIMEOUT, async {
-            let socket = self.socket().await?;
-            attach_stream(socket, terminal, observe, cols, rows).await
+            let (socket, _) = self.scoped_socket(run_id, terminal).await?;
+            attach_stream(socket, run_id, terminal, observe, cols, rows).await
         })
         .await?
     }
@@ -232,6 +293,7 @@ impl Herdr {
 
 async fn attach_stream<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: BufReader<S>,
+    run_id: &str,
     terminal: &str,
     observe: bool,
     cols: u16,
@@ -255,9 +317,7 @@ async fn attach_stream<S: AsyncRead + AsyncWrite + Unpin>(
         .and_then(|c| u32::try_from(c).ok())
         .filter(|c| *c != 0)
         .ok_or_else(|| invalid("invalid terminal channel"))?;
-    if reply["terminal"]["address"].as_str() != Some(terminal) {
-        return Err(invalid("terminal scope mismatch"));
-    }
+    check_owner(&reply["terminal"], run_id, terminal)?;
     // Keep the buffered first paint when switching protocols.
     let (read, write) = tokio::io::split(stream);
     Ok((
@@ -398,6 +458,18 @@ mod protocol_tests {
     use super::*;
     use tokio::io::{duplex, DuplexStream};
 
+    #[test]
+    fn upstream_local_addresses_exclude_names_and_remote_targets() {
+        for id in ["t1", "t9", "t10", "t1b", "t9z", "t100", "t4qh"] {
+            assert!(local_terminal(id).is_ok(), "{id}");
+        }
+        for id in [
+            "", "t", "t0", "t01", "t1a", "t1l", "tF", "t1:t1", "other/t1", "reviewer", "t1B",
+        ] {
+            assert!(local_terminal(id).is_err(), "{id}");
+        }
+    }
+
     // An independent fixture emits the upstream on-wire header; production framing
     // is exercised even on CI runners that deny AF_UNIX or lack herdr-core.
     async fn frame(s: &mut DuplexStream, channel: u32, kind: u8, body: &[u8]) {
@@ -434,7 +506,7 @@ mod protocol_tests {
                 s.get_mut(),
                 0,
                 0,
-                br#"{"jsonrpc":"2.0","id":2,"result":{"channel":17,"terminal":{"address":"t7"}}}"#,
+                br#"{"jsonrpc":"2.0","id":2,"result":{"channel":17,"terminal":{"address":"t7","labels":{"tarla_run":"fixture"}}}}"#,
             )
             .await;
             frame(s.get_mut(), 17, 3, &[80, 0, 24, 0]).await;
@@ -443,7 +515,7 @@ mod protocol_tests {
             assert_eq!((c, k, credit), (17, 1, 3u32.to_le_bytes().to_vec()));
             frame(s.get_mut(), 17, 2, b"finished").await;
         });
-        let (mut r, mut w) = attach_stream(BufReader::new(client), "t7", true, 80, 24)
+        let (mut r, mut w) = attach_stream(BufReader::new(client), "fixture", "t7", true, 80, 24)
             .await
             .unwrap();
         assert!(matches!(
@@ -458,6 +530,30 @@ mod protocol_tests {
         assert!(w.resize(50, 20).await.is_err());
         w.credit(3).await.unwrap();
         assert!(matches!(r.next().await.unwrap(), TerminalEvent::Closed(_)));
+        host.await.unwrap();
+    }
+    #[tokio::test]
+    async fn framed_attach_rechecks_run_label_before_exposing_paint() {
+        let (client, server) = duplex(1024);
+        let host = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            let mut hello = String::new();
+            server.read_line(&mut hello).await.unwrap();
+            server
+                .get_mut()
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"framed\":true}}\n")
+                .await
+                .unwrap();
+            let (_, _, attach) = read_frame(&mut server).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&attach).unwrap()["params"]["terminal"],
+                "t1b"
+            );
+            frame(server.get_mut(), 0, 0, br#"{"jsonrpc":"2.0","id":2,"result":{"channel":4,"terminal":{"address":"t1b","labels":{"tarla_run":"different-run"}}}}"#).await;
+        });
+        let result =
+            attach_stream(BufReader::new(client), "expected-run", "t1b", false, 80, 24).await;
+        assert!(matches!(result, Err(e) if e.kind() == io::ErrorKind::PermissionDenied));
         host.await.unwrap();
     }
     #[tokio::test]

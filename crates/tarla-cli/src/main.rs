@@ -113,6 +113,14 @@ enum Command {
     Cancel {
         id: String,
     },
+    /// Close an unconfirmed run on its owning executor after checking its process and worktree.
+    Abandon {
+        id: String,
+        #[arg(long, required = true, action = clap::ArgAction::SetTrue)]
+        confirm_stopped: bool,
+        #[arg(long)]
+        reason: String,
+    },
     Log {
         id: String,
         #[arg(long, default_value_t = 0)]
@@ -160,6 +168,7 @@ enum Decision {
 struct Client {
     http: reqwest::Client,
     base: Url,
+    workspace: String,
     token: String,
 }
 impl Client {
@@ -171,6 +180,19 @@ impl Client {
             .extend(path);
         Ok(url)
     }
+    async fn health(&self) -> Result<Value> {
+        let res = self.http.get(self.url(&["health"])?).send().await?;
+        let status = res.status();
+        ensure!(status.is_success(), "workspace discovery failed: {status}");
+        let info: Value = res.json().await?;
+        ensure!(
+            info["workspace_id"].as_str() == Some(&self.workspace),
+            "server workspace differs from requested workspace {}",
+            self.workspace
+        );
+        Ok(info)
+    }
+
     async fn api(
         &self,
         method: Method,
@@ -181,6 +203,7 @@ impl Client {
         let mut req = self
             .http
             .request(method, self.url(path)?)
+            .header("X-Tarla-Workspace", &self.workspace)
             .bearer_auth(&self.token)
             .query(query);
         if let Some(v) = body {
@@ -274,8 +297,19 @@ async fn main() -> Result<()> {
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
         base: cli.url,
+        workspace: cli.workspace,
         token,
     };
+    // Standalone IM gateways can be addressed directly and do not serve /health.
+    if !matches!(
+        cli.command,
+        Command::Status
+            | Command::PairChannel { .. }
+            | Command::ChannelPairings
+            | Command::UnpairChannel { .. }
+    ) {
+        c.health().await?;
+    }
     let result = match cli.command {
         Command::PairChannel { platform, actor, conversation, approvals } => {
             c.post(&["gateway", "pairings"], json!({
@@ -284,7 +318,7 @@ async fn main() -> Result<()> {
         }
         Command::ChannelPairings => c.get(&["gateway", "pairings"]).await?,
         Command::UnpairChannel { id } => c.api(Method::DELETE, &["gateway", "pairings", &id], None, &[]).await?,
-        Command::Status => c.get(&["health"]).await?,
+        Command::Status => c.health().await?,
         Command::Conversations => c.get(&["v1", "conversations"]).await?,
         Command::Runs => c.get(&["v1", "runs"]).await?,
         Command::Actions => c.get(&["v1", "actions"]).await?,
@@ -306,6 +340,9 @@ async fn main() -> Result<()> {
         }
         Command::Run { id } => c.get(&["v1", "runs", &id]).await?,
         Command::Cancel { id } => c.post(&["v1", "runs", &id, "cancel"], json!({})).await?,
+        Command::Abandon { id, confirm_stopped, reason } => c.post(
+            &["v1", "runs", &id, "abandon"], json!({"confirmed_stopped":confirm_stopped,"reason":reason})
+        ).await?,
         Command::Log { id, offset, limit } => c.api(Method::GET, &["v1", "runs", &id, "log"],
             None, &[("offset",offset.to_string()),("limit",limit.to_string())]).await?,
         Command::Resolve { id, resolution, expected_version } => {

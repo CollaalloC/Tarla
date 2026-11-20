@@ -26,7 +26,7 @@ pub fn open(path: &Path, workspace: &str) -> Result<Connection> {
             tx.execute_batch(include_str!("schema.sql"))?;
             tx.execute("INSERT INTO workspace_identity VALUES(1,?1)", [workspace])?;
         }
-        1 | 2 => verify_workspace(&tx, workspace)?,
+        1..=3 => verify_workspace(&tx, workspace)?,
         version => bail!("unsupported database schema version {version}"),
     }
     if version < 2 {
@@ -35,6 +35,15 @@ pub fn open(path: &Path, workspace: &str) -> Result<Connection> {
             CREATE INDEX idx_active_messages ON messages(conversation_id,seq_no) WHERE compacted_into IS NULL;
             CREATE INDEX idx_trigger_turns ON messages(conversation_id,seq_no) WHERE sender_role IN ('user','run_receipt');")?;
         tx.pragma_update(None, "user_version", 2)?;
+    }
+    if version < 3 {
+        tx.execute_batch("ALTER TABLE conversation_prefix ADD COLUMN frozen_soul TEXT;
+            ALTER TABLE conversation_prefix ADD COLUMN rendered_prefix TEXT;
+            CREATE VIRTUAL TABLE dag_search USING fts5(summary_text, content='context_dag_nodes', content_rowid='rowid', tokenize='trigram');
+            INSERT INTO dag_search(dag_search) VALUES('rebuild');
+            CREATE TRIGGER index_dag_summary AFTER INSERT ON context_dag_nodes BEGIN
+                INSERT INTO dag_search(rowid,summary_text) VALUES(NEW.rowid,NEW.summary_text); END;")?;
+        tx.pragma_update(None, "user_version", 3)?;
     }
     tx.commit()?;
     Ok(db)

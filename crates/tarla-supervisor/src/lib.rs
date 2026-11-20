@@ -3,6 +3,7 @@ mod http;
 mod slot;
 mod tools;
 mod visible;
+pub use slot::{SubscriptionRegistry, SubscriptionSlot};
 pub use tools::{control_tools, ControlTool, ToolSpec};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -118,6 +119,10 @@ pub trait ControlPlane: Send + Sync {
     ) -> Result<Value>;
     /// Persist the answer and queue delivery to the originating channels.
     async fn deliver(&self, conversation_id: &str, reply: &str) -> Result<()>;
+}
+
+pub fn dispatch_acknowledgement(run_id: &str) -> String {
+    format!("已提交任务 {run_id}。")
 }
 
 pub struct SupervisorEngine {
@@ -272,7 +277,7 @@ impl SupervisorEngine {
                 }
             }
             if let Some(run_id) = dispatch_id {
-                break format!("已提交任务 {run_id}。");
+                break dispatch_acknowledgement(&run_id);
             }
         };
         plane.deliver(id, &reply).await?;
@@ -330,6 +335,9 @@ pub enum BackendConfig {
         api_key_env: Option<String>,
         socks_proxy: Option<String>,
     },
+    SlotPool {
+        slots: Vec<String>,
+    },
     ClaudeSlot {
         executable: PathBuf,
         credential_dir: PathBuf,
@@ -341,11 +349,35 @@ pub fn backends_from_config(
     chain: &[String],
     configs: &BTreeMap<String, BackendConfig>,
 ) -> Result<Vec<Box<dyn BrainBackend>>> {
+    backends_from_config_with_slots(chain, configs, None)
+}
+
+/// Resolve named HTTP backends, legacy isolated Claude accounts and registered local slot pools.
+pub fn backends_from_config_with_slots(
+    chain: &[String],
+    configs: &BTreeMap<String, BackendConfig>,
+    registry: Option<&SubscriptionRegistry>,
+) -> Result<Vec<Box<dyn BrainBackend>>> {
     let mut resolved: Vec<Box<dyn BrainBackend>> = Vec::new();
     for reference in chain {
         let (kind, key) = reference
             .split_once(':')
             .context("expected http:<name> or slot_borrow:<name>")?;
+        if kind == "slot_borrow" {
+            let pool = match configs.get(key) {
+                Some(BackendConfig::SlotPool { slots }) => Some(slots.clone()),
+                None => Some(vec![key.to_owned()]),
+                _ => None,
+            };
+            if let Some(ids) = pool {
+                resolved.push(
+                    registry
+                        .context("registered subscription slots unavailable")?
+                        .pool(&ids)?,
+                );
+                continue;
+            }
+        }
         let backend: Box<dyn BrainBackend> = match (
             kind,
             configs

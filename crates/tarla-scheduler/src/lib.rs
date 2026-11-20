@@ -74,7 +74,8 @@ fn usage_at(used: f32, reset: Option<i64>, now: i64) -> Option<f32> {
     })
 }
 
-fn score(req: &TaskRequirement, slot: &AgentSlotSnapshot, now: i64) -> Option<i64> {
+/// Remaining percentage in the more constrained window, after resets and the 95% cutoff.
+pub fn quota_headroom(slot: &AgentSlotSnapshot, now: i64) -> Option<f32> {
     let health_ok = match slot.health {
         SlotHealth::Healthy => true,
         SlotHealth::CoolingDown { resets_at_unix } => now >= resets_at_unix,
@@ -82,9 +83,13 @@ fn score(req: &TaskRequirement, slot: &AgentSlotSnapshot, now: i64) -> Option<i6
     };
     let rolling = usage_at(slot.window_used_pct, slot.window_resets_at, now)?;
     let weekly = usage_at(slot.weekly_used_pct, slot.weekly_resets_at, now)?;
-    if !health_ok
-        || req.workspace_id != slot.workspace_id
-        || rolling.max(weekly) >= 95.0
+    let used = rolling.max(weekly);
+    (health_ok && used < 95.0).then_some(100.0 - used)
+}
+
+fn score(req: &TaskRequirement, slot: &AgentSlotSnapshot, now: i64) -> Option<i64> {
+    let headroom = quota_headroom(slot, now)?;
+    if req.workspace_id != slot.workspace_id
         || !req
             .required_caps
             .iter()
@@ -114,10 +119,7 @@ fn score(req: &TaskRequirement, slot: &AgentSlotSnapshot, now: i64) -> Option<i6
         .filter(|r| *r > now)
         .map(|r| (168 - (r.saturating_sub(now) / 3600).min(168)) / 2)
         .unwrap_or(0);
-    Some(
-        role + cost + urgency + (100.0 - rolling.max(weekly)) as i64
-            - 120 * i64::from(slot.active_runs),
-    )
+    Some(role + cost + urgency + headroom as i64 - 120 * i64::from(slot.active_runs))
 }
 
 fn best<'a>(

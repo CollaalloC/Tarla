@@ -66,6 +66,30 @@ pub fn append(
     role: &str,
     text: &str,
 ) -> Result<bool> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let inserted = append_in(
+        &tx,
+        workspace,
+        conversation,
+        (channel, source_id),
+        role,
+        text,
+        None,
+    )?;
+    tx.commit()?;
+    Ok(inserted)
+}
+
+/// Archive a message as part of a caller-owned atomic operation.
+pub fn append_in(
+    tx: &Transaction<'_>,
+    workspace: &str,
+    conversation: &str,
+    (channel, source_id): (&str, &str),
+    role: &str,
+    text: &str,
+    run_id: Option<&str>,
+) -> Result<bool> {
     ensure!(
         !workspace.is_empty()
             && !conversation.is_empty()
@@ -77,19 +101,23 @@ pub fn append(
         matches!(role, "user" | "assistant" | "run_receipt"),
         "invalid message role"
     );
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let actual: String = tx.query_row(
         "SELECT workspace_id FROM workspace_identity WHERE singleton=1",
         [],
         |r| r.get(0),
     )?;
     ensure!(actual == workspace, "wrong workspace");
-    let seen: Option<(String,String,String)> = tx.query_row(
-        "SELECT conversation_id,sender_role,content FROM messages WHERE channel_type=?1 AND source_msg_id=?2",
-        params![channel,source_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-    if let Some((old_conversation, old_role, old_content)) = seen {
+    let seen: Option<(String,String,String,Option<String>)> = tx.query_row(
+        "SELECT conversation_id,sender_role,content,run_id FROM messages WHERE channel_type=?1 AND source_msg_id=?2",
+        params![channel,source_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    if let Some((old_conversation, old_role, old_content, old_run)) = seen {
         ensure!(
-            old_conversation == conversation && old_role == role && old_content == text,
+            old_conversation == conversation
+                && old_role == role
+                && old_content == text
+                && run_id
+                    .zip(old_run.as_deref())
+                    .is_none_or(|(new, old)| new == old),
             "source id reused"
         );
         return Ok(false);
@@ -97,9 +125,8 @@ pub fn append(
     let time = now()?;
     tx.execute("INSERT INTO conversations(conversation_id,workspace_id,title,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)
         ON CONFLICT(conversation_id) DO UPDATE SET updated_at=excluded.updated_at", params![conversation,workspace,clip(text,80),time])?;
-    tx.execute("INSERT INTO messages(conversation_id,channel_type,source_msg_id,sender_role,content,token_estimate,created_at)
-        VALUES(?1,?2,?3,?4,?5,?6,?7)", params![conversation,channel,source_id,role,text,projected_cost(role,text),time])?;
-    tx.commit()?;
+    tx.execute("INSERT INTO messages(conversation_id,channel_type,source_msg_id,sender_role,content,token_estimate,created_at,run_id)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![conversation,channel,source_id,role,text,projected_cost(role,text),time,run_id])?;
     Ok(true)
 }
 
@@ -128,6 +155,48 @@ pub fn assemble(
     frozen_memory: &str,
     policy: &ContextPolicy,
 ) -> Result<Vec<ContextMessage>> {
+    assemble_window(db, conversation, soul, frozen_memory, policy, false)
+}
+
+/// Perform watermark compaction after a completed turn. Below the waterline this
+/// reads only lengths and indexed active entries; it never changes the prefix or DAG.
+pub fn maintain_after_turn(
+    db: &mut Connection,
+    conversation: &str,
+    policy: &ContextPolicy,
+) -> Result<()> {
+    let prefix:Option<usize> = db.query_row("SELECT length(CAST(rendered_prefix AS BLOB))+22 FROM conversation_prefix WHERE conversation_id=?1 AND rendered_prefix IS NOT NULL",
+        [conversation],|r|r.get(0)).optional()?;
+    let Some(prefix) = prefix else {
+        return Ok(());
+    };
+    let budget = policy.supervisor_active_budget_tokens;
+    let high = budget.saturating_mul(policy.compaction_high_watermark_pct) / 100;
+    let (raw, roots) = archive_cost(db, conversation)?;
+    if prefix.saturating_add(raw).saturating_add(roots) > high {
+        // The transaction rechecks the live watermark if another turn or maintainer won the race.
+        assemble_window(db, conversation, "", "", policy, true)?;
+    }
+    Ok(())
+}
+
+fn archive_cost(db: &Connection, conversation: &str) -> Result<(usize, usize)> {
+    // Old archives may not include receipt observation framing in their stored estimates.
+    Ok(db.query_row("SELECT
+        (SELECT COALESCE(SUM(CASE WHEN sender_role='run_receipt' THEN length(CAST(content AS BLOB))+?2 ELSE token_estimate END),0)
+         FROM messages WHERE conversation_id=?1 AND compacted_into IS NULL),
+        (SELECT COALESCE(SUM(token_estimate),0) FROM context_dag_nodes WHERE conversation_id=?1 AND parent_dag_id IS NULL)",
+        params![conversation,projected_cost("run_receipt","")],|r| Ok((r.get(0)?,r.get(1)?)))?)
+}
+
+fn assemble_window(
+    db: &mut Connection,
+    conversation: &str,
+    soul: &str,
+    frozen_memory: &str,
+    policy: &ContextPolicy,
+    idle: bool,
+) -> Result<Vec<ContextMessage>> {
     ensure!(
         policy.supervisor_active_budget_tokens > 0
             && (1..=100).contains(&policy.compaction_high_watermark_pct)
@@ -135,57 +204,70 @@ pub fn assemble(
         "invalid context policy"
     );
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute("INSERT INTO conversation_prefix(conversation_id,frozen_memory) VALUES(?1,?2) ON CONFLICT DO NOTHING", params![conversation,frozen_memory])?;
-    let snapshot: String = tx.query_row(
-        "SELECT frozen_memory FROM conversation_prefix WHERE conversation_id=?1",
+    tx.execute("INSERT INTO conversation_prefix(conversation_id,frozen_memory,frozen_soul) VALUES(?1,?2,?3)
+        ON CONFLICT(conversation_id) DO UPDATE SET frozen_soul=excluded.frozen_soul WHERE frozen_soul IS NULL",
+        params![conversation,frozen_memory,soul])?;
+    let budget = policy.supervisor_active_budget_tokens;
+    let cached: Option<String> = tx.query_row(
+        "SELECT rendered_prefix FROM conversation_prefix WHERE conversation_id=?1",
         [conversation],
         |r| r.get(0),
     )?;
-    let prefix = ContextMessage {
-        role: "system".into(),
-        content: if snapshot.is_empty() {
-            soul.to_owned()
+    let prefix =
+        if let Some(content) = cached {
+            ContextMessage {
+                role: "system".into(),
+                content,
+            }
         } else {
-            format!("{soul}\n\nWorkspace memories:\n{snapshot}")
-        },
-    };
+            let (profile,snapshot):(String,String) = tx.query_row(
+            "SELECT frozen_soul,frozen_memory FROM conversation_prefix WHERE conversation_id=?1",
+            [conversation], |r|Ok((r.get(0)?,r.get(1)?)))?;
+            let prefix = static_prefix(&profile, &snapshot, budget / 2)?;
+            tx.execute(
+                "UPDATE conversation_prefix SET rendered_prefix=?1 WHERE conversation_id=?2",
+                params![prefix.content, conversation],
+            )?;
+            prefix
+        };
     let prefix_cost = estimate(&prefix.role, &prefix.content);
-    let budget = policy.supervisor_active_budget_tokens;
-    ensure!(
-        prefix_cost <= budget,
-        "static prefix exceeds model context budget"
-    );
-    let cost_of_raw = |db: &Connection| -> rusqlite::Result<usize> {
-        // Older archives counted executor receipts before the observation label was introduced.
-        db.query_row(
-            "SELECT COALESCE(SUM(CASE WHEN sender_role='run_receipt'
-            THEN length(CAST(content AS BLOB))+?2 ELSE token_estimate END),0)
-            FROM messages WHERE conversation_id=?1 AND compacted_into IS NULL",
-            params![conversation, projected_cost("run_receipt", "")],
-            |r| r.get(0),
-        )
-    };
-    let raw_cost = cost_of_raw(&tx)?;
-    let summary_cost: usize = tx.query_row("SELECT COALESCE(SUM(token_estimate),0) FROM context_dag_nodes WHERE conversation_id=?1 AND parent_dag_id IS NULL", [conversation], |r| r.get(0))?;
+    ensure!(prefix_cost < budget,"the frozen prefix exceeds the available history budget; shorten the selected skill or increase supervisor_active_budget_tokens");
+    let (raw_cost, summary_cost) = archive_cost(&tx, conversation)?;
     let total = prefix_cost
         .saturating_add(raw_cost)
         .saturating_add(summary_cost);
     let high = budget.saturating_mul(policy.compaction_high_watermark_pct) / 100;
-    if total > high {
+    if idle && total <= high {
+        return Ok(Vec::new());
+    }
+    // Most folds run after replies. An abnormally large incoming turn can cross
+    // the hard ceiling before the idle worker has run, so compact synchronously there.
+    let fold = total > budget || (idle && total > high);
+    if fold {
         compact(&tx, conversation, policy.protected_verbatim_turns)?;
     }
 
-    let raw_cost = cost_of_raw(&tx)?;
-    ensure!(
-        prefix_cost + raw_cost <= budget,
-        "protected verbatim turns and static prefix exceed model context budget"
-    );
-    let raw = raw_messages(&tx, conversation)?;
-    let summary_budget = budget - prefix_cost - raw_cost;
     let mut roots = read_roots(&tx, conversation)?;
+    let available = budget - prefix_cost;
+    let raw_cost = if fold {
+        archive_cost(&tx, conversation)?.0
+    } else {
+        raw_cost
+    };
+    let raw_budget = if raw_cost > available && !roots.is_empty() {
+        available - (available / 8).min(320)
+    } else {
+        available
+    };
+    let raw = raw_messages(&tx, conversation, raw_budget)?;
+    let summary_budget = available
+        - raw
+            .iter()
+            .map(|m| estimate(&m.role, &m.content))
+            .sum::<usize>();
     // Merge only when a batch is large enough or the active roots no longer fit.
     // Leaves retain their original ranges through every merge.
-    while roots.len() >= 2 {
+    while fold && roots.len() >= 2 {
         let same_depth = roots
             .windows(4)
             .position(|w| w.iter().all(|r| r.depth == w[0].depth));
@@ -225,23 +307,133 @@ pub fn assemble(
     Ok(window)
 }
 
-fn raw_messages(tx: &Transaction<'_>, conversation: &str) -> Result<Vec<ContextMessage>> {
-    let mut stmt = tx.prepare("SELECT sender_role,content FROM messages WHERE conversation_id=?1 AND compacted_into IS NULL ORDER BY seq_no")?;
-    let data = stmt
+// A source that cannot fit is represented by its two ends and an exact paging handle.
+// Source texts and byte offsets always refer to the immutable archive, before any role label.
+fn handle(key: &str, len: usize) -> String {
+    format!("\n[archive {key} bytes={len}]\n")
+}
+
+fn excerpt(text: &str, key: &str, budget: usize) -> Result<String> {
+    if text.len() <= budget {
+        return Ok(text.into());
+    }
+    let marker = handle(key, text.len());
+    let room = budget
+        .checked_sub(marker.len())
+        .context("context budget cannot fit an archive reference")?;
+    let head = clip(text, room / 2);
+    let mut tail = text.len() - (room - head.len());
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    Ok(format!("{head}{marker}{}", &text[tail..]))
+}
+
+fn static_prefix(profile: &str, snapshot: &str, budget: usize) -> Result<ContextMessage> {
+    let sep = if snapshot.is_empty() {
+        ""
+    } else {
+        "\n\nWorkspace memories:\n"
+    };
+    let space = budget
+        .checked_sub(estimate("system", sep))
+        .context("context budget cannot fit the static prefix")?;
+    let memory_min = snapshot
+        .len()
+        .min(handle("source=frozen_memory", snapshot.len()).len());
+    let profile_min = profile
+        .len()
+        .min(handle("source=profile", profile.len()).len());
+    ensure!(
+        profile_min + memory_min <= space,
+        "context budget cannot fit static archive references"
+    );
+    let profile_cap = profile.len().min(space - memory_min);
+    let profile = excerpt(profile, "source=profile", profile_cap)?;
+    let memory = excerpt(snapshot, "source=frozen_memory", space - profile.len())?;
+    Ok(ContextMessage {
+        role: "system".into(),
+        content: format!("{profile}{sep}{memory}"),
+    })
+}
+
+fn raw_messages(
+    tx: &Transaction<'_>,
+    conversation: &str,
+    budget: usize,
+) -> Result<Vec<ContextMessage>> {
+    let mut stmt = tx.prepare("SELECT seq_no,sender_role,content FROM messages WHERE conversation_id=?1 AND compacted_into IS NULL ORDER BY seq_no")?;
+    let rows = stmt
         .query_map([conversation], |r| {
-            let role: String = r.get(0)?;
-            let content: String = r.get(1)?;
-            Ok(ContextMessage {
-                role: model_role(&role).into(),
-                content: if role == "run_receipt" {
-                    format!("{RECEIPT_LABEL}{content}")
-                } else {
-                    content
-                },
+            Ok(ArchivedMessage {
+                seq_no: r.get(0)?,
+                role: r.get(1)?,
+                content: r.get(2)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(data)
+    let minimum = |m: &ArchivedMessage| {
+        projected_cost(&m.role, "")
+            + m.content
+                .len()
+                .min(handle(&format!("seq_no={}", m.seq_no), m.content.len()).len())
+    };
+    let mut min_cost: usize = rows.iter().map(minimum).sum();
+    let mut start = 0;
+    let mut archived_range = None;
+    // Extreme turn counts may not even fit one handle per message. Keep one range for the oldest.
+    while min_cost
+        + archived_range
+            .as_ref()
+            .map_or(0, |s: &String| estimate("user", s))
+        > budget
+    {
+        ensure!(
+            start + 1 < rows.len(),
+            "context budget cannot fit the latest message reference"
+        );
+        min_cost -= minimum(&rows[start]);
+        archived_range = Some(format!(
+            "[archive seq_no={}..{}]",
+            rows[0].seq_no, rows[start].seq_no
+        ));
+        start += 1;
+    }
+    let mut window = Vec::new();
+    let mut remaining = budget - min_cost;
+    if let Some(content) = archived_range {
+        remaining -= estimate("user", &content);
+        window.push(ContextMessage {
+            role: "user".into(),
+            content,
+        });
+    }
+    // Water-fill evenly. Short protected messages stay verbatim whenever their unused peers
+    // can give up room; several oversized inputs cannot starve each other or the latest turn.
+    let mut extras = rows[start..]
+        .iter()
+        .map(|m| projected_cost(&m.role, &m.content) - minimum(m))
+        .collect::<Vec<_>>();
+    let mut order = (0..extras.len()).collect::<Vec<_>>();
+    order.sort_by_key(|i| extras[*i]);
+    for (index, &i) in order.iter().enumerate() {
+        let share = remaining / (order.len() - index);
+        extras[i] = extras[i].min(share);
+        remaining -= extras[i];
+    }
+    for (m, extra) in rows[start..].iter().zip(extras) {
+        let key = format!("seq_no={}", m.seq_no);
+        let cap = minimum(m) - projected_cost(&m.role, "") + extra;
+        let mut content = excerpt(&m.content, &key, cap)?;
+        if m.role == "run_receipt" {
+            content.insert_str(0, RECEIPT_LABEL);
+        }
+        window.push(ContextMessage {
+            role: model_role(&m.role).into(),
+            content,
+        });
+    }
+    Ok(window)
 }
 
 fn compact(tx: &Transaction<'_>, conversation: &str, turns: usize) -> Result<()> {
@@ -274,8 +466,16 @@ fn compact(tx: &Transaction<'_>, conversation: &str, turns: usize) -> Result<()>
         }
         let start = block[0].seq_no;
         let end = block.last().context("empty block")?.seq_no;
-        let parts = block.iter().map(|m| m.content.as_str()).collect::<Vec<_>>();
-        let (summary, entities) = distill(&parts);
+        // Executor text remains untrusted even after folding. Keep receipt handles in the archive.
+        let parts = block
+            .iter()
+            .filter(|m| m.role != "run_receipt")
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>();
+        let (mut summary, entities) = distill(&parts);
+        if let Some(receipt) = block.iter().find(|m| m.role == "run_receipt") {
+            summary.push_str(&format!("\n[Executor receipt seq_no={}]", receipt.seq_no));
+        }
         let node = new_node(tx, conversation, start, end, 1, summary, entities)?;
         tx.execute(
             "UPDATE messages SET compacted_into=?1 WHERE conversation_id=?2
@@ -394,15 +594,76 @@ fn distill(parts: &[&str]) -> (String, String) {
             }
         }
     }
+    // Keep explicit decisions and constraints even when they occur in the middle of
+    // a leaf or one of its children. This offline extractor copies source text verbatim.
+    let markers = [
+        (6, "最终决定"),
+        (6, "最终决策"),
+        (6, "final decision"),
+        (5, "决定"),
+        (5, "决策"),
+        (5, "decision"),
+        (5, "decided"),
+        (4, "必须"),
+        (4, "不得"),
+        (4, "禁止"),
+        (4, "验收"),
+        (4, "约束"),
+        (4, "constraint"),
+        (4, "must "),
+        (4, "shall "),
+        (3, "采用"),
+        (3, "选择"),
+        (3, "保留"),
+        (3, "use "),
+        (3, "chosen"),
+        (3, "require"),
+    ];
+    let mut ranked: Vec<(u8, String)> = Vec::new();
+    for part in parts {
+        for sentence in part.split_inclusive(['\n', '。', '！', '？', '；', ';', '!', '?']) {
+            let sentence = sentence.trim();
+            let lower = sentence.to_ascii_lowercase();
+            let Some((weight, offset)) = markers
+                .iter()
+                .find_map(|(weight, key)| lower.find(key).map(|p| (*weight, p)))
+            else {
+                continue;
+            };
+            let mut start = offset.saturating_sub(42);
+            while !sentence.is_char_boundary(start) {
+                start += 1;
+            }
+            let excerpt = clip(&sentence[start..], 180).trim().to_owned();
+            if !ranked.iter().any(|(_, s)| s == &excerpt) {
+                ranked.push((weight, excerpt));
+                ranked.sort_by_key(|(weight, _)| std::cmp::Reverse(*weight));
+                ranked.truncate(3);
+            }
+        }
+    }
     let first = parts.first().copied().unwrap_or("").trim();
     let last = parts.last().copied().unwrap_or("").trim();
-    let mut summary = clip(first, 100).to_owned();
-    if first != last {
-        summary.push_str(" … ");
-        summary.push_str(clip(last, 120));
+    let mut summary = String::new();
+    for piece in ranked
+        .iter()
+        .map(|(_, s)| s.as_str())
+        .chain([clip(first, 95), clip(last, 110)])
+    {
+        if piece.is_empty() || summary.contains(piece) {
+            continue;
+        }
+        let space = 480usize.saturating_sub(summary.len() + 1);
+        if space < 12 {
+            break;
+        }
+        if !summary.is_empty() {
+            summary.push('\n');
+        }
+        summary.push_str(clip(piece, space));
     }
     for key in entities.iter().filter(|k| !k.is_empty()) {
-        if !summary.contains(*key) && summary.len() + key.len() + 1 <= 360 {
+        if !summary.contains(*key) && summary.len() + key.len() + 1 <= 520 {
             summary.push(' ');
             summary.push_str(key);
         }
@@ -461,6 +722,103 @@ pub fn recall(
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(data)
+}
+
+#[derive(Serialize, Debug)]
+pub struct ArchivePage {
+    pub total_bytes: usize,
+    pub offset_bytes: usize,
+    pub next_offset_bytes: Option<usize>,
+    pub content: String,
+}
+
+/// Fetch a conversation-scoped page without materializing the entire source in Rust.
+/// Returned continuation offsets always land at an exact UTF-8 boundary.
+pub fn archive_page(
+    db: &Connection,
+    conversation: &str,
+    seq_no: Option<i64>,
+    source: Option<&str>,
+    offset: usize,
+    max_bytes: usize,
+) -> Result<ArchivePage> {
+    ensure!(
+        (4..=1024).contains(&max_bytes),
+        "max_bytes must be between 4 and 1024"
+    );
+    let query = match (seq_no, source) {
+        (Some(_), None) => "SELECT content FROM messages WHERE conversation_id=?1 AND seq_no=?2",
+        (None, Some("profile")) => {
+            "SELECT frozen_soul FROM conversation_prefix WHERE conversation_id=?1"
+        }
+        (None, Some("frozen_memory")) => {
+            "SELECT frozen_memory FROM conversation_prefix WHERE conversation_id=?1"
+        }
+        _ => anyhow::bail!("provide exactly one archive seq_no or source"),
+    };
+    let sql = format!("WITH src(body) AS ({query}) SELECT length(CAST(body AS BLOB)),substr(CAST(body AS BLOB),?3,?4) FROM src");
+    let pos = i64::try_from(offset)?
+        .checked_add(1)
+        .context("offset too large")?;
+    let (total_bytes, data): (usize, Vec<u8>) = db
+        .query_row(&sql, params![conversation, seq_no, pos, max_bytes], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?
+        .context("unknown archive source in this conversation")?;
+    ensure!(offset <= total_bytes, "offset beyond end of source");
+    let content = match std::str::from_utf8(&data) {
+        Ok(text) => text,
+        Err(e) if e.error_len().is_none() => std::str::from_utf8(&data[..e.valid_up_to()])?,
+        Err(_) => anyhow::bail!("offset is not a UTF-8 boundary"),
+    };
+    let next = offset + content.len();
+    Ok(ArchivePage {
+        total_bytes,
+        offset_bytes: offset,
+        next_offset_bytes: (next < total_bytes).then_some(next),
+        content: content.into(),
+    })
+}
+
+/// The model can search for handles, then read arbitrary original spans with bounded output.
+pub fn recall_tool(
+    db: &Connection,
+    conversation: &str,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let seq = args["seq_no"].as_i64();
+    let source = args["source"].as_str();
+    let max_bytes = usize::try_from(args["max_bytes"].as_u64().unwrap_or(384))?;
+    if seq.is_some() || source.is_some() {
+        let offset = usize::try_from(args["offset_bytes"].as_u64().unwrap_or(0))?;
+        return Ok(serde_json::to_value(archive_page(
+            db,
+            conversation,
+            seq,
+            source,
+            offset,
+            max_bytes,
+        )?)?);
+    }
+    let query = args["query"].as_str().unwrap_or("");
+    let limit = args["limit"].as_u64().unwrap_or(3).min(5) as usize;
+    let hits = recall(
+        db,
+        conversation,
+        args["dag_node_id"].as_str(),
+        query,
+        args["after_seq"].as_i64().unwrap_or(0),
+        limit,
+    )?;
+    let per_hit = max_bytes.clamp(4, 1024) / hits.len().max(1);
+    Ok(serde_json::Value::Array(hits.into_iter().map(|m| {
+        let offset = m.content.find(query).unwrap_or(0);
+        let excerpt = clip(&m.content[offset..],per_hit.max(4));
+        let next = offset + excerpt.len();
+        serde_json::json!({"seq_no":m.seq_no,"role":m.role,"total_bytes":m.content.len(),
+            "offset_bytes":offset,"next_offset_bytes":(next<m.content.len()).then_some(next),"content":excerpt})
+    }).collect()))
 }
 
 #[cfg(test)]
@@ -549,6 +907,129 @@ mod tests {
     }
 
     #[test]
+    fn prefix_and_recent_sources_round_trip_at_utf8_boundaries() -> Result<()> {
+        let mut db = tarla_memory::open(Path::new(":memory:"), "work")?;
+        let profile = "规则：一次只处理一个请求。".repeat(70);
+        let memory = "记录：【山海🌊】".repeat(70);
+        let huge = "源文本🌊。".repeat(400);
+        for i in 0..12 {
+            append(
+                &mut db,
+                "work",
+                "main",
+                "cli",
+                &format!("turn{i}"),
+                "user",
+                &huge,
+            )?;
+        }
+        let policy = ContextPolicy {
+            supervisor_active_budget_tokens: 480,
+            protected_verbatim_turns: 12,
+            ..Default::default()
+        };
+        let first = assemble(&mut db, "main", &profile, &memory, &policy)?;
+        assert!(first[0].content.contains("source=profile"));
+        assert!(first[0].content.contains("source=frozen_memory"));
+        assert!(first[1].content.contains("[archive seq_no=1.."));
+        assert!(first.last().unwrap().content.contains("seq_no=12"));
+        assert!(
+            first
+                .iter()
+                .map(|m| estimate(&m.role, &m.content))
+                .sum::<usize>()
+                <= 480
+        );
+        let larger = ContextPolicy {
+            supervisor_active_budget_tokens: 1600,
+            ..policy.clone()
+        };
+        let expanded = assemble(&mut db, "main", "new profile", "new memory", &larger)?;
+        assert_eq!(first[0], expanded[0]);
+        for (seq, source, original) in [
+            (None, Some("profile"), &profile),
+            (None, Some("frozen_memory"), &memory),
+            (Some(12), None, &huge),
+        ] {
+            let mut recovered = String::new();
+            loop {
+                let page = archive_page(&db, "main", seq, source, recovered.len(), 53)?;
+                assert_eq!(recovered.len(), page.offset_bytes);
+                assert_eq!(page.total_bytes, original.len());
+                assert!(page.content.len() <= 53);
+                recovered.push_str(&page.content);
+                if page.next_offset_bytes.is_none() {
+                    break;
+                }
+                assert_eq!(page.next_offset_bytes, Some(recovered.len()));
+            }
+            assert_eq!(&recovered, original);
+            assert!(archive_page(&db, "main", seq, source, 1, 8).is_err());
+            assert!(archive_page(&db, "other", seq, source, 0, 8).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn crossing_watermark_within_budget_folds_only_after_reply() -> Result<()> {
+        let mut db = tarla_memory::open(Path::new(":memory:"), "work")?;
+        let policy = ContextPolicy {
+            supervisor_active_budget_tokens: 1000,
+            compaction_high_watermark_pct: 75,
+            protected_verbatim_turns: 2,
+        };
+        let count = |db: &Connection| {
+            db.query_row("SELECT count(*) FROM context_dag_nodes", [], |r| {
+                r.get::<_, i64>(0)
+            })
+        };
+        for i in 0..3 {
+            append(
+                &mut db,
+                "work",
+                "main",
+                "cli",
+                &format!("u{i}"),
+                "user",
+                &"元".repeat(55),
+            )?;
+            assemble(&mut db, "main", "profile", "", &policy)?;
+            append(
+                &mut db,
+                "work",
+                "main",
+                "bot",
+                &format!("a{i}"),
+                "assistant",
+                "已收件",
+            )?;
+            maintain_after_turn(&mut db, "main", &policy)?;
+        }
+        assert_eq!(count(&db)?, 0);
+        append(
+            &mut db,
+            "work",
+            "main",
+            "cli",
+            "u3",
+            "user",
+            &"文".repeat(55),
+        )?;
+        assemble(&mut db, "main", "profile", "", &policy)?;
+        assert_eq!(count(&db)?, 0);
+        append(&mut db, "work", "main", "bot", "a3", "assistant", "已收件")?;
+        maintain_after_turn(&mut db, "main", &policy)?;
+        assert!(count(&db)? > 0);
+        let active: i64 = db.query_row(
+            "SELECT COUNT(*) FROM messages WHERE compacted_into IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(active, 4);
+        Ok(())
+    }
+
+    #[test]
     fn duplicate_delivery_and_oversized_protected_turn_are_explicit() -> Result<()> {
         let mut db = tarla_memory::open(Path::new(":memory:"), "work")?;
         let text = "太长".repeat(256);
@@ -559,7 +1040,23 @@ mod tests {
             supervisor_active_budget_tokens: 256,
             ..Default::default()
         };
-        assert!(assemble(&mut db, "c", "profile", "", &policy).is_err());
+        let window = assemble(&mut db, "c", "profile", "", &policy)?;
+        assert!(window.last().unwrap().content.contains("[archive seq_no=1"));
+        assert!(
+            window
+                .iter()
+                .map(|m| estimate(&m.role, &m.content))
+                .sum::<usize>()
+                <= 256
+        );
+        append(&mut db, "work", "c", "cli", "next", "user", "继续")?;
+        assert_eq!(
+            assemble(&mut db, "c", "profile", "", &policy)?
+                .last()
+                .unwrap()
+                .content,
+            "继续"
+        );
         assert_eq!(recall(&db, "c", None, "", 0, 1)?[0].content, text);
         Ok(())
     }
@@ -600,12 +1097,56 @@ pub fn related_decisions(
         return Ok(Vec::new());
     }
     let query = terms.join(" OR ");
+    let mut decisions = Vec::new();
+    // SQLite unicode61 indexes an unsegmented Chinese phrase as a single token.
+    // Trigram lookup lets a differently worded objective still find overlapping text.
+    let mut grams = BTreeSet::new();
+    for term in objective
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .take(24)
+    {
+        let chars = term.chars().take(96).collect::<Vec<_>>();
+        if chars.len() < 3 {
+            continue;
+        }
+        if term.is_ascii() {
+            if terms
+                .iter()
+                .any(|q| q.trim_matches('"').eq_ignore_ascii_case(term))
+            {
+                grams.insert(format!("\"{term}\""));
+            }
+        } else {
+            for part in chars.windows(3).take(24) {
+                grams.insert(format!("\"{}\"", part.iter().collect::<String>()));
+            }
+        }
+        if grams.len() >= 64 {
+            break;
+        }
+    }
+    if !grams.is_empty() {
+        let query = grams.into_iter().collect::<Vec<_>>().join(" OR ");
+        let mut stmt=db.prepare("SELECT d.summary_text FROM dag_search
+            JOIN context_dag_nodes d ON d.rowid=dag_search.rowid WHERE dag_search MATCH ?1
+            AND d.conversation_id=?2 AND d.depth_level=1 ORDER BY bm25(dag_search),d.start_seq_no DESC LIMIT 32")?;
+        let hits = stmt.query_map(params![query, conversation], |r| r.get::<_, String>(0))?;
+        for summary in hits {
+            let summary = summary?;
+            let excerpt = clip(&summary, 320).trim();
+            if !excerpt.is_empty() && !decisions.iter().any(|s| s == excerpt) {
+                decisions.push(excerpt.to_owned());
+            }
+            if decisions.len() == limit {
+                return Ok(decisions);
+            }
+        }
+    }
     let mut stmt=db.prepare("SELECT COALESCE(d.summary_text,m.content) FROM message_search
         JOIN messages m ON m.seq_no=message_search.rowid LEFT JOIN context_dag_nodes d ON d.dag_node_id=m.compacted_into
         WHERE message_search MATCH ?1 AND m.conversation_id=?2 AND m.sender_role='assistant'
         ORDER BY bm25(message_search),m.seq_no DESC LIMIT 64")?;
     let mut rows = stmt.query(params![query, conversation])?;
-    let mut decisions = Vec::new();
     while let Some(row) = rows.next()? {
         let full: String = row.get(0)?;
         let decision = clip(&full, 320).trim().to_owned();

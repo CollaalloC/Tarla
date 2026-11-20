@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-from acceptance import Node, install_test_slot, until
+from acceptance import BIN, Node, install_test_slot, until
 
 
 class Model(BaseHTTPRequestHandler):
@@ -90,6 +90,12 @@ def exercise(root, model, hc, host_environment):
         assert "fixture" in str(model.results["list_fleet_and_runs"])
         assert "memory_manage" in str(model.results["session_recall"])
         assert work.api("/v1/memories")[0]["memory_id"] == "fixture"
+        assert other.api("/v1/memories") == []
+        swapped = subprocess.run([BIN / "tarla", "--home", home, "--workspace", "work",
+                                  "--url", other.url, "remember", "misrouted", "wrong workspace",
+                                  "--base-version", "0"], env={**os.environ, "TARLA_TOKEN": other.token},
+                                 capture_output=True, text=True)
+        assert swapped.returncode != 0 and "workspace" in swapped.stderr
         assert other.api("/v1/memories") == []
         try:
             other.api("/v1/memories", token=work.token)

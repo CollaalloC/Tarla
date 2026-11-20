@@ -17,6 +17,24 @@ pub fn token(s: &Service, id: &str) -> Result<String> {
     mac.update(id.as_bytes());
     Ok(format!("{:x}", mac.finalize().into_bytes()))
 }
+pub(super) fn active(c: &Connection, id: &str, node: &str) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id=? AND target_node_id=?
+         AND desired_state='running' AND observed_state NOT IN ('failed','succeeded','cancelled'))",
+        params![id, node],
+        |r| r.get(0),
+    )?)
+}
+
+fn require_active(c: &Connection, id: &str, node: &str) -> Api<()> {
+    if !active(c, id, node)? {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "run is not active on this executor".into(),
+        ));
+    }
+    Ok(())
+}
 pub async fn callback(
     State(s): State<S>,
     Route((id, op)): Route<(String, String)>,
@@ -36,17 +54,7 @@ pub async fn callback(
         ));
     }
     let row = api::one(&s, &id)?;
-    if row["target_node_id"] != s.node()
-        || matches!(
-            row["observed_state"].as_str(),
-            Some("failed" | "succeeded" | "cancelled")
-        )
-    {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "run is not active on this executor".into(),
-        ));
-    }
+    require_active(&s.db()?, &id, s.node())?;
     let out = match op.as_str() {
         "approval" => {
             let request = string(&v, "request_id")?;
@@ -54,6 +62,7 @@ pub async fn callback(
             let aid = format!("{:x}", Sha256::digest(format!("{id}\n{request}")));
             let mut c = s.db()?;
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            require_active(&tx, &id, s.node())?;
             let tool = string(&v, "tool_or_cmd")?;
             let reason = string(&v, "risk_reason")?;
             if tool.len() > 2048 || reason.len() > 2048 {
@@ -98,7 +107,11 @@ pub async fn callback(
                 },
                 s.ws.config.context_policy.run_receipt_max_tokens,
             )?;
-            s.db()?.execute("INSERT INTO service_receipt_drafts VALUES(?,?) ON CONFLICT(run_id) DO UPDATE SET receipt=excluded.receipt",params![id,json!(receipt).to_string()])?;
+            let mut db = s.db()?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            require_active(&tx, &id, s.node())?;
+            tx.execute("INSERT INTO service_receipt_drafts VALUES(?,?) ON CONFLICT(run_id) DO UPDATE SET receipt=excluded.receipt",params![id,json!(receipt).to_string()])?;
+            tx.commit()?;
             json!({"stored":true})
         }
         "telemetry" => {
@@ -132,6 +145,12 @@ pub fn queue_proposal(s: &Service, v: &Value, run: Option<&str>) -> Result<Value
     };
     let mut c = s.db()?;
     let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if let Some(id) = run {
+        anyhow::ensure!(
+            active(&tx, id, s.node())?,
+            "run is not active on this executor"
+        );
+    }
     let existing: Option<(String, Option<String>)> = tx
         .query_row(
             "SELECT proposal,result FROM service_proposals WHERE id=?",

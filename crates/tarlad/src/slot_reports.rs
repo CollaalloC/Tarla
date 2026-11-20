@@ -21,8 +21,9 @@ fn mac(s: &Service, id: &str, expiry: i64) -> Result<String> {
     Ok(format!("{expiry}.{:x}", m.finalize().into_bytes()))
 }
 fn local(s: &Service, slot: &str) -> Result<()> {
-    if !s.can_execute() || !s.slots.iter().any(|x| x.snapshot.slot_id == slot) {
-        bail!("unknown local executor slot")
+    // Supervisor-only hosts may register subscription accounts for stateless borrowing.
+    if !s.slots.iter().any(|x| x.snapshot.slot_id == slot) {
+        bail!("unknown local slot")
     }
     Ok(())
 }

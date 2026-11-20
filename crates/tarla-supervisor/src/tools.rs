@@ -43,13 +43,15 @@ pub fn control_tools() -> Vec<ToolSpec> {
         (DispatchMission, "Queue one bounded mission; returns immediately with its run ID. Use only for work requested by the user.", json!({
             "objective":s(),"acceptance_criteria":list(),"distilled_context":{"type":"array","maxItems":5,"items":s()},
             "required_fact_keys":list(),"role":{"type":"string","enum":["architect","implementer","reviewer","explorer","distiller"]},
-            "required_caps":list(),"exclude_model_family":s()
+            "required_caps":list(),"exclude_model_family":s(),
+            "scope":{"type":"string","description":"Memory scope: global or project:<slug>. Includes global memories."},
+            "author_run_id":{"type":"string","description":"For a review, the conversation run that authored the work being reviewed. Required if the author is ambiguous."}
         }), vec!["objective","acceptance_criteria"]),
         (InspectRunLog, "Read a bounded page of an executor log for a workspace run.", json!({
             "run_id":s(),"offset":n(),"limit":n(),"query":s()
         }), vec!["run_id"]),
-        (SessionRecall, "Retrieve original messages from this conversation by query or DAG node.", json!({
-            "query":s(),"dag_node_id":s(),"after_seq":n(),"limit":n()
+        (SessionRecall, "Search this archive or read exact UTF-8 pages using seq_no or source. Continue from next_offset_bytes.", json!({
+            "query":s(),"dag_node_id":s(),"after_seq":n(),"limit":n(),"seq_no":n(),"source":{"type":"string","enum":["profile","frozen_memory"]},"offset_bytes":n(),"max_bytes":n()
         }), vec![]),
         (MemoryManage, "Find, propose, update or archive a workspace memory. Updates require the version previously read.", json!({
             "operation":{"type":"string","enum":["create","update","archive","search"]},

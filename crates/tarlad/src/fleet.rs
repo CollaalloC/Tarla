@@ -1,10 +1,11 @@
 use super::*;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use tarla_memory::{MemoryBackend, SqliteMemory};
 use tarla_protocol::{MissionPacket, RunReceipt};
 use tarla_scheduler::{select_best_slot, AgentSlotSnapshot, SlotHealth, TaskRequirement};
 use tarla_sidecar::Herdr;
 
+#[derive(Clone)]
 pub struct Slot {
     pub snapshot: AgentSlotSnapshot,
     pub argv: Vec<String>,
@@ -47,11 +48,14 @@ pub fn local_slots(s: &Service) -> Result<Vec<AgentSlotSnapshot>> {
     if !s.can_execute() {
         return Ok(vec![]);
     }
-    let c = s.db()?;
+    reported_slots(&s.db()?, &s.slots)
+}
+
+fn reported_slots(c: &Connection, slots: &[Slot]) -> Result<Vec<AgentSlotSnapshot>> {
     let mut result = vec![];
-    for slot in &s.slots {
+    for slot in slots {
         let mut snap = slot.snapshot.clone();
-        snap.active_runs=c.query_row("SELECT count(*) FROM runs WHERE target_node_id=? AND target_slot_id=? AND observed_state NOT IN ('succeeded','failed','cancelled')",params![s.node(),snap.slot_id],|r|r.get(0))?;
+        snap.active_runs=c.query_row("SELECT count(*) FROM runs WHERE target_node_id=? AND target_slot_id=? AND observed_state NOT IN ('succeeded','failed','cancelled')",params![snap.node_id,snap.slot_id],|r|r.get(0))?;
         if let Some(raw) = c
             .query_row(
                 "SELECT report FROM service_telemetry WHERE slot_id=?",
@@ -81,6 +85,61 @@ pub fn local_slots(s: &Service) -> Result<Vec<AgentSlotSnapshot>> {
     }
     Ok(result)
 }
+/// The registry is local to this process. The executor and supervisor use the same
+/// credential lock; live reports and nonterminal runs are re-read for each decision.
+pub fn subscription_registry(
+    home: &Path,
+    db_path: &Path,
+    slots: &[Slot],
+) -> Result<tarla_supervisor::SubscriptionRegistry> {
+    use tarla_scheduler::{quota_headroom, BillingTier};
+    use tarla_supervisor::{SubscriptionRegistry, SubscriptionSlot};
+
+    let root = home.canonicalize()?.join("slots");
+    let registered = slots
+        .iter()
+        .map(|slot| {
+            let id = &slot.snapshot.slot_id;
+            (
+                id.clone(),
+                SubscriptionSlot {
+                    driver: slot.snapshot.driver.clone(),
+                    executable: PathBuf::from(&slot.argv[0]),
+                    credential_dir: root.join(id),
+                },
+            )
+        })
+        .collect();
+    let db_path = db_path.to_owned();
+    let slots = slots.to_vec();
+    Ok(SubscriptionRegistry::new(registered, move || {
+        let c = Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let tx = c.unchecked_transaction()?;
+        let timestamp = now();
+        let result = reported_slots(&tx, &slots)?
+            .into_iter()
+            .filter_map(|slot| {
+                if slot.active_runs > 0
+                    || !matches!(
+                        slot.billing_tier,
+                        BillingTier::PrepaidSubscription | BillingTier::FreeQuota
+                    )
+                {
+                    return None;
+                }
+                let remaining = quota_headroom(&slot, timestamp)?;
+                Some((slot.slot_id, remaining))
+            })
+            .collect();
+        tx.commit()?;
+        Ok(result)
+    }))
+}
+
+#[cfg(all(test, unix))]
+#[path = "subscription_tests.rs"]
+mod subscription_tests;
+
 pub fn snapshots(s: &Service) -> Result<Vec<AgentSlotSnapshot>> {
     let mut slots = local_slots(s)?;
     let c = s.db()?;
@@ -99,14 +158,20 @@ pub fn snapshots(s: &Service) -> Result<Vec<AgentSlotSnapshot>> {
     Ok(slots)
 }
 pub fn dispatch(s: &Service, conv: &str, arg: &Value, run_id: Option<String>) -> Result<Value> {
-    dispatch_selected(s, conv, arg, run_id, None)
+    dispatch_selected(s, conv, arg, run_id, None, None)
 }
+pub enum Acknowledgement<'a> {
+    Supervisor(&'a str),
+    Command(&'a str),
+}
+
 pub fn dispatch_selected(
     s: &Service,
     conv: &str,
     arg: &Value,
     run_id: Option<String>,
     skill: Option<&skills::Selection>,
+    acknowledgement: Option<Acknowledgement<'_>>,
 ) -> Result<Value> {
     if !s.is_supervisor() {
         bail!("only the designated supervisor can dispatch")
@@ -116,7 +181,7 @@ pub fn dispatch_selected(
     let rid = run_id.unwrap_or_else(uid);
     if let Some(existing) = list(
         &c,
-        "SELECT r.run_id,r.conversation_id,q.request_json FROM runs r LEFT JOIN service_requirements q USING(run_id) WHERE run_id=?",
+        "SELECT r.run_id,r.conversation_id,r.target_node_id,r.target_slot_id,q.request_json FROM runs r LEFT JOIN service_requirements q USING(run_id) WHERE run_id=?",
         &[&rid],
     )?
     .first()
@@ -124,7 +189,7 @@ pub fn dispatch_selected(
         if existing["conversation_id"] != conv || existing["request_json"].as_str().is_some_and(|old|old!=arg.to_string()) {
             bail!("run identity conflict")
         }
-        return Ok(json!({"run_id":rid}));
+        return Ok(json!({"run_id":rid,"target_node_id":existing["target_node_id"],"target_slot_id":existing["target_slot_id"]}));
     }
     let mut slots = snapshots(s)?;
     if let Some(n) = arg["node_id"].as_str() {
@@ -133,20 +198,38 @@ pub fn dispatch_selected(
     if let Some(n) = arg["slot_id"].as_str() {
         slots.retain(|x| x.slot_id == n)
     }
-    let mut require = TaskRequirement {
+    let require = TaskRequirement {
         workspace_id: s.id().into(),
         role: serde_json::from_value(arg.get("role").cloned().unwrap_or(json!("implementer")))?,
         required_caps: strings(arg, "required_caps")?,
         exclude_model_family: arg["exclude_model_family"].as_str().map(String::from),
     };
-    if require.role == tarla_scheduler::AgentRole::Reviewer
-        && require.exclude_model_family.is_none()
-    {
-        require.exclude_model_family=c.query_row("SELECT q.model_family FROM service_requirements q JOIN runs r USING(run_id) WHERE r.conversation_id=? AND q.role IN ('architect','implementer') ORDER BY r.created_at DESC,r.rowid DESC LIMIT 1",[conv],|r|r.get(0)).optional()?;
-        if require.exclude_model_family.is_none() {
-            bail!("review requires the model family of the original author")
-        }
+    if require.role == tarla_scheduler::AgentRole::Reviewer {
+        let author_run = arg
+            .get("author_run_id")
+            .map(|value| {
+                value
+                    .as_str()
+                    .context("author_run_id must be a run identifier")
+            })
+            .transpose()?;
+        let family = author_family(&c, conv, author_run)?;
+        slots.retain(|slot| slot.model_family != family);
+    } else if arg.get("author_run_id").is_some() {
+        bail!("author_run_id applies only to reviews")
     }
+    let scope = match arg.get("scope") {
+        None => "global",
+        Some(value) => value
+            .as_str()
+            .filter(|scope| {
+                *scope == "global"
+                    || scope
+                        .strip_prefix("project:")
+                        .is_some_and(|slug| !slug.trim().is_empty())
+            })
+            .context("memory scope must be global or project:<slug>")?,
+    };
     let role = serde_json::to_value(require.role)?
         .as_str()
         .context("unknown role")?
@@ -210,10 +293,8 @@ pub fn dispatch_selected(
             objective: goal.into(),
             acceptance_criteria: acceptance,
             distilled_context: decisions,
-            project_memory_snapshot: m.prefetch_frozen_snapshot(
-                arg["scope"].as_str().unwrap_or("global"),
-                s.ws.config.memory.prefetch_token_budget,
-            )?,
+            project_memory_snapshot: m
+                .prefetch_frozen_snapshot(scope, s.ws.config.memory.prefetch_token_budget)?,
             required_fact_keys: strings(arg, "required_fact_keys")?,
         },
         s.ws.config.context_policy.mission_packet_max_tokens,
@@ -250,10 +331,40 @@ pub fn dispatch_selected(
     if candidate.node_id == s.node() {
         claim(&dbtx, s, &rid)?;
     }
+    let result =
+        json!({"run_id":rid,"target_node_id":candidate.node_id,"target_slot_id":candidate.slot_id});
+    if let Some(origin) = acknowledgement {
+        let (source, reply) = match origin {
+            Acknowledgement::Supervisor(source) => {
+                (source, tarla_supervisor::dispatch_acknowledgement(&rid))
+            }
+            Acknowledgement::Command(source) => (source, result.to_string()),
+        };
+        control::record_run_reply(&dbtx, s.id(), conv, source, &rid, &reply)?;
+    }
     dbtx.commit()?;
     s.notify.notify_waiters();
-    Ok(json!({"run_id":rid,"target_node_id":candidate.node_id,"target_slot_id":candidate.slot_id}))
+    Ok(result)
 }
+// A caller's optional family exclusion is an additional preference. The
+// persisted slot that authored the work always determines reviewer independence.
+fn author_family(db: &Connection, conversation: &str, run: Option<&str>) -> Result<String> {
+    let mut stmt = db.prepare(
+        "SELECT q.model_family FROM service_requirements q JOIN runs r USING(run_id)
+         WHERE r.conversation_id=?1 AND q.role IN ('architect','implementer')
+           AND (?2 IS NULL OR r.run_id=?2) ORDER BY r.created_at DESC,r.rowid DESC LIMIT 2",
+    )?;
+    let mut rows = stmt.query(params![conversation, run])?;
+    let family: String = rows
+        .next()?
+        .context("review requires an author run in this conversation")?
+        .get(0)?;
+    if run.is_none() && rows.next()?.is_some() {
+        bail!("multiple author runs in this conversation; specify author_run_id")
+    }
+    Ok(family)
+}
+
 fn strings(arg: &Value, k: &str) -> Result<Vec<String>> {
     match arg.get(k) {
         None | Some(Value::Null) => Ok(vec![]),
@@ -297,7 +408,43 @@ async fn tick(s: &Service) -> Result<()> {
     if !s.can_execute() {
         return Ok(());
     }
-    let jobs=list(&s.db()?,"SELECT r.*,c.phase,c.terminal,p.workdir AS pinned_workdir FROM service_claims c JOIN runs r USING(run_id) LEFT JOIN service_run_paths p USING(run_id) WHERE c.phase!='finished' ORDER BY c.updated_at LIMIT 128",&[])?;
+    // Recover every outstanding holder first. Only the head of each available
+    // slot competes for admission. Cancelled waiters never need an account lock.
+    let jobs = list(&s.db()?, "
+        WITH occupied AS (
+            SELECT r.target_slot_id FROM service_claims c JOIN runs r USING(run_id)
+            WHERE c.phase IN ('active','launching','abandoning')
+        ), heads AS (
+            SELECT min(c.rowid) FROM service_claims c JOIN runs r USING(run_id)
+            WHERE c.phase='queued' AND r.desired_state!='cancelled' GROUP BY r.target_slot_id
+        )
+        SELECT r.*,c.phase,c.terminal,p.workdir AS pinned_workdir,l.state AS permit
+        FROM service_claims c JOIN runs r USING(run_id)
+        LEFT JOIN service_run_paths p USING(run_id) LEFT JOIN service_launch_permits l USING(run_id)
+        WHERE c.phase IN ('active','launching','abandoning') OR (c.phase='queued' AND
+              (r.desired_state='cancelled' OR
+               (c.rowid IN (SELECT * FROM heads) AND r.target_slot_id NOT IN (SELECT * FROM occupied))))
+        ORDER BY CASE WHEN r.desired_state='cancelled' THEN 0 WHEN c.phase='queued' THEN 2 ELSE 1 END,c.rowid",
+        &[])?;
+    if jobs
+        .iter()
+        .any(|job| matches!(job["phase"].as_str(), Some("active" | "launching")))
+    {
+        let hc = herdr(s)?;
+        if hc.available().await.is_err() {
+            // Holders may survive their RPC server. Reopen this workspace's
+            // private inventory even when every slot already has a claim.
+            if let Err(e) = async {
+                tarla_sidecar::Toolchain::load(&s.home.join("bin"))?
+                    .ensure_herdr(&hc)
+                    .await
+            }
+            .await
+            {
+                eprintln!("executor holder inventory unavailable: {e}");
+            }
+        }
+    }
     for job in jobs {
         if let Err(e) = step(s, &job).await {
             eprintln!("run {}: {e}", job["run_id"]);
@@ -307,12 +454,32 @@ async fn tick(s: &Service) -> Result<()> {
 }
 async fn step(s: &Service, job: &Value) -> Result<()> {
     let rid = string(job, "run_id")?;
-    let hc = herdr(s)?;
     let mut phase = string(job, "phase")?.to_string();
     let goal = job["desired_state"] == "cancelled";
     let mut terminal = job["terminal"].as_str().map(String::from);
     let slot_id = string(job, "target_slot_id")?;
+    if phase == "abandoning" {
+        return finish(s, rid, "cancelled", "", "");
+    }
+    if phase != "queued"
+        && goal
+        && job["permit"] == "issued"
+        && launch::withdraw(&mut s.db()?, rid)?
     {
+        return finish(
+            s,
+            rid,
+            "cancelled",
+            "Cancelled before the command started.",
+            "",
+        );
+    }
+    if phase == "queued" && goal {
+        return finish(s, rid, "cancelled", "Cancelled before launch.", "");
+    }
+    if phase != "queued" && job["permit"].is_null() {
+        // An existing installation can still have holders launched by an older
+        // daemon. Retain its daemon-side guard until a terminal receipt arrives.
         let mut locks = s
             .account_locks
             .lock()
@@ -327,9 +494,12 @@ async fn step(s: &Service, job: &Value) -> Result<()> {
             }
         }
     }
+    let hc = herdr(s)?;
     if phase == "queued" {
-        if goal {
-            return finish(s, rid, "cancelled", "Cancelled before launch.", "");
+        match tarla_sidecar::try_lock_slot(&s.home, slot_id) {
+            Ok(guard) => drop(guard),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) => return Err(e.into()),
         }
         let Some(slot) = s
             .slots
@@ -400,7 +570,10 @@ async fn step(s: &Service, job: &Value) -> Result<()> {
         );
         env.insert("TARLA_RUN_TOKEN".into(), hooks::token(s, rid)?);
         env.insert("TARLA_RUN_ID".into(), rid.into());
-        if s.db()?.execute("UPDATE service_claims SET phase='launching',updated_at=? WHERE run_id=? AND phase='queued'",params![now(),rid])?!=1{return Ok(())}
+        let argv = launch::command(s, rid, argv)?;
+        if !launch::issue(&mut s.db()?, rid)? {
+            return Ok(());
+        }
         match hc.start_run(rid, &argv, &slot.workdir, &env).await {
             Ok(t) => terminal = Some(t),
             Err(e) => {
@@ -412,27 +585,60 @@ async fn step(s: &Service, job: &Value) -> Result<()> {
     }
     if phase == "launching" {
         if terminal.is_none() {
-            terminal = hc.find_run(rid).await?;
+            terminal = match hc.find_run(rid).await {
+                Ok(found) => found,
+                Err(e) => {
+                    state(s, rid, "unconfirmed", None)?;
+                    return Err(e.into());
+                }
+            };
         }
         let Some(t) = terminal.as_deref() else {
+            if launch::withdraw(&mut s.db()?, rid)? {
+                return finish(
+                    s,
+                    rid,
+                    "failed",
+                    "The interrupted launch was withdrawn before the command started.",
+                    "",
+                );
+            }
             state(s, rid, "unconfirmed", None)?;
             return Ok(());
         };
         let mut db = s.db()?;
-        let tx = db.transaction()?;
-        tx.execute(
-            "UPDATE service_claims SET phase='active',terminal=?,updated_at=? WHERE run_id=?",
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if tx.execute(
+            "UPDATE service_claims SET phase='active',terminal=?,updated_at=? WHERE run_id=? AND phase='launching'",
             params![t, now(), rid],
-        )?;
-        update(&tx, s, rid, "running", Some(t), None)?;
+        )? != 1 { return Ok(()); }
+        update_live(&tx, s, rid, t)?;
         tx.commit()?;
     }
     if let Some(t) = terminal {
         s.transcripts.ensure(&s.ws.root, rid, &t, &hc).await?;
-        let st = match hc.status(&t).await {
+        let st = match hc.status(rid, &t).await {
             Ok(st) => st,
             Err(e) => {
                 state(s, rid, "unconfirmed", Some(&t))?;
+                match hc.find_run(rid).await {
+                    Ok(Some(found)) if found != t => {
+                        s.db()?.execute(
+                            "UPDATE service_claims SET phase='launching',terminal=?,updated_at=? WHERE run_id=? AND phase='active'",
+                            params![found,now(),rid],
+                        )?;
+                    }
+                    Ok(None) if launch::withdraw(&mut s.db()?, rid)? => {
+                        return finish(
+                            s,
+                            rid,
+                            "failed",
+                            "The missing holder never admitted this command.",
+                            "",
+                        );
+                    }
+                    _ => {}
+                }
                 return Err(e.into());
             }
         };
@@ -440,7 +646,7 @@ async fn step(s: &Service, job: &Value) -> Result<()> {
             || matches!(st.state.as_str(), "exited" | "dead" | "closed" | "finished")
         {
             s.transcripts.drain(rid).await;
-            let out = hc.read(&t, 1000).await.unwrap_or_default();
+            let out = hc.read(rid, &t, 1000).await.unwrap_or_default();
             let final_state = if goal {
                 "cancelled"
             } else if st.exit_code == Some(0) {
@@ -455,7 +661,7 @@ async fn step(s: &Service, job: &Value) -> Result<()> {
             return finish(s, rid, final_state, summary, &out);
         }
         if goal {
-            hc.cancel(&t).await?;
+            hc.cancel(rid, &t).await?;
             return Ok(());
         }
         let status = st.status.unwrap_or(Value::Null);
@@ -465,7 +671,10 @@ async fn step(s: &Service, job: &Value) -> Result<()> {
                 .or(status["title"].as_str())
                 .unwrap_or("The agent requires human input.");
             let mut c = s.db()?;
-            let tx = c.transaction()?;
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !hooks::active(&tx, rid, s.node())? {
+                return Ok(());
+            }
             let fingerprint = format!("{:x}", Sha256::digest(status.to_string()));
             let existing = tx
                 .query_row(
@@ -500,23 +709,28 @@ async fn step(s: &Service, job: &Value) -> Result<()> {
             tx.commit()?;
         } else {
             let mut db = s.db()?;
-            let tx = db.transaction()?;
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             clear_osc(&tx, rid)?;
+            update_live(&tx, s, rid, &t)?;
             tx.commit()?;
-            let pending = s.db()?.query_row(
-                "SELECT exists(SELECT 1 FROM approvals WHERE run_id=? AND resolution='pending')",
-                [rid],
-                |r| r.get::<_, bool>(0),
-            )?;
-            state(
-                s,
-                rid,
-                if pending { "blocked" } else { "running" },
-                Some(&t),
-            )?;
         }
     };
     Ok(())
+}
+fn update_live(db: &Connection, s: &Service, id: &str, terminal: &str) -> Result<()> {
+    let blocked = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM approvals WHERE run_id=? AND resolution='pending')",
+        [id],
+        |r| r.get::<_, bool>(0),
+    )?;
+    update(
+        db,
+        s,
+        id,
+        if blocked { "blocked" } else { "running" },
+        Some(terminal),
+        None,
+    )
 }
 fn clear_osc(c: &Connection, id: &str) -> Result<()> {
     let aid: Option<String> = c
@@ -527,7 +741,7 @@ fn clear_osc(c: &Connection, id: &str) -> Result<()> {
         )
         .optional()?;
     if let Some(aid) = aid {
-        c.execute("UPDATE approvals SET resolution='handled_at_terminal',resolved_at=? WHERE approval_id=?",params![now(),aid])?;
+        c.execute("UPDATE approvals SET resolution='handled_at_terminal',resolved_at=? WHERE approval_id=? AND resolution='pending'",params![now(),aid])?;
         c.execute("DELETE FROM service_osc WHERE run_id=?", [id])?;
         push(
             c,
@@ -553,7 +767,16 @@ fn update(
     t: Option<&str>,
     approval: Option<Value>,
 ) -> Result<()> {
-    if c.execute("UPDATE runs SET observed_state=?,hc_terminal_id=coalesce(?,hc_terminal_id),updated_at=? WHERE run_id=? AND observed_state!=?",params![next,t,now(),id,next])?==0 && approval.is_none(){return Ok(())}
+    let changed = c.execute(
+        "UPDATE runs SET observed_state=?1,hc_terminal_id=coalesce(?2,hc_terminal_id),updated_at=?3
+         WHERE run_id=?4 AND (observed_state!=?1 OR (?2 IS NOT NULL AND hc_terminal_id IS NOT ?2) OR ?5)
+         AND observed_state NOT IN ('cancelled','failed','succeeded')
+         AND NOT EXISTS(SELECT 1 FROM service_run_abandonments WHERE run_id=runs.run_id)",
+        params![next,t,now(),id,approval.is_some()],
+    )?;
+    if changed == 0 {
+        return Ok(());
+    }
     push(
         c,
         id,
@@ -566,7 +789,35 @@ fn push(c: &Connection, id: &str, kind: &str, payload: &Value) -> Result<()> {
     c.execute("INSERT INTO outbox_events(event_id,run_id,event_type,payload_json,created_at) VALUES(?,?,?,?,?)",params![uid(),id,kind,serde_json::to_string(payload)?,now()])?;
     Ok(())
 }
-fn finish(s: &Service, id: &str, status: &str, summary: &str, transcript: &str) -> Result<()> {
+pub(crate) fn finish(
+    s: &Service,
+    id: &str,
+    status: &str,
+    summary: &str,
+    transcript: &str,
+) -> Result<()> {
+    let mut db = s.db()?;
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (desired, observed): (String, String) = tx.query_row(
+        "SELECT desired_state,observed_state FROM runs WHERE run_id=?",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if matches!(observed.as_str(), "succeeded" | "failed" | "cancelled") {
+        return Ok(());
+    }
+    let status = if desired == "cancelled" {
+        "cancelled"
+    } else {
+        status
+    };
+    let abandoned: Option<String> = tx
+        .query_row(
+            "SELECT reason FROM service_run_abandonments WHERE run_id=?",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
     let path = crate::transcript::finish(&s.ws.root, id, status, transcript)?;
     let native = handoff::outcome(&s.ws.root, id)?;
     let summary = native
@@ -580,8 +831,7 @@ fn finish(s: &Service, id: &str, status: &str, summary: &str, transcript: &str) 
         artifact_refs: vec![],
         s0_transcript_pointer: format!("node:{}/run:{id}/transcript.jsonl", s.node()),
     };
-    if let Some(raw) = s
-        .db()?
+    if let Some(raw) = tx
         .query_row(
             "SELECT receipt FROM service_receipt_drafts WHERE run_id=?",
             [id],
@@ -593,10 +843,12 @@ fn finish(s: &Service, id: &str, status: &str, summary: &str, transcript: &str) 
         receipt.executive_summary = draft.executive_summary;
         receipt.artifact_refs = draft.artifact_refs;
     }
+    if let Some(reason) = abandoned {
+        receipt.executive_summary =
+            format!("Owner closed an unconfirmed run. Earlier effects are unknown. {reason}");
+    }
     let receipt =
         tarla_context::bound_receipt(receipt, s.ws.config.context_policy.run_receipt_max_tokens)?;
-    let mut c = s.db()?;
-    let tx = c.transaction()?;
     clear_osc(&tx, id)?;
     tx.execute("UPDATE approvals SET resolution='ended',resolved_at=? WHERE run_id=? AND resolution='pending'",params![now(),id])?;
     tx.execute("UPDATE runs SET observed_state=?,receipt_summary=?,s0_log_local_path=?,updated_at=? WHERE run_id=?",params![status,receipt.executive_summary,path.to_string_lossy(),now(),id])?;

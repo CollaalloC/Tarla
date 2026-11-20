@@ -72,14 +72,7 @@ pub async fn post_message(
     Json(v): Json<Value>,
 ) -> Api {
     ensure_supervisor(&s)?;
-    let reply = control::message(&s, &id, &v).await?;
-    let mut out = json!({"reply":reply,"conversation_id":id});
-    if let Ok(value) = serde_json::from_str::<Value>(&reply) {
-        if let Some(run) = value.get("run_id") {
-            out["run_id"] = run.clone()
-        }
-    }
-    Ok(Json(out))
+    Ok(Json(control::message(&s, &id, &v).await?))
 }
 pub async fn binding(State(s): State<S>, Route(id): Route<String>, Json(v): Json<Value>) -> Api {
     ensure_supervisor(&s)?;
@@ -211,28 +204,37 @@ pub fn resolve_local_approval(s: &Service, id: &str, v: &str) -> Result<Value> {
     if !matches!(v, "approved" | "rejected") {
         bail!("invalid approval outcome")
     }
-    let c = s.db()?;
-    if c.query_row(
+    let mut db = s.db()?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if tx.query_row(
         "SELECT exists(SELECT 1 FROM service_osc WHERE approval_id=?)",
         [id],
         |r| r.get::<_, bool>(0),
     )? {
         bail!("use the run's interactive terminal to answer this prompt")
     }
-
-    let n=c.execute("UPDATE approvals SET resolution=?,resolved_by='paired_user',resolved_at=? WHERE approval_id=? AND resolution='pending'",params![v,now(),id])?;
-    if n != 1 {
-        let prior = c
+    let n = tx.execute(
+        "UPDATE approvals SET resolution=?,resolved_by='paired_user',resolved_at=?
+         WHERE approval_id=? AND resolution='pending' AND
+         (node_id!=? OR EXISTS(SELECT 1 FROM runs r WHERE r.run_id=approvals.run_id AND
+          r.target_node_id=approvals.node_id AND r.desired_state='running' AND
+          r.observed_state NOT IN ('succeeded','failed','cancelled')))",
+        params![v, now(), id, s.node()],
+    )?;
+    if n == 0 {
+        let prior: Option<String> = tx
             .query_row(
                 "SELECT resolution FROM approvals WHERE approval_id=?",
                 [id],
-                |r| r.get::<_, String>(0),
+                |r| r.get(0),
             )
             .optional()?;
         if prior.as_deref() != Some(v) {
-            bail!("approval already resolved or unknown")
+            bail!("approval is no longer pending for an active run")
         }
-    };
+    }
+    tx.commit()?;
+    s.notify.notify_waiters();
     Ok(json!({"id":id,"resolution":v}))
 }
 pub async fn logs(State(s): State<S>, Route(id): Route<String>, Query(p): Query<Page>) -> Api {
@@ -282,6 +284,6 @@ pub async fn forward(s: &Service, id: &str, text: &str) -> Result<Value> {
     if r["target_node_id"] != s.node() || r["observed_state"] != "running" {
         bail!("pinned run unavailable")
     }
-    fleet::herdr(s)?.send(terminal, text).await?;
+    fleet::herdr(s)?.send(id, terminal, text).await?;
     Ok(json!({"run_id":id,"forwarded":true}))
 }
