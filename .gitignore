@@ -1,7 +1,4 @@
 /target/
-.dart_tool/
-.flutter-plugins-dependencies
-**/build/
 *.token
 .env
 *.db*

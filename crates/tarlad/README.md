@@ -89,3 +89,7 @@ The supervisor adds the selected revision after the current conversation window 
 A gateway can poll `GET /v1/conversations/{id}/draft?channel=telegram&source_msg_id=...` while the matching message POST is running. Use the workspace bearer and the exact same channel, source message ID and conversation. A response has `status`, `revision` and `text`. A streaming response replaces the entire previous draft, including when the text resets to empty after provider failure or a tool round. Idle means that source has no available draft. A completed response includes the durable assistant message sequence in `seq_no`. Revision values identify changes within an active attempt. Completion and a restarted process start separate revision ranges.
 
 Only public text deltas are published. Tool arguments, reasoning blocks and provider metadata stay out of previews. Drafts live in memory and are capped at 8 KiB. The committed reply survives restart and may be longer. Providers and CLI drivers that return only complete decisions use the same final-message path.
+
+## Local desktop endpoint discovery
+
+A standalone desktop client hosting `tarlad` on loopback may pass `--publish-local-endpoint` (for example with `--listen 127.0.0.1:0`). The daemon writes `{"port":<bound-port>}` to `runtime/desktop-endpoint.json` while running and exposes `GET /local/v1/proof/{nonce}` for a 64-character hexadecimal nonce, returning `{"proof":"<hmac-sha256>"}` keyed by `runtime/api.token` over `tarla-desktop-v1:<nonce>` so the client can verify the listener before sending bearer credentials.

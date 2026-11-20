@@ -9,4 +9,3 @@ The repository contains adapters for separate, operator-provisioned processes. I
 | herdr-core | Private local socket or named pipe for an executor's persistent terminals | [herdrdev/herdr-core](https://github.com/herdrdev/herdr-core) |
 | EasyTier | Optional workspace-specific userspace mesh | [EasyTier/EasyTier](https://github.com/EasyTier/EasyTier) |
 | Tailscale | Optional isolated tailscaled state and userspace SOCKS endpoint | [tailscale/tailscale](https://github.com/tailscale/tailscale) |
-| Flutter and xterm.dart | Desktop and mobile views of the same authenticated API | [Flutter](https://github.com/flutter/flutter), [xterm.dart](https://github.com/TerminalStudio/xterm.dart) |
