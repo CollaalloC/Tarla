@@ -200,8 +200,7 @@ def run(root):
             denied(lambda: ticket(chief,run,mode="interactive",route="supervisor"),409)
             assert ws_status(worker,run,ticket(worker,run)["ticket"]) == 101
         (remote / "release").touch()
-        while time.monotonic() < deadline:
-            time.sleep(min(.5, deadline-time.monotonic()))
+        time.sleep(max(0, deadline - time.monotonic()))
         for server, grant in expired:
             assert ws_status(server, rid, grant) == 401
         print("PASS native observe-only input policy, direct and relayed CLI PTYs, scoped bearer, single-use grants, offline executor and 60s expiry")

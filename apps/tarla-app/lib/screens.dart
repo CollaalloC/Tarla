@@ -694,7 +694,13 @@ class _TerminalPageState extends State<TerminalPage> {
               if (mounted) setState(() => status = e.toString());
             },
             onDone: () {
-              if (mounted) setState(() => status = '终端连接已关闭');
+              terminal.onOutput = null;
+              terminal.onResize = null;
+              if (mounted)
+                setState(() {
+                  socket = null;
+                  status = '终端连接已关闭';
+                });
             },
           );
     } catch (e) {
@@ -725,8 +731,8 @@ class _TerminalPageState extends State<TerminalPage> {
           Expanded(
             child: TerminalView(
               terminal,
-              readOnly: widget.mode == 'observe',
-              autofocus: widget.mode == 'interactive',
+              readOnly: socket == null || widget.mode == 'observe',
+              autofocus: socket != null && widget.mode == 'interactive',
             ),
           ),
         ],

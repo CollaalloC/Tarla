@@ -126,8 +126,11 @@ class TarlaApi {
       req.headers.contentType = ContentType.json;
       req.write(jsonEncode(payload));
     }
+    final timeout = method == 'GET' || uri.pathSegments.last == 'attach'
+        ? const Duration(seconds: 10)
+        : const Duration(seconds: 120);
     final res = await req.close().timeout(
-      const Duration(seconds: 120),
+      timeout,
       onTimeout: () {
         req.abort();
         throw TimeoutException('服务响应超时');
@@ -140,7 +143,13 @@ class TarlaApi {
           }
           return b..addAll(v);
         })
-        .timeout(const Duration(seconds: 120));
+        .timeout(
+          timeout,
+          onTimeout: () {
+            req.abort();
+            throw TimeoutException('服务响应超时');
+          },
+        );
     final raw = utf8.decode(bytes, allowMalformed: true);
     if (res.statusCode < 200 || res.statusCode >= 300) {
       String message = res.reasonPhrase;

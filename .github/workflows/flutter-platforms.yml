@@ -3,10 +3,20 @@ on:
   push:
     paths:
       - "apps/tarla-app/**"
+      - "crates/**"
+      - "Cargo.*"
+      - "tests/native_mobile.py"
+      - "tests/acceptance.py"
+      - "tests/install_test_herdr.py"
       - ".github/workflows/flutter-platforms.yml"
   pull_request:
     paths:
       - "apps/tarla-app/**"
+      - "crates/**"
+      - "Cargo.*"
+      - "tests/native_mobile.py"
+      - "tests/acceptance.py"
+      - "tests/install_test_herdr.py"
       - ".github/workflows/flutter-platforms.yml"
   workflow_dispatch:
 
@@ -102,16 +112,6 @@ jobs:
           TARLA_TEST_BIN: ${{ github.workspace }}/target/debug
         run: flutter test test/daemon_contract_test.dart
       - run: flutter build ${{ matrix.args }}
-      - name: Boot an iPhone simulator and launch Tarla
-        if: matrix.target == 'ios-simulator'
-        shell: bash
-        run: |
-          device_id=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; print(next(d["udid"] for os,devices in json.load(sys.stdin)["devices"].items() if "iOS" in os for d in devices if d["name"].startswith("iPhone")))')
-          xcrun simctl boot "$device_id"
-          xcrun simctl bootstatus "$device_id" -b
-          xcrun simctl install "$device_id" build/ios/iphonesimulator/Runner.app
-          xcrun simctl launch "$device_id" dev.tarla.client
-          xcrun simctl terminate "$device_id" dev.tarla.client
       - name: Preserve bundle permissions
         if: runner.os != 'Windows'
         shell: bash
@@ -129,30 +129,84 @@ jobs:
           path: apps/tarla-app/${{ matrix.artifact }}
           if-no-files-found: error
 
-  android-emulator:
-    name: Android API 35 launch
-    needs: build
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+  mobile-integration:
+    name: ${{ matrix.name }} · workspace and remote terminal
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Android API 35
+            os: ubuntu-24.04
+            platform: android
+          - name: iPhone Simulator
+            os: macos-15
+            platform: ios
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 80
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          name: tarla-android
-      - name: Extract the tested APK
-        run: tar -xzf android.tar.gz build/app/outputs/flutter-apk/app-debug.apk
+          shared-key: native-mobile-host
+      - name: Build real host supervisor and executor
+        run: cargo build --locked -p tarlad -p tarla-cli
+      - name: Install the verified Linux PTY release
+        id: herdr_release
+        if: matrix.platform == 'android'
+        continue-on-error: true
+        run: python3 tests/install_test_herdr.py "$GITHUB_ENV"
+      - name: Fetch pinned PTY sources for this host
+        if: matrix.platform == 'ios' || steps.herdr_release.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          repository: herdrdev/herdr-core
+          ref: 06793ede1bedb1fed8d22d3cae476d3eb239edf0
+          submodules: true
+          persist-credentials: false
+          path: .upstream-herdr
+      - if: matrix.platform == 'ios' || steps.herdr_release.outcome == 'failure'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: 0.16.0
+      - name: Build the pinned upstream PTY executable
+        if: matrix.platform == 'ios' || steps.herdr_release.outcome == 'failure'
+        working-directory: .upstream-herdr
+        run: |
+          cargo build --locked -p herdr-core
+          echo "TARLA_TEST_HC=$PWD/target/debug/herdr-core" >> "$GITHUB_ENV"
+      - uses: actions/setup-java@v4
+        if: matrix.platform == 'android'
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.3'
+          channel: stable
+          cache: true
+      - name: Resolve mobile integration dependencies
+        working-directory: apps/tarla-app
+        run: flutter pub get --enforce-lockfile
       - name: Enable Android emulator acceleration
+        if: matrix.platform == 'android'
         run: |
           sudo chgrp "$(id -gn)" /dev/kvm
           sudo chmod g+rw /dev/kvm
-      - name: Launch Tarla on Android emulator
+      - name: Exercise both app processes on Android
+        if: matrix.platform == 'android'
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
           arch: x86_64
-          disk-size: 2048M
+          disk-size: 4096M
           ram-size: 2048M
-          script: |
-            adb install -r build/app/outputs/flutter-apk/app-debug.apk
-            adb shell am start -W -n dev.tarla.client/.MainActivity
-            adb shell pidof dev.tarla.client
+          script: python3 tests/native_mobile.py android "$(adb get-serialno)"
+      - name: Exercise both app processes on iOS
+        if: matrix.platform == 'ios'
+        shell: bash
+        run: |
+          device_id=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; print(next(d["udid"] for rt,devices in json.load(sys.stdin)["devices"].items() if "iOS" in rt for d in devices if d["name"].startswith("iPhone")))')
+          xcrun simctl boot "$device_id"
+          xcrun simctl bootstatus "$device_id" -b
+          python3 tests/native_mobile.py ios "$device_id"

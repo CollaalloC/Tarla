@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shlex
 import sqlite3
 import subprocess
 import tempfile
@@ -16,7 +17,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request
 
-from acceptance import HTTP, Node, until
+from acceptance import BIN, HTTP, Node, install_test_slot, until
 
 KEY = "local-fixture-encryption-key"
 
@@ -86,11 +87,45 @@ def completed(node, conv, text):
     return until(lambda: ("assistant", "reply " + text) in history(node, conv), f"archived {text}")
 
 
+def terminal_notice(node, work):
+    run = node.api("/v1/runs", {"conversation_id":"shared","goal":"interactive terminal question"})["run_id"]
+    action = until(lambda: next((a for a in node.api("/v1/actions")
+                                if a["kind"] == "terminal_input" and a["run_id"] == run), None),
+                   "actual Herdr OSC 7501 terminal input")
+    with contextlib.closing(sqlite3.connect(node.dir / "gateway.db")) as db:
+        def notice():
+            return db.execute("SELECT json_extract(job,'$.Text') FROM outgoing o JOIN terminal_notices t "
+                              "ON t.route=o.route JOIN routes r ON r.id=o.route WHERE t.action=? "
+                              "AND r.platform='telegram' AND job LIKE ?", (action["id"], "%"+run+"%")).fetchone()
+        (text,) = until(notice, "paired Telegram terminal notice")
+        assert not db.execute("SELECT 1 FROM cards WHERE action=?", (action["id"],)).fetchone()
+        assert db.execute("SELECT count(*) FROM terminal_notices WHERE action=?", (action["id"],)).fetchone() == (1,)
+    command = shlex.split(text.splitlines()[-1])
+    assert command == ["tarla","--workspace","work","attach",run,"--interactive","--via-supervisor"], command
+    process = subprocess.Popen([BIN/"tarla","--home",node.home,"--url",node.url,*command[1:]],
+                               stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        process.stdin.write(b"paired reply\r")
+        process.stdin.flush()
+        until(lambda: (work/"answer").is_file(), "terminal instruction reaches actual blocked process")
+        assert (work/"answer").read_text() == "paired reply"
+        until(lambda: node.api("/v1/runs/"+run)["observed_state"]=="succeeded","interactive run completes")
+    finally:
+        process.stdin.close()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            process.wait(timeout=5)
+    assert process.returncode == 0, process.stderr.read().decode()
+    print("PASS real OSC 7501 prompt, one scoped IM notice, advertised CLI command resolves the live terminal")
+
+
 def check(root):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
     server.started, server.release, server.healthy = (threading.Event() for _ in range(3))
     server.interrupted, server.disconnected = threading.Event(), threading.Event()
-    node = Node(root, "chief", "supervisor_only")
+    node = Node(root, "chief", "supervisor_and_executor")
     cfg = node.dir / "workspace.toml"
     content = cfg.read_text().replace("fallback_chain = []", 'fallback_chain = ["http:primary","http:fallback"]')
     for name in ("primary","fallback"):
@@ -98,6 +133,14 @@ def check(root):
                     f'endpoint="http://127.0.0.1:{server.server_port}/{name}"\n')
     cfg.write_text(content + '\n[gateway.telegram]\nenabled=true\n[gateway.feishu]\nenabled=true\n'
                    'app_id="fixture-app"\nencrypt_key_env="FIXTURE_ENCRYPT"\n')
+    hc = os.environ.get("TARLA_TEST_HC")
+    if hc:
+        work = install_test_slot(node, hc)
+        (work / "job.py").write_text(
+            "from pathlib import Path\n"
+            "print('\\x1b]7501;state=blocked:kind=permission:id=a/b:msg=QXBwbHk/\\x07', end='', flush=True)\n"
+            "Path('answer').write_text(input().strip())\n"
+        )
 
     with contextlib.ExitStack() as cleanup:
         thread = threading.Thread(target=server.serve_forever)
@@ -107,6 +150,12 @@ def check(root):
         cleanup.callback(server.shutdown)
         cleanup.callback(server.release.set)
         cleanup.callback(server.disconnected.set)
+        if hc:
+            runtime = node.dir / "runtime"
+            cleanup.callback(subprocess.run, [hc,"server","stop"], capture_output=True, timeout=10,
+                             env={**os.environ,"HC_SESSION":"tarla","HC_SOCKET":str(runtime/"hc.sock"),
+                                  "XDG_RUNTIME_DIR":str(runtime/"hc-runtime"),"XDG_STATE_HOME":str(runtime/"hc-state"),
+                                  "XDG_CONFIG_HOME":str(runtime/"hc-config")})
         cleanup.callback(node.stop)
         cleanup.enter_context(patch.dict(os.environ, {
             "TARLA_TELEGRAM_BOT_TOKEN":"42:LOCAL", "TARLA_TELEGRAM_WEBHOOK_SECRET":"fixture",
@@ -115,10 +164,10 @@ def check(root):
             "NO_PROXY":"127.0.0.1,localhost","no_proxy":"127.0.0.1,localhost",
         }))
         node.start("")
-        def pair(platform, actor, conv):
+        def pair(platform, actor, conv, approvals=False):
             return "/pair " + node.api("/gateway/pairings", {"platform":platform,"actor_id":actor,
-                                       "conversation_id":conv})["code"]
-        telegram(node, 1, pair("telegram","7","shared"))
+                                       "conversation_id":conv,"approvals":approvals})["code"]
+        telegram(node, 1, pair("telegram","7","shared", approvals=True))
         feishu(node, "pair-shared", "same", pair("feishu","actor","shared"))
         feishu(node, "pair-free", "other", pair("feishu","actor","free"))
         telegram(node, 2, "slow")
@@ -164,6 +213,8 @@ def check(root):
         assert history(node, "shared") == expected, history(node,"shared")
         assert history(node, "free") == [("user","fast"),("assistant","reply fast")]
         print("PASS signed Telegram/Feishu overlap, FIFO through 429/503 and restart, one archived reply per source")
+        if hc:
+            terminal_notice(node, work)
 
 
 if __name__ == "__main__":

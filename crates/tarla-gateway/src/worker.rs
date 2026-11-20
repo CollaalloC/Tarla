@@ -504,7 +504,25 @@ async fn poll(g: &Gateway) -> Result<()> {
                     .chars()
                     .take(600)
                     .collect();
-                let text = format!("{title}\n{detail}\nOpen this run on a paired CLI to respond.\ntarla --workspace {workspace} attach {id} --interactive");
+                let modes = run["terminal_modes"].as_array();
+                if modes.is_some_and(|m| m.is_empty()) {
+                    continue;
+                }
+                let interactive = modes.is_none_or(|m| m.iter().any(|v| v == "interactive"));
+                let (hint, option) = if interactive {
+                    (
+                        "Open this run on a paired CLI to respond.",
+                        " --interactive",
+                    )
+                } else {
+                    (
+                        run["terminal_input_hint"].as_str().unwrap_or(
+                            "Reply in this conversation. The CLI can show the terminal.",
+                        ),
+                        "",
+                    )
+                };
+                let text = format!("{title}\n{detail}\n{hint}\ntarla --workspace {workspace} attach {id}{option} --via-supervisor");
                 store::queue_terminal_notice(&mut *g.db()?, &b, action, text)?;
             } else {
                 store::queue_card(
@@ -575,9 +593,11 @@ mod tests {
         let app = Router::new()
             .route("/v1/actions", get(|| async { Json(json!([
                 {"id":"osc","kind":"terminal_input","run_id":"run17","title":"Choice required","risk_reason":"Choose a path"},
+                {"id":"chat","kind":"terminal_input","run_id":"run18","title":"Follow up in chat"},
                 {"id":"tool","kind":"approval","conversation_id":"main","title":"Review tool"}
             ])) }))
             .route("/v1/runs/run17", get(|| async { Json(json!({"run_id":"run17","workspace_id":"work","conversation_id":"main"})) }))
+            .route("/v1/runs/run18", get(|| async { Json(json!({"run_id":"run18","workspace_id":"work","conversation_id":"main","terminal_modes":["observe"],"terminal_input_hint":"Send the next instruction in chat."})) }))
             .route("/v1/conversations/{id}/messages", get(|| async { Json(json!([])) }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let core = format!("http://{}", listener.local_addr().unwrap())
@@ -616,6 +636,17 @@ mod tests {
             "SELECT count(*),r.thread,json_extract(o.job,'$.Text') FROM outgoing o JOIN routes r ON o.route=r.id WHERE o.job LIKE '%--interactive%'", [],
             |r| Ok((r.get(0)?, r.get(1)?,r.get(2)?))).unwrap();
         assert_eq!((notices.0, notices.1.as_str()), (1, "on"));
+        let observe: String = db
+            .query_row(
+                "SELECT json_extract(job,'$.Text') FROM outgoing WHERE job LIKE '%run18%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            observe.contains("Send the next instruction in chat.")
+                && !observe.contains("--interactive")
+        );
         assert!(
             notices.2.contains("Choose a path")
                 && notices

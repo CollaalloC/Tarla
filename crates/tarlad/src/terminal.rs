@@ -16,7 +16,18 @@ const UNKNOWN: &str =
     "The executor has not confirmed input support. Send a message in this run’s conversation.";
 
 pub fn owner_input(s: &Service, id: &str) -> Result<bool> {
-    Ok(!handoff::structured_turn(&s.ws.root, id)?)
+    let saved = s
+        .db()?
+        .query_row(
+            "SELECT interactive FROM service_terminal_input WHERE run_id=?",
+            [id],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()?;
+    match saved {
+        Some(interactive) => Ok(interactive),
+        None => Ok(!handoff::structured_turn(&s.ws.root, id)?),
+    }
 }
 
 pub fn remember_input(db: &Connection, id: &str, interactive: bool) -> Result<()> {
