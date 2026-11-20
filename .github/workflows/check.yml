@@ -57,6 +57,9 @@ jobs:
       - name: Upstream terminal and network adapters
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: cargo test --locked -p tarla-sidecar --test real -- --ignored
+      - name: Single-node supervisor, execution, receipt and host isolation
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: python3 tests/stage1_core.py
       - name: Framed terminal observer
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: cargo test --locked -p tarlad private_observer_streams -- --ignored

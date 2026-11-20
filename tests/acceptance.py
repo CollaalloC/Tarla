@@ -66,17 +66,18 @@ def until(fn, label, timeout=25):
 
 
 class Node:
-    def __init__(self, path, name, role):
+    def __init__(self, path, name, role, workspace=SPACE):
+        self.workspace = workspace
         self.home, self.name, self.port = path, name, free_port()
         self.url = f"http://127.0.0.1:{self.port}"
-        self.dir = self.home / "workspaces" / SPACE
+        self.dir = self.home / "workspaces" / self.workspace
         self.proc = None
         self.cli("init", "--node", name, "--role", role, "--supervisor", "chief")
         self.token = (self.dir / "runtime/api.token").read_text().strip()
 
     def cli(self, *args):
         return subprocess.check_output([BIN / "tarla", "--home", self.home,
-                                        "--workspace", SPACE, "--url", self.url, *args], text=True)
+                                        "--workspace", self.workspace, "--url", self.url, *args], text=True)
 
     def configure(self, peer, port):
         config = self.dir / "workspace.toml"
@@ -90,7 +91,7 @@ class Node:
     def start(self, secret):
         self.log = (self.home / "server.log").open("a")
         self.proc = subprocess.Popen([BIN / "tarlad", "--home", self.home,
-            "--workspace", SPACE, "--listen", f"127.0.0.1:{self.port}"],
+            "--workspace", self.workspace, "--listen", f"127.0.0.1:{self.port}"],
             env={**os.environ, "TARLA_PAIR_TEST": secret}, stdout=self.log, stderr=self.log)
         def ready():
             if self.proc.poll() is not None:
