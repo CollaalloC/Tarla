@@ -89,7 +89,9 @@ tarla --workspace work pair office https://office.example.net --token-env OFFICE
 
 计划迁移时先停止旧主管，使用 `tarla supervisor handover --to <new-node> --snapshot <file>` 生成面向指定新机器的账本快照并降级旧主管。在新机器上用同一工作空间名及指定节点名初始化干净目录，再用 `tarla supervisor restore --snapshot <file>` 导入。根据新拓扑配置模型、网关及配对凭证后启动新主管。已预配新主管并记录原主管公钥的执行机会自动采用签署的更高任期。可用 `tarla supervisor backup` 提前制作灾难恢复备份，详见[主管迁移与恢复](docs/stage2.md#更换主管)。快照含会话和长期记忆，应经私有通道传输。
 
-## 测试及客户端
+## 测试与验收
+
+本仓库提供无头核心守护进程（`tarlad`）、命令行工具（`tarla`）与多平台消息网关（`tarla-gateway`）；桌面与移动图形客户端在独立仓库中基于同一受控业务 API 开发。
 
 ```sh
 cargo test --locked --workspace
@@ -103,10 +105,9 @@ python3 tests/acceptance.py
 | --- | --- | --- |
 | 一 · 单机主管 | 156 轮真实接口对话、异步派单与主动回报、宿主 Herdr 隔离、执行器重启与消息重放 | [单机使用与验收](docs/stage1.md) · [长会话测试](tests/stage1_history.py) · [执行恢复测试](tests/executor_recovery.py) |
 | 二 · 配对与同步 | 在独立进程间同步 S2 记忆，断线补传和重启对账，验证限时终端票据及工位交接 | [双机使用与验收](docs/stage2.md) · [双网配置](docs/managed-networks.md) · [双节点延迟实测](docs/replication-latency.md) · [工位验收](tests/pinned.py) |
-| 三 · 网关与客户端 | 对话、任务、审批和记忆的客户端接口，四个 IM 平台的入站和出站协议，以及原生应用构建和模拟器启动 | [客户端对真实守护进程的测试](apps/tarla-app/test/daemon_contract_test.dart) · [网关配置](crates/tarla-gateway/README.md) · [客户端构建与下载](https://github.com/CollaalloC/Tarla/actions/workflows/flutter-platforms.yml) |
+| 三 · 网关与单终端接管 | 对话、任务、审批和记忆的业务接口，直连与主管中继单终端票据，以及四个 IM 平台的有序恢复与草稿投递 | [单终端接管与网关](docs/stage3.md) · [网关配置](crates/tarla-gateway/README.md) · [终端中继验收](tests/stage3_terminal.py) · [网关恢复验收](tests/gateway_recovery.py) |
 
 - [从 CLI 或网关接管任务终端](docs/stage3.md)
-- [Flutter 客户端及真机/模拟器连接](apps/tarla-app/README.md)
 - [飞书、Telegram、Slack、Discord 网关的配置与配对](crates/tarla-gateway/README.md)
 - [记忆后端、外部索引与离线行为](crates/tarla-memory/README.md)
 - [运行状态、执行机权限与双网配置](crates/tarlad/README.md)
