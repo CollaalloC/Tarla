@@ -33,6 +33,8 @@ curl -X POST "$CORE/gateway/pairings" -H "Authorization: Bearer $TOKEN" \
 
 将返回的五分钟一次性代码作为 `/pair CODE` 或普通文本 `tarla pair CODE` 发到目标聊天 / 话题。Discord 的输入形式为 `/tarla text:tarla pair CODE`。Slack 建议用普通文本。飞书使用发送者的 open_id。只有指定平台与用户可兑换，之后只有该用户可通过这条绑定发消息或审批。选择群组时，同一话题中的成员都能看到后续回复。需要单独给另一个人使用时，请绑定新的私聊或话题。
 
+网关按接收顺序处理属于同一会话的消息，包括从其他平台接续的消息。不同会话可以并行处理。主管配置的所有模型均暂时不可用时，Core 返回 HTTP 503。网关保留该消息和后续消息，重启后继续重试。开启 `approvals` 的话题还会收到终端输入提醒，内含指向具体工作空间和任务的 `tarla attach` 命令。
+
 多个渠道可配对到相同会话，直接使用 Core 的会话绑定 API 设置 pinned 工位。生成配对码时记录会话游标，兑换后投递该游标之后的助手消息与当前待处理审批。审批卡只对绑定会话中的任务生效，且配对时需设置 `approvals:true`。使用授权的 `GET /gateway/pairings` 查看绑定，`DELETE /gateway/pairings/{id}` 撤销绑定及其待投递数据。
 
 ## 独立进程

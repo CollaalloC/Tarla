@@ -330,6 +330,13 @@ struct Launch {
 fn metadata_path(root: &Path, id: &str) -> PathBuf {
     root.join("runtime/pinned").join(format!("{id}.result"))
 }
+pub fn structured_turn(root: &Path, id: &str) -> Result<bool> {
+    validate_id(id)?;
+    Ok(metadata_path(root, id)
+        .with_extension("launch")
+        .try_exists()?)
+}
+
 fn argv_for(slot: &fleet::Slot, prompt: String, session: Option<&str>) -> Result<Vec<String>> {
     let mut args = slot.argv.clone();
     for opt in args.iter().skip(1) {
@@ -375,13 +382,14 @@ fn argv_for(slot: &fleet::Slot, prompt: String, session: Option<&str>) -> Result
     Ok(args)
 }
 pub fn launch(s: &Service, job: &Value, slot: &fleet::Slot, prompt: String) -> Result<Vec<String>> {
+    let id = string(job, "run_id")?;
     let pinned = job["pinned_workdir"].is_string();
     if !native(&slot.snapshot.driver) || (!pinned && argv_for(slot, String::new(), None).is_err()) {
         let mut args = slot.argv.clone();
         args.push(prompt);
+        terminal::remember_input(&s.db()?, id, true)?;
         return Ok(args);
     }
-    let id = string(job, "run_id")?;
     let conv = string(job, "conversation_id")?;
     let db = s.db()?;
     let ep = db
@@ -417,6 +425,7 @@ pub fn launch(s: &Service, job: &Value, slot: &fleet::Slot, prompt: String) -> R
             workdir: Some(slot.workdir.clone()),
         })?,
     )?;
+    terminal::remember_input(&db, id, false)?;
     Ok(vec![
         std::env::current_exe()?
             .into_os_string()

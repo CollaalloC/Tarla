@@ -22,7 +22,7 @@ fn hash(s: &str) -> String {
 }
 
 pub fn open(path: &Path) -> Result<Connection> {
-    let db = Connection::open(path)?;
+    let mut db = Connection::open(path)?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     db.execute_batch("
     PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;
@@ -31,7 +31,23 @@ pub fn open(path: &Path) -> Result<Connection> {
     CREATE TABLE IF NOT EXISTS cards(token TEXT PRIMARY KEY, route TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE, action TEXT NOT NULL, UNIQUE(route,action));
     CREATE TABLE IF NOT EXISTS inbox(n INTEGER PRIMARY KEY, platform TEXT NOT NULL, event TEXT NOT NULL, route TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE, job TEXT NOT NULL, tries INTEGER NOT NULL DEFAULT 0, retry INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, UNIQUE(platform,event));
     CREATE TABLE IF NOT EXISTS outgoing(n INTEGER PRIMARY KEY AUTOINCREMENT, route TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE, job TEXT NOT NULL, tries INTEGER NOT NULL DEFAULT 0, retry INTEGER NOT NULL DEFAULT 0);
+    CREATE INDEX IF NOT EXISTS gateway_route_conversation ON routes(conv);
+    CREATE INDEX IF NOT EXISTS gateway_pending_inbox ON inbox(route,n) WHERE done=0;
+    CREATE INDEX IF NOT EXISTS gateway_pending_outgoing ON outgoing(route,n);
+    CREATE TABLE IF NOT EXISTS terminal_notices(route TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE, action TEXT NOT NULL, PRIMARY KEY(route,action));
     ")?;
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for table in ["inbox", "outgoing"] {
+        let present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?) WHERE name='lease')",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !present {
+            tx.execute(&format!("ALTER TABLE {table} ADD COLUMN lease TEXT"), [])?;
+        }
+    }
+    tx.commit()?;
     db.execute_batch(crate::drafts::SCHEMA)?;
     Ok(db)
 }
@@ -291,6 +307,27 @@ pub fn queue_card(db: &mut Connection, b: &Binding, action: &str, title: &str) -
         tx.execute(
             "INSERT INTO outgoing(route,job) VALUES (?,?)",
             params![b.id, serde_json::to_string(&job)?],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn queue_terminal_notice(
+    db: &mut Connection,
+    binding: &Binding,
+    action: &str,
+    text: String,
+) -> Result<()> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if tx.execute(
+        "INSERT OR IGNORE INTO terminal_notices VALUES (?,?)",
+        params![binding.id, action],
+    )? == 1
+    {
+        tx.execute(
+            "INSERT INTO outgoing(route,job) VALUES (?,?)",
+            params![binding.id, serde_json::to_string(&Delivery::Text(text))?],
         )?;
     }
     tx.commit()?;

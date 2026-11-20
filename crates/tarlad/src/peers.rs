@@ -9,6 +9,7 @@ use tarla_protocol::{MissionPacket, RunReceipt};
 use tarla_scheduler::AgentSlotSnapshot;
 pub struct Peer {
     pub url: String,
+    pub client_url: Option<String>,
     token: String,
 }
 pub fn load(conf: &toml::Table, ws: &Workspace) -> Result<BTreeMap<String, Peer>> {
@@ -30,6 +31,24 @@ pub fn load(conf: &toml::Table, ws: &Workspace) -> Result<BTreeMap<String, Peer>
             {
                 bail!("peer URL must be a bare HTTP(S) origin on the paired network")
             }
+            let client_url = v
+                .get("client_url")
+                .map(|value| -> Result<String> {
+                    let uri =
+                        reqwest::Url::parse(value.as_str().context("client_url must be a URL")?)?;
+                    anyhow::ensure!(
+                        uri.scheme() == "https"
+                            && uri.host().is_some()
+                            && uri.username().is_empty()
+                            && uri.password().is_none()
+                            && uri.query().is_none()
+                            && uri.fragment().is_none()
+                            && uri.path() == "/",
+                        "client_url must be a bare HTTPS origin"
+                    );
+                    Ok(uri.as_str().trim_end_matches('/').into())
+                })
+                .transpose()?;
             let token = std::env::var(string(&v, "token_env")?)
                 .context("missing configured peer secret")?;
             if token.len() < 32
@@ -45,6 +64,7 @@ pub fn load(conf: &toml::Table, ws: &Workspace) -> Result<BTreeMap<String, Peer>
                         id.into(),
                         Peer {
                             url: url.into(),
+                            client_url,
                             token,
                         },
                     )
@@ -215,7 +235,7 @@ pub async fn receive(
             result["term"] = json!(s.term());
             result
         }
-        "ticket" | "log" | "resolve" | "forward" => {
+        "ticket" | "terminal_input" | "log" | "resolve" | "forward" => {
             if node != s.supervisor() {
                 return Err(ApiError(
                     StatusCode::FORBIDDEN,
@@ -223,7 +243,8 @@ pub async fn receive(
                 ));
             }
             match op.as_str() {
-                "ticket" => terminal::local_ticket(&s, string(&v, "run_id")?, &v)?,
+                "ticket" => terminal::local_ticket(&s, string(&v, "run_id")?, &v).await?,
+                "terminal_input" => terminal::local_input_info(&s, string(&v, "run_id")?)?,
                 "log" => {
                     api::local_log(
                         &s,
@@ -388,6 +409,9 @@ pub(super) fn accept_events(
                               params![decision,now(),string(&p,"approval_id")?,id])?;
                 }
                 "state_changed" if !terminal && node != s.node() => {
+                    if let Some(value) = p["terminal_interactive"].as_bool() {
+                        terminal::remember_input(c, id, value)?;
+                    }
                     let next = string(&p, "state")?;
                     if !matches!(
                         next,

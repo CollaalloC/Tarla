@@ -59,3 +59,5 @@ END;
 INSERT OR IGNORE INTO service_distillations(run_id,receipt_event)
 SELECT run_id,event_id FROM outbox_events WHERE acked_at IS NULL AND event_type='run_receipt'
 AND json_extract(payload_json,'$.final_state')='succeeded';
+
+CREATE TABLE IF NOT EXISTS service_terminal_input(run_id TEXT PRIMARY KEY, interactive INTEGER NOT NULL CHECK(interactive IN (0,1)));
