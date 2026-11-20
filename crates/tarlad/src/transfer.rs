@@ -173,7 +173,7 @@ fn process(s: &Service, run: &str) -> Result<()> {
         &slots,
         parent_node,
         parent_slot,
-        string(&row, "target")?,
+        row["target"].as_str().context("invalid handoff target")?,
         row["quota"] != 1,
     )
     .context("waiting for an eligible destination slot")?;

@@ -192,14 +192,32 @@ pub fn queue_proposal(s: &Service, v: &Value, run: Option<&str>) -> Result<Value
     s.notify.notify_waiters();
     Ok(json!({"status":"queued","proposal_id":key}))
 }
-pub async fn flush_memory(s: &Service) -> Result<()> {
-    let rows = list(
-        &s.db()?,
+// An automatic lesson is checked against the supervisor's accepted receipt.
+// Select it only after the very same event is in this round's confirmed S1
+// prefix. An older supervisor's acked_at can survive a snapshot rollback.
+fn ready_proposals(
+    c: &Connection,
+    confirmed_through: Option<i64>,
+    time: i64,
+) -> Result<Vec<Value>> {
+    list(
+        c,
         "SELECT p.id,p.proposal FROM service_proposals p LEFT JOIN service_proposal_retries r USING(id)
-         WHERE p.result IS NULL AND (r.retry_after IS NULL OR r.retry_after<=?)
+         WHERE p.result IS NULL AND (r.retry_after IS NULL OR r.retry_after<=?1)
+         AND (p.id NOT GLOB 'distill-*' OR EXISTS (
+            SELECT 1 FROM service_distillations d
+            JOIN outbox_events e ON e.event_id=d.receipt_event AND e.run_id=d.run_id
+            JOIN service_s1_sequence seq ON seq.event_id=e.event_id
+            WHERE d.run_id=json_extract(p.proposal,'$.source_run_id') AND e.event_type='run_receipt'
+              AND e.acked_at IS NOT NULL AND seq.seq<=?2
+         ))
          ORDER BY (r.retry_after IS NOT NULL), r.retry_after, p.rowid LIMIT 16",
-        &[&now()],
-    )?;
+        &[&time, &confirmed_through],
+    )
+}
+
+pub async fn flush_memory(s: &Service, confirmed_through: Option<i64>) -> Result<()> {
+    let rows = ready_proposals(&s.db()?, confirmed_through, now())?;
     for row in rows {
         let p: Mutation = serde_json::from_str(string(&row, "proposal")?)?;
         let result = if s.is_supervisor() {
@@ -243,4 +261,57 @@ pub fn apply(s: &Service, node: &str, p: &Mutation) -> Result<Value> {
     let result = SqliteMemory::new(&mut c, s.id(), s.node()).propose_mutation(p)?;
     peers::mutation_committed(s, &result);
     Ok(json!(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automatic_proposals_wait_for_their_own_receipt_ack_without_delaying_manual_work() {
+        let db = tarla_memory::open(std::path::Path::new(":memory:"), "work").unwrap();
+        db.execute_batch(crate::MIGRATIONS).unwrap();
+        db.execute_batch(crate::s1::SCHEMA).unwrap();
+        // The queries use durable rows in the migrated schema. The fixture
+        // supplies run identities solely to satisfy its local foreign keys.
+        db.execute_batch("INSERT INTO conversations(conversation_id,workspace_id,created_at,updated_at)
+            VALUES('conversation','work',1,1);
+            INSERT INTO runs(run_id,workspace_id,conversation_id,supervisor_term,target_node_id,target_slot_id,
+              desired_state,observed_state,mission_packet_json,created_at,updated_at)
+              VALUES('one','work','conversation',1,'worker','slot','running','succeeded','{}',1,1),
+                    ('two','work','conversation',1,'worker','slot','running','succeeded','{}',1,1);
+            INSERT INTO outbox_events(event_id,run_id,event_type,payload_json,created_at,acked_at)
+              VALUES('first','one','run_receipt','{\"final_state\":\"succeeded\"}',1,1),
+                    ('second','two','run_receipt','{\"final_state\":\"succeeded\"}',1,NULL);
+            INSERT INTO service_proposals(id,proposal,result)
+              VALUES('distill-one','{\"source_run_id\":\"one\"}',NULL),
+                    ('distill-two','{\"source_run_id\":\"two\"}',NULL),
+                    ('manual','{\"source_run_id\":\"two\"}',NULL),
+                    ('manual-retry','{}',NULL);
+            INSERT INTO service_proposal_retries VALUES('manual-retry',100);").unwrap();
+        let ready = |cursor, time| {
+            ready_proposals(&db, cursor, time)
+                .unwrap()
+                .into_iter()
+                .map(|row| row["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ready(None, 99), ["manual"]);
+        assert_eq!(ready(Some(0), 99), ["manual"]);
+        assert_eq!(ready(Some(2), 99), ["distill-one", "manual"]);
+        db.execute(
+            "UPDATE outbox_events SET acked_at=2 WHERE event_id='second'",
+            [],
+        )
+        .unwrap();
+        // Rewind to a receiver whose restored cursor predates the second receipt.
+        assert_eq!(
+            ready(Some(1), 100),
+            ["distill-one", "manual", "manual-retry"]
+        );
+        assert_eq!(
+            ready(Some(2), 100),
+            ["distill-one", "distill-two", "manual", "manual-retry"]
+        );
+    }
 }

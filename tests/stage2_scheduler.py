@@ -1,10 +1,12 @@
 """Public dispatch selection across a supervisor and a registered executor."""
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
 import secrets
 import signal
+import sqlite3
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -79,6 +81,20 @@ def check(root):
         report("bravo",window_used_pct=0)
         author=submit("review","remote",slot_id="alpha")["run_id"]
         assert submit("review","remote",role="reviewer",author_run_id=author,exclude_model_family="unrelated")["target_slot_id"]=="bravo"
+        # Stage the run-scoped checkpoint normally written by the authenticated adapter.
+        # Real PTY emission and native resume are exercised separately by quota_handoff.py.
+        parent=hashlib.sha256(b"api-run:auto-handoff:retry-id").hexdigest()
+        with sqlite3.connect(worker.dir/"state.db") as db:
+            db.execute("INSERT INTO service_rate_limits VALUES(?,?,?)",
+                       (parent,int(time.time())+600,"Confirmed checkpoint from the original slot."))
+        scheduled=submit("auto-handoff","remote",slot_id="alpha",request_id="retry-id")
+        assert scheduled["run_id"]==parent
+        child=until(lambda: chief.api("/v1/runs/"+parent)["successor_run_id"], "automatic destination")
+        assert chief.api("/v1/runs/"+child)["target_slot_id"]=="bravo"
+        assert chief.api("/v1/runs/"+child)["predecessor_run_id"]==parent
+        assert submit("auto-handoff","remote",slot_id="alpha",request_id="retry-id")==scheduled
+        assert len([r for r in chief.api("/v1/runs") if r["conversation_id"]=="auto-handoff"])==2
+        report("alpha",health="healthy")
         worker.stop()
         until(lambda: remote_slots()["alpha"]["health"]=="node_offline","stale peer filtered",timeout=22)
         reject(lambda: submit("offline","remote"),"eligible")
