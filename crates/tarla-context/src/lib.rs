@@ -669,7 +669,7 @@ fn distill(parts: &[&str]) -> (String, String) {
         summary.push_str(clip(piece, space));
     }
     for key in entities.iter().filter(|k| !k.is_empty()) {
-        if !summary.contains(*key) && summary.len() + key.len() + 1 <= 520 {
+        if !summary.contains(*key) && summary.len() + key.len() < 520 {
             summary.push(' ');
             summary.push_str(key);
         }

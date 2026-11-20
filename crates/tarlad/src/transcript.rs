@@ -331,7 +331,9 @@ pub fn page(root: &Path, id: &str, offset: u64, limit: u64, query: &str) -> Resu
                 .context("invalid transcript record")?
                 .as_bytes();
             let bytes = h
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|b| {
                     u8::from_str_radix(std::str::from_utf8(b)?, 16).map_err(anyhow::Error::from)
                 })
