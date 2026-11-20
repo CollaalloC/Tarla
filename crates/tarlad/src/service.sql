@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS service_leases(nonce TEXT PRIMARY KEY, expires INTEGE
 CREATE TABLE IF NOT EXISTS service_run_paths(run_id TEXT PRIMARY KEY,workdir TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS service_receipt_drafts(run_id TEXT PRIMARY KEY,receipt TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS service_proposals(id TEXT PRIMARY KEY,proposal TEXT NOT NULL,result TEXT);
+CREATE TABLE IF NOT EXISTS service_proposal_retries(id TEXT PRIMARY KEY REFERENCES service_proposals(id),retry_after INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS service_telemetry(slot_id TEXT PRIMARY KEY,report TEXT NOT NULL,updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS service_forwards(source TEXT PRIMARY KEY,run_id TEXT NOT NULL,sent INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS service_binding_epochs(conversation_id TEXT PRIMARY KEY, epoch TEXT NOT NULL, checkpoint TEXT NOT NULL);

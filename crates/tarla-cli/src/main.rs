@@ -81,6 +81,8 @@ enum Command {
         id: String,
     },
     Status,
+    /// Show executor journals still required by a restored supervisor.
+    RecoveryStatus,
     Conversations,
     Runs,
     Actions,
@@ -319,6 +321,7 @@ async fn main() -> Result<()> {
         Command::ChannelPairings => c.get(&["gateway", "pairings"]).await?,
         Command::UnpairChannel { id } => c.api(Method::DELETE, &["gateway", "pairings", &id], None, &[]).await?,
         Command::Status => c.health().await?,
+        Command::RecoveryStatus => c.get(&["v1", "recovery"]).await?,
         Command::Conversations => c.get(&["v1", "conversations"]).await?,
         Command::Runs => c.get(&["v1", "runs"]).await?,
         Command::Actions => c.get(&["v1", "actions"]).await?,

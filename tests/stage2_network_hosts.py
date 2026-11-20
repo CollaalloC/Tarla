@@ -49,6 +49,7 @@ class Host(Node):
 
 
 def run(root, hc):
+    ip("link","set","lo","up")
     ip("link","add","testbr","type","bridge")
     with contextlib.ExitStack() as cleanup:
         cleanup.callback(ip,"link","del","testbr")

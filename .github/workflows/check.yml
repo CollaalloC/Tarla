@@ -81,11 +81,9 @@ jobs:
       - name: Cross-node claim and acknowledged event recovery
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: python3 tests/s1_reconciliation.py
-      - name: Four-stage scheduler and durable S2 fork recovery
+      - name: Durable S2 fork recovery
         if: "!cancelled() && steps.binaries.outcome == 'success'"
-        run: |
-          python3 tests/stage2_scheduler.py
-          python3 tests/s2_recovery.py
+        run: python3 tests/s2_recovery.py
       - name: Automatic completion lesson and offline mirror
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: python3 tests/stage2_distillation.py
@@ -95,6 +93,11 @@ jobs:
       - name: Workspace skill activation
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: python3 tests/skills.py
+      - name: Stage two scheduler and rate-limit handoff
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: |
+          python3 tests/stage2_scheduler.py
+          python3 tests/quota_handoff.py
       - name: Pinned sessions and handoff
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: python3 tests/pinned.py

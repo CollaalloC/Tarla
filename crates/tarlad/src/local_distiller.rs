@@ -75,3 +75,23 @@ impl LocalDistiller {
             .filter(|i| *i < quotes.len()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn classifier_only_accepts_explicit_local_endpoints() {
+        for url in [
+            "https://example.com/model",
+            "http://localhost/model",
+            "http://user:pw@127.0.0.1/model",
+            "http://127.0.0.1/model?key=x",
+        ] {
+            assert!(LocalDistiller::new(&tarla_workspace::DistillerConfig {
+                model: "local".into(),
+                endpoint: url.into()
+            })
+            .is_err());
+        }
+    }
+}

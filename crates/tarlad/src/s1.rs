@@ -31,12 +31,17 @@ pub fn sent(db: &Connection, supervisor: &str) -> Result<i64> {
 
 pub fn batch(db: &Connection, after: i64) -> Result<Value> {
     ensure!(after >= 0, "invalid S1 cursor");
+    let head: i64 = db.query_row(
+        "SELECT coalesce(max(seq),0) FROM service_s1_sequence",
+        [],
+        |r| r.get(0),
+    )?;
     let rows = list(
         db,
         "SELECT x.seq,o.event_id,o.run_id,o.event_type,o.payload_json
         FROM service_s1_sequence x JOIN outbox_events o USING(event_id)
-        WHERE x.seq>? ORDER BY x.seq LIMIT 24",
-        &[&after],
+        WHERE x.seq>? AND x.seq<=? ORDER BY x.seq LIMIT 24",
+        &[&after, &head],
     )?;
     let mut claims = serde_json::Map::new();
     let mut events = vec![];
@@ -63,7 +68,7 @@ pub fn batch(db: &Connection, after: i64) -> Result<Value> {
         }
         events.push(ev);
     }
-    Ok(json!({"s1_cursor":after,"events":events,"claims":claims}))
+    Ok(json!({"s1_cursor":after,"s1_head":head,"events":events,"claims":claims}))
 }
 
 fn assignment_mac(db: &Connection, metadata: &Value) -> Result<Hmac<Sha256>> {
@@ -118,7 +123,12 @@ pub fn certify(db: &Connection, s: &Service, node: &str, row: &mut Value) -> Res
             "{:x}",
             assignment_mac(db, &metadata)?.finalize().into_bytes()
         );
-        json!({"assignment":metadata,"tag":tag})
+        let issued = json!({"assignment":metadata,"tag":tag});
+        db.execute(
+            "INSERT INTO service_s1_proofs VALUES(?,?)",
+            params![id, issued.to_string()],
+        )?;
+        issued
     };
     let claim: Option<String> = db
         .query_row(
@@ -285,6 +295,9 @@ pub fn accept(
         ack.push(eid.to_owned());
     }
     db.execute("INSERT INTO service_s1_frontier VALUES(?,?) ON CONFLICT(node) DO UPDATE SET seq=excluded.seq",params![node,frontier])?;
+    if request["s1_head"].as_i64() == Some(frontier) {
+        db.execute("DELETE FROM service_restore_pending WHERE node=?", [node])?;
+    }
     Ok((frontier, ack))
 }
 
@@ -337,7 +350,28 @@ pub fn save_offer(db: &Connection, s: &Service, id: &str, item: &Value, fresh: b
             params![id, cert.to_string()],
         )?;
     }
-    if fresh {
+    let prior_claim: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM service_claims WHERE run_id=?)",
+        [id],
+        |r| r.get(0),
+    )?;
+    if !prior_claim {
+        if let Some(authorized) = item["authorized_claim"].as_str() {
+            // The supervisor has already authorized this identity but this
+            // executor lost its local claim. Inspect its retained holder; a
+            // previous side effect can never be disproved by a missing row.
+            validate_id(authorized)?;
+            db.execute(
+                "INSERT INTO service_claims(run_id,phase,updated_at) VALUES(?,'launching',?)",
+                params![id, now()],
+            )?;
+            db.execute(
+                "INSERT OR IGNORE INTO service_s1_claims VALUES(?,?)",
+                params![id, authorized],
+            )?;
+            db.execute("UPDATE runs SET observed_state='unconfirmed' WHERE run_id=? AND observed_state NOT IN ('succeeded','failed','cancelled')",[id])?;
+            return Ok(());
+        }
         db.execute(
             "INSERT INTO service_claims(run_id,phase,updated_at) VALUES(?,'offered',?)",
             params![id, now()],
@@ -374,8 +408,21 @@ pub fn startup(s: &S) {
         let s = s.clone();
         let node = node.clone();
         tokio::spawn(async move {
-            if let Err(err) = pull(&s, &node).await {
-                eprintln!("startup S1 reconciliation with {node}: {err}");
+            loop {
+                if let Err(err) = pull(&s, &node).await {
+                    eprintln!("startup S1 reconciliation with {node}: {err}");
+                }
+                let pending = s.db().and_then(|db| {
+                    Ok(db.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM service_restore_pending WHERE node=?)",
+                        [&node],
+                        |r| r.get::<_, bool>(0),
+                    )?)
+                });
+                if !matches!(pending, Ok(true)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
             }
         });
     }
@@ -398,4 +445,95 @@ async fn pull(s: &Service, node: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Only a deliberate supervisor restore arms this fence. Expand the snapshot's
+/// source catalog before serving requests, even if a node is currently offline.
+pub fn begin_recovery(
+    db: &mut Connection,
+    local: &str,
+    paired: &BTreeMap<String, peers::Peer>,
+) -> Result<()> {
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if tx.execute("DELETE FROM service_restore_barrier WHERE singleton=1", [])? == 0 {
+        return Ok(());
+    }
+    tx.execute("DELETE FROM service_restore_pending", [])?;
+    tx.execute(
+        "INSERT OR IGNORE INTO service_restore_pending SELECT node FROM service_restore_sources
+        WHERE node!=? AND node NOT IN(SELECT node FROM service_restore_nonexecutors)",
+        [local],
+    )?;
+    for node in paired.keys() {
+        tx.execute(
+            "INSERT OR IGNORE INTO service_restore_pending SELECT ?1 WHERE ?1!=?2
+            AND NOT EXISTS(SELECT 1 FROM service_restore_nonexecutors WHERE node=?1)",
+            params![node, local],
+        )?;
+    }
+    tx.execute("INSERT OR IGNORE INTO service_restore_pending SELECT DISTINCT target_node_id FROM runs WHERE target_node_id!=?",[local])?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn waiting(db: &Connection) -> Result<Vec<Value>> {
+    list(
+        db,
+        "SELECT p.node AS node_id,coalesce(f.seq,0) AS confirmed_seq FROM service_restore_pending p
+        LEFT JOIN service_s1_frontier f ON p.node=f.node ORDER BY p.node",
+        &[],
+    )
+}
+
+pub fn check_dispatch(db: &Connection) -> Result<()> {
+    let rows = waiting(db)?;
+    if !rows.is_empty() {
+        let names = rows
+            .iter()
+            .filter_map(|r| r["node_id"].as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "restored supervisor is reconciling S1 history with {names}; use tarla recovery-status"
+        );
+    }
+    Ok(())
+}
+
+pub async fn recovery_status(axum::extract::State(s): axum::extract::State<S>) -> Api {
+    ensure_supervisor(&s)?;
+    let mut pending = waiting(&s.db()?)?;
+    for peer in &mut pending {
+        peer["paired"] = json!(s.peers.contains_key(string(peer, "node_id")?));
+    }
+    Ok(Json(
+        json!({"phase":if pending.is_empty() {"ready"} else {"reconciling"},"pending":pending}),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_fence_remembers_unpaired_executors_without_rearming_on_restart() {
+        let mut db = tarla_memory::open(Path::new(":memory:"), "w").unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        db.execute_batch("INSERT INTO service_restore_barrier VALUES(1);
+            INSERT INTO service_restore_sources VALUES('unpaired'),('old-supervisor'),('new-supervisor');
+            INSERT INTO service_restore_nonexecutors VALUES('old-supervisor');").unwrap();
+        begin_recovery(&mut db, "new-supervisor", &BTreeMap::new()).unwrap();
+        assert_eq!(
+            waiting(&db).unwrap(),
+            vec![json!({"node_id":"unpaired","confirmed_seq":0})]
+        );
+        assert!(check_dispatch(&db).is_err());
+        db.execute(
+            "DELETE FROM service_restore_pending WHERE node='unpaired'",
+            [],
+        )
+        .unwrap();
+        begin_recovery(&mut db, "new-supervisor", &BTreeMap::new()).unwrap();
+        check_dispatch(&db).unwrap();
+    }
 }

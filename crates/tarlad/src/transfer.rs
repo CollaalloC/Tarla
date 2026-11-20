@@ -38,7 +38,7 @@ pub fn accept_quota(db: &Connection, _s: &Service, run: &str, raw: &Value) -> Re
 fn boundary(db: &Connection, parent: &str) -> Result<Value> {
     list(
         db,
-        "SELECT r.*,t.target,t.prompt,t.quota,t.checkpoint,t.state AS transfer_state,
+        "SELECT r.*,t.target,t.prompt,t.quota,t.checkpoint,t.manual_source,t.state AS transfer_state,
         p.workdir AS old_workdir,q.request_json,e.epoch AS original_epoch
         FROM service_turn_transfers t JOIN runs r USING(run_id)
         JOIN service_requirements q USING(run_id)
@@ -129,7 +129,9 @@ fn process(s: &Service, run: &str) -> Result<()> {
         return Ok(());
     }
     let conv = string(&row, "conversation_id")?;
-    if !owns_binding(&db, &row)? || row["desired_state"] == "cancelled" {
+    let unconfirmed_quota =
+        row["quota"] == 1 && row["observed_state"] != "failed" && row["manual_source"].is_null();
+    if unconfirmed_quota || !owns_binding(&db, &row)? || row["desired_state"] == "cancelled" {
         db.execute("UPDATE service_turn_transfers SET state='cancelled',last_error=NULL WHERE run_id=? AND state='pending'",[run])?;
         return Ok(());
     }
@@ -172,7 +174,7 @@ fn process(s: &Service, run: &str) -> Result<()> {
         parent_node,
         parent_slot,
         string(&row, "target")?,
-        false,
+        row["quota"] != 1,
     )
     .context("waiting for an eligible destination slot")?;
     let pinned = row["old_workdir"].is_string();
@@ -180,7 +182,14 @@ fn process(s: &Service, run: &str) -> Result<()> {
     let resume_objective = row["quota"] == 1 && row["observed_state"] == "failed";
     if !resume_objective && row["prompt"].is_null() {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if owns_binding(&tx, &row)? && pinned {
+        let current = boundary(&tx, run)?;
+        if current["transfer_state"] != "pending"
+            || current["desired_state"] == "cancelled"
+            || !owns_binding(&tx, &current)?
+        {
+            return Ok(());
+        }
+        if pinned {
             change(
                 &tx,
                 conv,
@@ -236,29 +245,46 @@ fn process(s: &Service, run: &str) -> Result<()> {
     Ok(())
 }
 
+async fn reconcile(s: &Service) -> Result<()> {
+    let ready = list(
+        &s.db()?,
+        "SELECT t.run_id,r.conversation_id FROM service_turn_transfers t JOIN runs r USING(run_id)
+         WHERE t.state='pending' AND r.observed_state IN ('failed','succeeded','cancelled')
+           AND EXISTS(SELECT 1 FROM service_wakes w WHERE w.conversation_id=r.conversation_id
+                      AND json_extract(w.receipt,'$.run_id')=r.run_id) ORDER BY t.rowid",
+        &[],
+    )?;
+    for item in ready {
+        let run = string(&item, "run_id")?;
+        let conversation = string(&item, "conversation_id")?;
+        // A chat or report in one conversation must not block other ready transfers.
+        let Ok(_guard) = tokio::time::timeout(Duration::from_millis(5), s.lock(conversation)).await
+        else {
+            continue;
+        };
+        if let Err(error) = process(s, run) {
+            let detail = error.to_string();
+            s.db()?.execute(
+                "UPDATE service_turn_transfers SET last_error=?1
+                WHERE run_id=?2 AND state='pending' AND last_error IS NOT ?1",
+                params![detail, run],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn worker(s: S) {
     if !s.is_supervisor() {
         return;
     }
     loop {
-        let result:Result<()>=async {
-            let ready=list(&s.db()?,"SELECT t.run_id,r.conversation_id FROM service_turn_transfers t
-                JOIN runs r USING(run_id) WHERE t.state='pending' AND r.observed_state IN ('failed','succeeded','cancelled')
-                AND EXISTS(SELECT 1 FROM service_wakes w WHERE w.conversation_id=r.conversation_id
-                   AND json_extract(w.receipt,'$.run_id')=r.run_id) ORDER BY t.rowid",&[])?;
-            for item in ready {
-                let run=string(&item,"run_id")?;
-                let _lock=s.lock(string(&item,"conversation_id")?).await;
-                if let Err(e)=process(&s,run) {
-                    s.db()?.execute("UPDATE service_turn_transfers SET last_error=? WHERE run_id=? AND state='pending' AND last_error IS NOT ?",
-                        params![e.to_string(),run,e.to_string()])?;
-                }
-            }
-            Ok(())
-        }.await;
-        if let Err(e) = result {
-            eprintln!("turn handoff deferred: {e}");
+        if let Err(error) = reconcile(&s).await {
+            eprintln!("turn handoff deferred: {error}");
         }
-        tokio::select! {_=s.notify.notified()=>(),_=tokio::time::sleep(Duration::from_millis(750))=>()}
+        tokio::select! {
+            _ = s.notify.notified() => (),
+            _ = tokio::time::sleep(Duration::from_millis(750)) => (),
+        }
     }
 }

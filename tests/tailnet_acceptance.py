@@ -9,7 +9,7 @@ import shutil
 import ssl
 import subprocess
 import tempfile
-from time import monotonic
+from time import monotonic, sleep
 from unittest.mock import patch
 from urllib.error import URLError
 from urllib.request import HTTPSHandler, ProxyHandler, build_opener
@@ -18,7 +18,7 @@ from acceptance import Node, free_port, until
 from overlay import record, recover_child, request, unreachable
 
 
-def control_config(path, prefix, api_ports):
+def control_config(path, prefix, api_ports, region_id):
     path.mkdir(mode=0o700)
     policy = path / "policy.json"
     policy.write_text(json.dumps({"acls": [{"action": "accept", "src": ["*"],
@@ -46,7 +46,7 @@ def control_config(path, prefix, api_ports):
         "prefixes": {"v4": prefix, "v6": "fd7a:115c:a1e0::/48", "allocation": "sequential"},
         "unix_socket": str(path / "control.sock"), "dns": {"magic_dns": False, "override_local_dns": False, "base_domain": "tarla.test"},
         "policy": {"mode": "file", "path": str(policy)}, "logtail": {"enabled": False},
-        "derp": {"server": {"enabled": True, "region_id": 999, "region_code": "tarla",
+        "derp": {"server": {"enabled": True, "region_id": region_id, "region_code": f"tarla{region_id}",
                             "region_name": "Tarla local relay", "private_key_path": str(path / "relay.key"),
                             "stun_listen_addr": f"127.0.0.1:{free_port()}", "ipv4": "127.0.0.1",
                             "automatically_add_embedded_derp_region": True},
@@ -82,7 +82,7 @@ def tailnet(root, space, prefix, cleanup):
     path = root / ("control-" + space)
     nodes = [Node(root / "a", "chief", "supervisor_only", workspace=space),
              Node(root / "b", "worker", "executor_only", workspace=space)]
-    url, cfg, ca = control_config(path, prefix, [n.port for n in nodes])
+    url, cfg, ca = control_config(path, prefix, [n.port for n in nodes], 999 if space == "work" else 998)
     head = [os.environ["TARLA_TEST_HEADSCALE"], "--config", cfg]
     subprocess.run([*head, "configtest"], check=True)
     https = build_opener(ProxyHandler({}), HTTPSHandler(context=ssl.create_default_context(cafile=ca)))
@@ -135,17 +135,38 @@ def tailnet(root, space, prefix, cleanup):
     return chief, worker, addresses[0]
 
 
+def expect_api(node, ip, destination, token, workspace, expected):
+    # A new TCP flow may need to establish a fresh DERP/direct path even
+    # when replication has already succeeded over an existing connection.
+    until_at = monotonic() + 45
+    while True:
+        try:
+            status, _ = request(node, "tailscale", ip, destination.port, token, workspace, timeout=8)
+        except OSError as error:
+            if monotonic() >= until_at:
+                raise AssertionError(f"{node.workspace} could not establish a fresh tailnet connection "
+                                     f"to {ip}:{destination.port}") from error
+            sleep(.3)
+            continue
+        assert status == expected, (node.workspace, ip, destination.port, status, expected)
+        return
+
+
 def run(path):
     with contextlib.ExitStack() as cleanup:
         a, b, ip_a = tailnet(path, "work", "100.70.0.0/24", cleanup)
         c, d, ip_c = tailnet(path, "life", "100.75.0.0/24", cleanup)
         assert len({record(n, "tailscale")["socks5"] for n in (a,b,c,d)}) == 4
-        assert request(b, "tailscale", ip_a, a.port, a.token, "work")[0] == 200
-        assert request(b, "tailscale", ip_a, a.port, c.token)[0] == 401
-        assert request(d, "tailscale", ip_c, c.port, c.token, "work")[0] == 409
+        assert all((n.dir / "runtime/tailscale").is_dir() for n in (a,b,c,d))
+        expect_api(b, ip_a, a, a.token, "work", 200)
+        expect_api(d, ip_c, c, c.token, "life", 200)
+        expect_api(b, ip_a, a, c.token, "work", 401)
+        expect_api(d, ip_c, c, c.token, "work", 409)
         unreachable(d, "tailscale", ip_a, a.port)
         unreachable(b, "tailscale", ip_c, c.port)
         unreachable(b, "tailscale", ip_a, c.port)  # work's policy excludes life's co-hosted API
+        expect_api(b, ip_a, a, a.token, "work", 200)
+        expect_api(d, ip_c, c, c.token, "life", 200)
         started = recover_child(b, "tailscale", b.home / "bin/tailscale/1.82.0/tailscaled")
         a.api("/v1/memories", {"memory_id":"tailnet", "scope":"global", "base_version":1, "content":"resumed"})
         until(lambda: any(row["content"] == "resumed" for row in b.api("/v1/memories")),

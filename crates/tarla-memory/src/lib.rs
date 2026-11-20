@@ -28,7 +28,7 @@ pub fn open(path: &Path, workspace: &str) -> Result<Connection> {
             tx.execute_batch(include_str!("schema.sql"))?;
             tx.execute("INSERT INTO workspace_identity VALUES(1,?1)", [workspace])?;
         }
-        1..=4 => verify_workspace(&tx, workspace)?,
+        1..=5 => verify_workspace(&tx, workspace)?,
         version => bail!("unsupported database schema version {version}"),
     }
     if version < 2 {
@@ -51,8 +51,85 @@ pub fn open(path: &Path, workspace: &str) -> Result<Connection> {
         replica::migrate(&tx)?;
         tx.pragma_update(None, "user_version", 4)?;
     }
+    if version < 5 {
+        tx.execute_batch("ALTER TABLE conversation_prefix ADD COLUMN model_memory TEXT;
+            CREATE INDEX idx_memory_revision_version ON memory_changes(memory_id,json_extract(revision_json,'$.version'));")?;
+        // Keep every legacy source byte, re-render only projections containing untrusted entries.
+        let mut stmt =
+            tx.prepare("SELECT conversation_id,frozen_memory FROM conversation_prefix")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let original: String = row.get(1)?;
+            let trusted = owner_entries(&tx, &original)?;
+            tx.execute("UPDATE conversation_prefix SET model_memory=?1,rendered_prefix=CASE WHEN frozen_memory=?1 THEN rendered_prefix ELSE NULL END WHERE conversation_id=?2",params![trusted,id])?;
+        }
+        tx.pragma_update(None, "user_version", 5)?;
+    }
     tx.commit()?;
     Ok(db)
+}
+
+/// Reconstruct the privileged part of a frozen prefetch from exact archived revisions.
+/// Parsing a line never grants authority: both the header and the complete multiline
+/// value must match the revision. The full snapshot remains available via session_recall.
+fn owner_entries(db: &Connection, snapshot: &str) -> Result<String> {
+    let mut remaining = snapshot;
+    let mut trusted = String::new();
+    while !remaining.is_empty() {
+        let Some((header, _)) = remaining.strip_prefix('[').and_then(|s| s.split_once("] ")) else {
+            break;
+        };
+        let Some((id, version)) = header.rsplit_once(" v") else {
+            break;
+        };
+        let Ok(version) = version.parse::<i64>() else {
+            break;
+        };
+        let raw:Option<String>=db.query_row("SELECT revision_json FROM memory_changes WHERE memory_id=?1 AND json_extract(revision_json,'$.version')=?2 ORDER BY sync_seq DESC LIMIT 1",
+            params![id,version],|row|row.get(0)).optional()?;
+        let Some(raw) = raw else { break };
+        let revision: Memory = serde_json::from_str(&raw)?;
+        let entry = format!(
+            "[{} v{}] {}\n",
+            revision.memory_id, revision.version, revision.content
+        );
+        let Some(rest) = remaining.strip_prefix(&entry) else {
+            break;
+        };
+        if revision.updated_by == "user_manual" && revision.source_run_id.is_none() {
+            trusted.push_str(&entry);
+        }
+        remaining = rest;
+    }
+    Ok(trusted)
+}
+
+/// Freeze the full S2 view for exact, tool-level recall and a separate owner-only
+/// projection for the system prompt. An existing conversation keeps its first snapshot.
+pub fn freeze_supervisor_snapshot(
+    db: &mut Connection,
+    workspace: &str,
+    node: &str,
+    conversation: &str,
+    soul: &str,
+    budget: usize,
+) -> Result<()> {
+    if db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM conversation_prefix WHERE conversation_id=?)",
+        [conversation],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Ok(());
+    }
+    let snapshot =
+        SqliteMemory::new(db, workspace, node).prefetch_frozen_snapshot("global", budget)?;
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let trusted = owner_entries(&tx, &snapshot)?;
+    tx.execute("INSERT OR IGNORE INTO conversation_prefix(conversation_id,frozen_soul,frozen_memory,model_memory) VALUES(?,?,?,?)",
+        params![conversation,soul,snapshot,trusted])?;
+    tx.commit()?;
+    Ok(())
 }
 
 pub fn verify_workspace(db: &Connection, workspace: &str) -> Result<()> {
@@ -95,6 +172,8 @@ pub struct Memory {
     pub is_deleted: bool,
     pub sync_seq: i64,
     pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_run_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -357,6 +436,7 @@ fn apply_proposal(
         version: previous.checked_add(1).context("version exhausted")?,
         hlc_timestamp: merge_clock(tx, node, p.hlc_timestamp.as_ref())?,
         updated_by: author.to_owned(),
+        source_run_id: p.source_run_id.clone(),
         is_deleted: p.is_deleted,
         sync_seq: cursor(tx)?.checked_add(1).context("cursor exhausted")?,
         updated_at: unix_ms()?,

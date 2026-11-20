@@ -389,7 +389,10 @@ pub(super) fn accept_events(
                 }
                 "state_changed" if !terminal && node != s.node() => {
                     let next = string(&p, "state")?;
-                    if !matches!(next, "running" | "unconfirmed" | "blocked") {
+                    if !matches!(
+                        next,
+                        "dispatch_pending" | "running" | "unconfirmed" | "blocked"
+                    ) {
                         bail!("unknown executor state")
                     }
                     c.execute("UPDATE runs SET observed_state=?,hc_terminal_id=coalesce(?,hc_terminal_id),updated_at=? WHERE run_id=?",params![next,p["terminal"].as_str(),now(),id])?;
@@ -427,8 +430,15 @@ pub(super) fn accept_events(
                     }
                     // A peer may reissue its final receipt under a different outbox ID.
                     // The first accepted completion remains the single conversation wake.
-                    if c.query_row("SELECT exists(SELECT 1 FROM service_wakes WHERE conversation_id=? AND json_extract(receipt,'$.run_id')=?)",
-                        params![conv, id], |row| row.get::<_,bool>(0))? {
+                    let previous: Option<String> = c.query_row(
+                        "SELECT receipt FROM service_wakes WHERE conversation_id=? AND json_extract(receipt,'$.run_id')=?",
+                        params![conv,id], |row| row.get(0),
+                    ).optional()?;
+                    if let Some(previous) = previous {
+                        anyhow::ensure!(
+                            serde_json::from_str::<RunReceipt>(&previous)? == r,
+                            "conflicting completion receipt"
+                        );
                         ack.push(eid.to_owned());
                         continue;
                     }
@@ -537,11 +547,12 @@ async fn round(s: &Service) -> Result<()> {
         control::ensure_conversation(&tx, s, conv)?;
         let current = list(
             &tx,
-            "SELECT r.target_slot_id,r.mission_packet_json,r.conversation_id,p.workdir AS pinned_workdir,e.epoch AS pin_epoch FROM runs r LEFT JOIN service_run_paths p USING(run_id) LEFT JOIN service_pin_epochs e USING(run_id) WHERE r.run_id=?",
+            "SELECT r.target_node_id,r.target_slot_id,r.mission_packet_json,r.conversation_id,p.workdir AS pinned_workdir,e.epoch AS pin_epoch FROM runs r LEFT JOIN service_run_paths p USING(run_id) LEFT JOIN service_pin_epochs e USING(run_id) WHERE r.run_id=?",
             &[&id],
         )?;
         if let Some(old) = current.first() {
-            if old["target_slot_id"] != slot
+            if old["target_node_id"] != s.node()
+                || old["target_slot_id"] != slot
                 || old["conversation_id"] != conv
                 || old["pinned_workdir"] != item["pinned_workdir"]
                 || old["pin_epoch"].as_str().unwrap_or("legacy")
@@ -552,6 +563,16 @@ async fn round(s: &Service) -> Result<()> {
             }
         } else {
             fleet::insert_run(&tx, s, conv, s.node(), slot, &packet)?;
+            if let Some(term) = item["supervisor_term"].as_i64() {
+                anyhow::ensure!(
+                    term > 0 && term <= s.term(),
+                    "invalid original assignment term"
+                );
+                tx.execute(
+                    "UPDATE runs SET supervisor_term=? WHERE run_id=?",
+                    params![term, id],
+                )?;
+            }
             s1::apply_metadata(&tx, id, item)?;
         }
         s1::save_offer(&tx, s, id, item, current.is_empty())?;
@@ -569,12 +590,17 @@ async fn round(s: &Service) -> Result<()> {
                 "SELECT observed_state,hc_terminal_id FROM runs WHERE run_id=?",
                 &[&id],
             )?;
-            if let Some(row) = old
-                .first()
-                .filter(|r| matches!(r["observed_state"].as_str(), Some("running" | "blocked")))
-            {
+            if let Some(row) = old.first().filter(|r| {
+                matches!(
+                    r["observed_state"].as_str(),
+                    Some("dispatch_pending" | "running" | "blocked")
+                )
+            }) {
                 let payload = json!({"run_id":id,"state":row["observed_state"],"terminal":row["hc_terminal_id"]});
-                tx.execute("INSERT INTO outbox_events(event_id,run_id,event_type,payload_json,created_at) VALUES(?,?,'state_changed',?,?)",params![uid(),id,payload.to_string(),now()])?;
+                tx.execute("INSERT INTO outbox_events(event_id,run_id,event_type,payload_json,created_at)
+                    SELECT ?1,?2,'state_changed',?3,?4 WHERE NOT EXISTS(SELECT 1 FROM outbox_events
+                        WHERE run_id=?2 AND event_type='state_changed' AND payload_json=?3 AND acked_at IS NULL)",
+                    params![uid(),id,payload.to_string(),now()])?;
             }
         }
     }

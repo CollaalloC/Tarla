@@ -134,6 +134,11 @@ pub async fn callback(
     Ok(Json(out))
 }
 pub fn queue_proposal(s: &Service, v: &Value, run: Option<&str>) -> Result<Value> {
+    let operation = v["operation"].as_str().unwrap_or("update");
+    anyhow::ensure!(
+        matches!(operation, "create" | "update" | "archive"),
+        "unsupported memory operation"
+    );
     let key = v["proposal_id"]
         .as_str()
         .map(String::from)
@@ -190,20 +195,37 @@ pub fn queue_proposal(s: &Service, v: &Value, run: Option<&str>) -> Result<Value
 pub async fn flush_memory(s: &Service) -> Result<()> {
     let rows = list(
         &s.db()?,
-        "SELECT id,proposal FROM service_proposals WHERE result IS NULL ORDER BY rowid LIMIT 16",
-        &[],
+        "SELECT p.id,p.proposal FROM service_proposals p LEFT JOIN service_proposal_retries r USING(id)
+         WHERE p.result IS NULL AND (r.retry_after IS NULL OR r.retry_after<=?)
+         ORDER BY (r.retry_after IS NOT NULL), r.retry_after, p.rowid LIMIT 16",
+        &[&now()],
     )?;
     for row in rows {
         let p: Mutation = serde_json::from_str(string(&row, "proposal")?)?;
         let result = if s.is_supervisor() {
-            apply(s, s.node(), &p)?
+            apply(s, s.node(), &p)
         } else {
-            peers::call(s, s.supervisor(), "propose", &json!({"proposal":p})).await?
+            peers::call(s, s.supervisor(), "propose", &json!({"proposal":p})).await
         };
-        s.db()?.execute(
+        let c = s.db()?;
+        let result = match result {
+            Ok(value) => value,
+            Err(error) => {
+                // A stale or not-yet-recovered base must not block unrelated offline writes.
+                c.execute("INSERT INTO service_proposal_retries VALUES(?,?) ON CONFLICT(id) DO UPDATE SET retry_after=excluded.retry_after",params![p.proposal_id,now()+5])?;
+                return Err(error);
+            }
+        };
+        let tx = c.unchecked_transaction()?;
+        tx.execute(
             "UPDATE service_proposals SET result=? WHERE id=?",
             params![result.to_string(), p.proposal_id],
         )?;
+        tx.execute(
+            "DELETE FROM service_proposal_retries WHERE id=?",
+            [&p.proposal_id],
+        )?;
+        tx.commit()?;
     }
     Ok(())
 }

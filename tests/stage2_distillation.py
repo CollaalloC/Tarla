@@ -19,8 +19,33 @@ SCOPE = "project:tidal-index"
 GOAL = "Diagnose the tidal index reader"
 FACT = "The cache error was caused by an outdated index"
 NEW_FACT = "The cache error was caused by a stale journal"
+MODEL_FINDING = "Median calibration drift fell from eight units to two"
 MANUAL = "Owner verified that the index format is current."
 SECRET = "Do not record this token: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+
+class ExtractionModel(Model):
+    evidence=[]
+    def do_POST(self):
+        if self.path != "/distill":
+            return super().do_POST()
+        raw=self.rfile.read(int(self.headers["Content-Length"]))
+        request=json.loads(raw)
+        assert len(raw)<2048 and "tools" not in request and request["stream"] is False
+        quotes=json.loads(request["messages"][1]["content"])
+        assert isinstance(quotes,list) and all(isinstance(q,str) and len(q.encode())<=220 for q in quotes)
+        type(self).evidence.append(quotes)
+        index=quotes.index(MODEL_FINDING) if MODEL_FINDING in quotes else None
+        if "An invented result would be incorrect" in quotes:
+            answer={"observation":"An invented result to be rejected"}
+        else:
+            answer={"index":index}
+        body=json.dumps({"choices":[{"message":{"role":"assistant","content":json.dumps(answer)}}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type","application/json")
+        self.send_header("Content-Length",str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 def rows(node, statement, bindings=()):
@@ -41,6 +66,8 @@ def run_test(root, hc, model):
     reader_cfg=reader.dir/"workspace.toml"
     reader_cfg.write_text(reader_cfg.read_text().replace("TARLA_PAIR_TEST","TARLA_S2_READER_PAIR"))
     os.environ["TARLA_S2_READER_PAIR"]=secrets.token_hex(32)
+    with reader_cfg.open("a") as cfg:
+        cfg.write(f'\n[memory.distiller]\nmodel="local-extractive"\nendpoint="http://127.0.0.1:{model.server_port}/distill"\n')
     project = install_test_slot(source,hc)
     destination = install_test_slot(reader,hc)
     program = """import json,sys,time
@@ -146,6 +173,18 @@ sys.exit(control.get('exit',0))
               "process ineligible receipt")
         assert not rows(source,"SELECT 1 FROM service_proposals WHERE json_extract(proposal,'$.source_run_id') IN (?,?)",(failed,rejected))
         assert set(notes(chief))=={key}
+        # The loopback model can select a technical finding outside the zero-cost grammar.
+        output(destination,SECRET,MODEL_FINDING+".")
+        assisted=launch(reader,"Measure drift after recalibration")
+        until(lambda:any(MODEL_FINDING in m["content"] and assisted in m["content"] for m in notes(source).values()),
+              "model selected natural-language evidence on a second executor")
+        assert [MODEL_FINDING] in ExtractionModel.evidence
+        assert SECRET not in str(ExtractionModel.evidence)
+        output(destination,"An invented result would be incorrect.")
+        invented=launch(reader,"Reject a hallucinated classifier result")
+        until(lambda:rows(reader,"SELECT state FROM service_distillations WHERE run_id=?",(invented,))==[("no_finding",)],
+              "ungrounded classifier response rejected")
+        assert len(notes(chief))==2
         print("PASS automatic project-scoped lesson from a real CLI without a memory hook, captured baseline, "
               "offline/restarted executor, stale candidate, evidence validation and next-run reuse")
 
@@ -154,7 +193,7 @@ if __name__=="__main__":
     hc=os.environ.get("TARLA_TEST_HC")
     if not hc:
         sys.exit("set TARLA_TEST_HC to the upstream herdr-core executable")
-    with tempfile.TemporaryDirectory(prefix="tarla-distill-") as tmp, ThreadingHTTPServer(("127.0.0.1",0),Model) as model:
+    with tempfile.TemporaryDirectory(prefix="tarla-distill-") as tmp, ThreadingHTTPServer(("127.0.0.1",0),ExtractionModel) as model:
         thread=threading.Thread(target=model.serve_forever,daemon=True)
         thread.start()
         try:

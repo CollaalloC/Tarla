@@ -157,6 +157,38 @@ pub fn run(home: &Path, id: &str, op: &Operation) -> Result<()> {
                 "DELETE FROM sqlite_sequence WHERE name='service_s1_sequence'",
                 [],
             )?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS service_restore_sources(node TEXT PRIMARY KEY);
+                CREATE TABLE IF NOT EXISTS service_restore_nonexecutors(node TEXT PRIMARY KEY);
+                DELETE FROM service_restore_sources; DELETE FROM service_restore_nonexecutors;",
+            )?;
+            let config: toml::Table =
+                fs::read_to_string(ws.root.join("workspace.toml"))?.parse()?;
+            if let Some(peers) = config.get("peers").and_then(|p| p.as_array()) {
+                for peer in peers {
+                    let node = peer
+                        .get("node_id")
+                        .and_then(|n| n.as_str())
+                        .context("invalid paired node in backup")?;
+                    if node != to {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO service_restore_sources VALUES(?)",
+                            [node],
+                        )?;
+                    }
+                }
+            }
+            if identity.role_mode == "supervisor_only" {
+                tx.execute(
+                    "INSERT INTO service_restore_nonexecutors VALUES(?)",
+                    [&identity.node_id],
+                )?;
+            } else {
+                tx.execute(
+                    "INSERT OR IGNORE INTO service_restore_sources VALUES(?)",
+                    [&identity.node_id],
+                )?;
+            }
             tx.execute("INSERT INTO handover_activation VALUES(?)", [backup])?;
             authority::remember(&tx, &grant)?;
             tx.execute(
@@ -226,6 +258,9 @@ pub fn run(home: &Path, id: &str, op: &Operation) -> Result<()> {
                 "VACUUM INTO ?1",
                 [tmp.path().to_str().context("invalid import path")?],
             )?;
+            let imported = Connection::open(tmp.path())?;
+            imported.execute_batch("CREATE TABLE IF NOT EXISTS service_restore_barrier(singleton INTEGER PRIMARY KEY); INSERT OR REPLACE INTO service_restore_barrier VALUES(1);")?;
+            drop(imported);
             tmp.as_file().sync_all()?;
             // If interrupted before installing the ledger a startup must fail closed.
             // Install the copy first, retaining its old epoch until configuration is switched.

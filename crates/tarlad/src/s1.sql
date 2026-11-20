@@ -18,3 +18,7 @@ CREATE TABLE IF NOT EXISTS service_s1_proofs(run_id TEXT PRIMARY KEY,certificate
 CREATE TABLE IF NOT EXISTS service_s1_claims(run_id TEXT PRIMARY KEY,claim_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS service_assignment_pages(peer TEXT PRIMARY KEY,after_run TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS service_event_digests(event_id TEXT PRIMARY KEY,digest TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS service_restore_barrier(singleton INTEGER PRIMARY KEY CHECK(singleton=1));
+CREATE TABLE IF NOT EXISTS service_restore_pending(node TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS service_restore_sources(node TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS service_restore_nonexecutors(node TEXT PRIMARY KEY);

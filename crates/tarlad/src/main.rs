@@ -277,6 +277,9 @@ async fn serve() -> Result<bool> {
     facts::configure(&mut initial, &conf, &ws.config.workspace.node_id)?;
     let slots = fleet::load(&conf, &ws, &home)?;
     let peers = peers::load(&conf, &ws)?;
+    if identity.node_id == identity.supervisor_node_id && identity.role_mode != "executor_only" {
+        s1::begin_recovery(&mut initial, &identity.node_id, &peers)?;
+    }
     let listener = tokio::net::TcpListener::bind(a.listen).await?;
     let actual = listener.local_addr()?;
     let runtime = ws.root.join("runtime");
@@ -459,6 +462,7 @@ async fn serve() -> Result<bool> {
         .route("/v1/facts", get(api::facts))
         .route("/v1/slots", get(api::slots))
         .route("/v1/nodes", get(api::nodes))
+        .route("/v1/recovery", get(s1::recovery_status))
         .route(
             "/v1/slots/{slot}/telemetry-token",
             post(slot_reports::issue),
@@ -506,11 +510,25 @@ async fn serve() -> Result<bool> {
         service.node(),
         actual
     );
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let server = axum::serve(listener, routes.layer(DefaultBodyLimit::max(128 * 1024)))
-        .with_graceful_shutdown(shutdown_signal());
+        .with_graceful_shutdown(async {
+            let _ = stopped.await;
+        })
+        .into_future();
+    tokio::pin!(server);
     tokio::select! {
-        result=server.into_future()=>{result?;Ok(false)},
-        _=service.reload.notified()=>Ok(true),
+        result = &mut server => { result?; Ok(false) },
+        _ = service.reload.notified() => Ok(true),
+        _ = shutdown_signal() => {
+            let _ = stop.send(());
+            // A slow HTTP client or terminal viewer must not retain the workspace
+            // lock on shutdown. Herdr holds the actual jobs independently.
+            if let Ok(result) = tokio::time::timeout(Duration::from_secs(3), &mut server).await {
+                result?;
+            }
+            Ok(false)
+        }
     }
 }
 

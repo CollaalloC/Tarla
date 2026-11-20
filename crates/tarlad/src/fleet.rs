@@ -198,6 +198,7 @@ pub fn dispatch_selected(
     if let Some(result) = existing_dispatch(&dbtx, conv, &rid, arg)? {
         return Ok(result);
     }
+    s1::check_dispatch(&dbtx)?;
     let mut slots = snapshots_in(s, &dbtx)?;
     if let Some(n) = arg["node_id"].as_str() {
         slots.retain(|x| x.node_id == n)

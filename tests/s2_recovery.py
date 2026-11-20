@@ -2,7 +2,9 @@
 from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import os
 import secrets
+from unittest.mock import patch
 import sqlite3
 from urllib.error import HTTPError
 from acceptance import Node, until
@@ -17,8 +19,8 @@ def records(node):
     return {r["memory_id"]:r for r in node.api("/v1/memories?limit=256")}
 
 
-def pair(node, peer):
-    node.cli("pair", peer.name, peer.url, "--token-env", "TARLA_PAIR_TEST")
+def pair(node, peer, token_env="TARLA_PAIR_TEST"):
+    node.cli("pair", peer.name, peer.url, "--token-env", token_env)
 
 
 def scenario(root, divergent):
@@ -28,8 +30,10 @@ def scenario(root, divergent):
     c = Node(root/"c","replacement","executor_only")
     pair(a,b)
     pair(b,a)
-    pair(c,b)
+    pair(b,c,"TARLA_RECOVERY_PAIR")
+    pair(c,b,"TARLA_RECOVERY_PAIR")
     with ExitStack() as cleanup:
+        cleanup.enter_context(patch.dict(os.environ, {"TARLA_RECOVERY_PAIR":secrets.token_hex(32)}))
         for node in [a,b,c]:
             cleanup.callback(node.stop)
         a.start(secret)
@@ -51,6 +55,10 @@ def scenario(root, divergent):
         expected = records(a)
         until(lambda: records(b)==expected,"mirror of post-backup source revisions")
         a.stop()
+        if divergent:
+            # The first proposal cannot be accepted at its claimed version.
+            assert put(b,"future-base","not ready",99)["status"]=="queued"
+            assert put(b,"offline","queued behind the future base")["status"]=="queued"
         b.stop()
         c.cli("supervisor","restore","--snapshot",str(backup),"--confirm-old-offline")
         c.start(secret)
@@ -59,10 +67,6 @@ def scenario(root, divergent):
             # Both histories now end at sequence 3 but contain distinct decisions.
             put(c,"style","new authority edit",1)
         b.cli("supervisor","set-authority","--node",c.name,"--term","2")
-        # Remove the old link from this test's peer set (pair secrets are per counterpart).
-        config=b.dir/"workspace.toml"
-        config.write_text(config.read_text().replace('node_id = "chief"','node_id = "replacement"')
-                          .replace(a.url,c.url))
         b.start(secret)
         if divergent:
             until(lambda: records(b)["style"]["content"]=="new authority edit","equal-height fork rejoin")
@@ -70,6 +74,8 @@ def scenario(root, divergent):
                          if x["kind"]=="memory_conflict" and x["proposed_text"]=="old branch edit"),None),
                          "divergent revision presented for human review")
             assert action["current_version"]==2
+            until(lambda: "offline" in records(c) and "offline" in records(b),
+                  "unrelated queued mutation delivered despite unavailable base")
             put(c,"style","review changed",2)
             try:
                 c.api("/v1/actions/"+action["id"],{"resolution":"approved","expected_version":2})

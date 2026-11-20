@@ -183,9 +183,12 @@ impl SqliteMemory<'_> {
     /// The designated supervisor decides every recovered version. An executor can offer
     /// a previous observation but cannot install a sequence or override newer contents.
     pub fn answer_replica(&mut self, peer: &str, req: &ReplicaRequest) -> Result<ReplicaReply> {
-        let tx = self
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let behavior = if req.repair.is_some() {
+            TransactionBehavior::Immediate
+        } else {
+            TransactionBehavior::Deferred
+        };
+        let tx = self.db.transaction_with_behavior(behavior)?;
         verify_workspace(&tx, self.workspace)?;
         ensure!(req.at.seq >= 0, "invalid replica cursor");
         let known = checkpoint(&tx, req.at.seq)?;
@@ -366,7 +369,10 @@ fn recover(
         content: m.content.clone(),
         base_version: m.version - 1,
         source_node_id: peer.to_owned(),
-        source_run_id: None,
+        source_run_id: m
+            .source_run_id
+            .clone()
+            .or_else(|| m.updated_by.strip_prefix("run:").map(String::from)),
         is_deleted: m.is_deleted,
         hlc_timestamp: Some(m.hlc_timestamp.clone()),
     };
@@ -378,13 +384,20 @@ fn recover(
     {
         return Ok(());
     }
-    let current:Option<String>=tx.query_row("SELECT revision_json FROM memory_changes WHERE memory_id=? ORDER BY sync_seq DESC LIMIT 1",[&m.memory_id],|r|r.get(0)).optional()?;
-    let current = current.map(decoded).transpose()?;
-    if current
+    let historical: Option<String> = tx.query_row(
+        "SELECT revision_json FROM memory_changes WHERE memory_id=? AND json_extract(revision_json,'$.version')=?",
+        params![m.memory_id,m.version],|r|r.get(0)).optional()?;
+    if historical
+        .map(decoded)
+        .transpose()?
         .as_ref()
         .is_some_and(|old| meaning(old) == meaning(m))
-        || current.is_none() && m.is_deleted
     {
+        return Ok(());
+    }
+    let current:Option<String>=tx.query_row("SELECT revision_json FROM memory_changes WHERE memory_id=? ORDER BY sync_seq DESC LIMIT 1",[&m.memory_id],|r|r.get(0)).optional()?;
+    let current = current.map(decoded).transpose()?;
+    if current.is_none() && m.is_deleted {
         return Ok(());
     }
     let ver = current.as_ref().map_or(0, |r| r.version);
@@ -394,8 +407,8 @@ fn recover(
         // A restored authority may no longer have this key. The details retain its
         // identity when SQLite's optional reference to the current materialization is NULL.
         let stamp = merge_clock(tx, node, p.hlc_timestamp.as_ref())?;
-        tx.execute("INSERT INTO memory_candidates(candidate_id,memory_id,workspace_id,proposed_text,base_version,hlc_timestamp,source_node_id,source_run_id,created_at) VALUES(?,?,?,?,?,?,?,'',?)",
-            params![id,current.as_ref().map(|x|&x.memory_id),workspace,p.content,p.base_version,serde_json::to_string(&stamp)?,peer,unix_ms()?])?;
+        tx.execute("INSERT INTO memory_candidates(candidate_id,memory_id,workspace_id,proposed_text,base_version,hlc_timestamp,source_node_id,source_run_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            params![id,current.as_ref().map(|x|&x.memory_id),workspace,p.content,p.base_version,serde_json::to_string(&stamp)?,peer,p.source_run_id.as_deref().unwrap_or(""),unix_ms()?])?;
         tx.execute(
             "INSERT INTO memory_candidate_details VALUES(?,?)",
             params![id, serde_json::to_string(&p)?],

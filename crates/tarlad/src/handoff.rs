@@ -432,6 +432,8 @@ pub struct Outcome {
     pub answer: String,
     #[serde(default)]
     pub rate_limit: Option<i64>,
+    #[serde(default)]
+    failed: bool,
 }
 fn extract(driver: &str, v: &Value, out: &mut Outcome) {
     let failure = matches!(v["type"].as_str(), Some("error" | "turn.failed"))
@@ -441,6 +443,8 @@ fn extract(driver: &str, v: &Value, out: &mut Outcome) {
     let limited = [
         error.get("code"),
         error.get("type"),
+        error.get("codexErrorInfo"),
+        v.get("codexErrorInfo"),
         v.get("error"),
         v.get("code"),
     ]
@@ -449,18 +453,50 @@ fn extract(driver: &str, v: &Value, out: &mut Outcome) {
     .any(|value| {
         matches!(
             value.as_str(),
-            Some("rate_limit_error" | "rate_limit_exceeded" | "usage_limit_reached" | "429")
+            Some(
+                "rate_limit_error"
+                    | "rate_limit_exceeded"
+                    | "usage_limit_reached"
+                    | "usageLimitExceeded"
+                    | "429"
+            )
         ) || value.as_i64() == Some(429)
     }) || error["status"].as_i64() == Some(429)
         || v["status"].as_i64() == Some(429)
         || (v["type"] == "rate_limit_event" && v["rate_limit_info"]["status"] == "rejected");
-    if failure && limited {
+    // Some Codex releases expose only a provider message on their JSONL error frame.
+    // Never infer a control signal from assistant text, a tool result or terminal output.
+    let provider_limited = error["message"]
+        .as_str()
+        .or_else(|| v["message"].as_str())
+        .is_some_and(|message| {
+            let brief = message
+                .chars()
+                .take(256)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            brief.starts_with("you've hit your usage limit")
+                || brief.starts_with("rate limit reached")
+                || brief.starts_with("http 429")
+                || brief.contains("status 429 too many requests")
+                || brief.contains("status: 429 too many requests")
+        });
+    if v["type"] == "turn.completed" || (v["type"] == "result" && v["is_error"] == false) {
+        out.rate_limit = None;
+        out.failed = false;
+    }
+    if v["type"] == "turn.failed" || (v["type"] == "result" && v["is_error"] == true) {
+        out.failed = true;
+    }
+    if failure && (limited || provider_limited) {
         out.rate_limit = Some(
             error["resets_at"]
                 .as_i64()
                 .or(v["rate_limit_info"]["resetsAt"].as_i64())
                 .unwrap_or_else(|| now() + 300),
         );
+    } else if v["type"] == "turn.failed" {
+        out.rate_limit = None;
     }
     let session = if driver == "codex" {
         if v["type"] == "item.completed" && v["item"]["type"] == "agent_message" {
@@ -473,7 +509,7 @@ fn extract(driver: &str, v: &Value, out: &mut Outcome) {
             .flatten()
     } else {
         if v["type"] == "result" {
-            if let Some(s) = v["result"].as_str() {
+            if let Some(s) = v["result"].as_str().filter(|_| v["is_error"] != true) {
                 out.answer = s.chars().take(1200).collect()
             }
             v["session_id"].as_str()
@@ -517,7 +553,8 @@ pub fn helper(path: &Path) -> Result<i32> {
         continued = buf.len() == 4 * 1024 * 1024 && !buf.ends_with(b"\n");
         std::io::stdout().write_all(&buf)?;
     }
-    let code = p.wait()?.code().unwrap_or(1);
+    let exit = p.wait()?.code().unwrap_or(1);
+    let code = if exit == 0 && out.failed { 1 } else { exit };
     if plan.expected.is_some() && out.session != plan.expected {
         out.session = None;
     }
@@ -591,6 +628,41 @@ mod tests {
                 vec!["claude".into()]
             },
         }
+    }
+    #[test]
+    fn only_provider_failure_frames_classify_quota_exhaustion() {
+        let mut out = Outcome::default();
+        let message = "Exceeded retry limit, last status: 429 Too Many Requests";
+        extract(
+            "codex",
+            &json!({"type":"item.completed","item":{"type":"agent_message","text":message}}),
+            &mut out,
+        );
+        assert!(out.rate_limit.is_none());
+        extract(
+            "codex",
+            &json!({"type":"turn.failed","error":{"message":message}}),
+            &mut out,
+        );
+        assert!(out.rate_limit.is_some());
+        extract(
+            "codex",
+            &json!({"type":"turn.failed","error":{"message":"permission denied"}}),
+            &mut out,
+        );
+        assert!(out.rate_limit.is_none());
+        extract(
+            "claude",
+            &json!({"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":12345678}}),
+            &mut out,
+        );
+        assert_eq!(out.rate_limit, Some(12345678));
+        extract(
+            "claude",
+            &json!({"type":"result","is_error":false,"result":"completed after a retry"}),
+            &mut out,
+        );
+        assert!(out.rate_limit.is_none() && !out.failed);
     }
     #[test]
     fn resume_exact_native_id_on_next_turn() {

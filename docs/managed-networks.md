@@ -41,7 +41,7 @@ tarlad --workspace work --listen 127.0.0.1:7400
 
 ## Tailscale
 
-配置 `enable_tailscale = true` 并安装固定版本的 `tailscaled`。Tarla 为每个工作空间创建专用状态文件、控制端点和回环 SOCKS5 地址。Linux 或 macOS 可用配套 `tailscale` 客户端完成这个私有实例的首次登录。
+配置 `enable_tailscale = true` 并安装固定版本的 `tailscaled`。Tarla 为每个工作空间独立保存节点身份 `runtime/ts.state`、证书等附属状态 `runtime/tailscale/`、控制端点和回环 SOCKS5 地址。Linux 或 macOS 可用配套 `tailscale` 客户端完成这个私有实例的首次登录。
 
 ```sh
 tailscale --socket="$HOME/.tarla/workspaces/work/runtime/ts.sock" up --accept-dns=false --accept-routes=false
@@ -62,11 +62,13 @@ tailscale --socket="$HOME/.tarla/workspaces/work/runtime/ts.sock" up --accept-dn
 }
 ```
 
-配对 URL 填写对应网络中的对端地址和业务端口。主机登录账户管理工作空间的私有状态和本机回环代理。对端发出的业务请求仍需提供对应凭据。
+以上示例将 IPv4 业务监听器绑定到回环地址。显式配置 `--listen 0.0.0.0:7400` 时，本机物理网络接口也会接受经过业务鉴权的请求。配对 URL 填写对应网络中的对端地址和业务端口。主机登录账户管理工作空间的私有状态和本机回环代理。对端发出的业务请求仍需提供对应凭据。
 
 ### 网络进程恢复
 
 `tarlad` 在工作空间内保留一个稳定的回环 SOCKS5 监听端点。EasyTier 或 Tailscale 进程退出后，进行中的连接会断开。守护进程关闭旧连接，按 250 毫秒到 10 秒的退避间隔重启已校验的边车，再使用原有代理地址接受新请求。整个 `tarlad` 重新启动后，代理端口可以改变，客户端应重新读取本地运行记录。EasyTier 的实例标识和 Tailscale 的登记状态存放在各自工作空间中，恢复连接后继续由对等同步协议补传。
+
+正常停止守护进程时，Tarla 同时释放本工作空间的网络进程。Linux 还为网络子进程设置父进程退出信号，即使 `tarlad` 被强制终止，网络子进程也会退出。下列实网验收在 Linux 上运行。其余平台上强制终止整个进程树后的行为需要在目标系统上单独验证。
 
 `runtime/easytier.json` 和 `runtime/tailscale.json` 记录当前状态 `ready` 或 `reconnecting`。`ready` 表示本地代理已完成 SOCKS 握手。Tailscale 首次登录、网络策略授权和对端重连可能仍在进行。获取上游诊断数据前，读取当前记录中的 `rpc`，EasyTier 的管理端口可能随边车重启改变。
 

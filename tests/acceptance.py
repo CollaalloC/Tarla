@@ -125,7 +125,7 @@ def install_test_slot(node, binary):
     work = node.home / "fixture-worktree"
     work.mkdir()
     (work / "job.py").write_text(
-        "import json,sys,time\n"
+        "import json,sys,time\nfrom pathlib import Path\n"
         "m=json.loads(sys.argv[1])\n"
         "with open('launches', 'a') as f: print(m['run_id'],file=f,flush=True)\n"
         "print('ready', flush=True)\n"
@@ -133,6 +133,11 @@ def install_test_slot(node, binary):
         "    value=input().strip()\n"
         "    with open('terminal-result','w') as f: f.write(value)\n"
         "    print('terminal acknowledged',flush=True)\n"
+        "elif m['objective']=='exercise restart':\n"
+        "    for _ in range(900):\n"
+        "        if Path('release-after-restart').is_file(): break\n"
+        "        time.sleep(.1)\n"
+        "    else: raise SystemExit(1)\n"
         "else: time.sleep(5)\n"
         "print('fixture job completed', flush=True)\n")
     with (node.dir/"workspace.toml").open("a") as cfg:
@@ -150,18 +155,25 @@ def assert_remote_execution(chief, worker, work, secret):
     path = "/v1/runs/" + run_id
     marker = work/"launches"
     until(lambda: marker.exists() and run_id in marker.read_text(),"real executor launch")
-    # Existing PTY must survive both the control plane and local executor process restarting.
-    chief.stop()
-    worker.stop()
-    worker.start(secret)
-    chief.start(secret)
+    until(lambda: chief.api(path).get("hc_terminal_id"), "replicated live terminal")
+    grant = chief.api(path + "/attach", {"mode": "observe"})
+    # Keep a viewer connected through SIGTERM. Its HTTP connection must not
+    # retain the workspace lock or stop the independently held native worker.
+    with websocket(worker, "/v1/terminal/" + run_id, grant["ticket"]) as status:
+        assert status == 101
+        chief.stop()
+        worker.stop()
+        worker.start(secret)
+        chief.start(secret)
+    (work / "release-after-restart").touch()
     until(lambda: chief.api(path)["observed_state"]=="succeeded","task receipt after restart",45)
     until(lambda: any(m["sender_role"]=="assistant" for m in chief.api("/v1/conversations/jobs/messages")),
           "RunCompleted wake")
     assert marker.read_text().splitlines()==[run_id]
     print("PASS real private herdr-core, cross-node mission, executor and supervisor restart, exactly one launch, active completion")
 
-def websocket_status(node, path, ticket):
+@contextlib.contextmanager
+def websocket(node, path, ticket):
     # Exercise the same HTTP Upgrade used by the App; no workspace API credential is sent.
     key = base64.b64encode(os.urandom(16)).decode()
     with socket.create_connection(("127.0.0.1",node.port),timeout=5) as conn:
@@ -170,7 +182,12 @@ def websocket_status(node, path, ticket):
                    f"Sec-WebSocket-Key: {key}", f"Authorization: Bearer {ticket}", "", ""]
         conn.sendall("\r\n".join(headers).encode())
         with conn.makefile("rb") as reply:
-            return int(reply.readline().split()[1])
+            yield int(reply.readline().split()[1])
+
+
+def websocket_status(node, path, ticket):
+    with websocket(node, path, ticket) as status:
+        return status
 
 
 def assert_remote_terminal(chief, worker, work):

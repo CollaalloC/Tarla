@@ -33,13 +33,18 @@ pub async fn search_memories(
     }
     if let Some(provider) = s.memory_index.clone().filter(|_| !query.trim().is_empty()) {
         let path = s.db_path.clone();
-        let (workspace, node, query) = (s.id().to_owned(), s.node().to_owned(), query.to_owned());
-        return tokio::task::spawn_blocking(move || {
+        let (workspace, node, search_term) =
+            (s.id().to_owned(), s.node().to_owned(), query.to_owned());
+        let projected = tokio::task::spawn_blocking(move || {
             let mut db = Connection::open(path)?;
             db.busy_timeout(Duration::from_secs(5))?;
-            provider.search(&mut db, &workspace, &node, &query, limit)
+            provider.search(&mut db, &workspace, &node, &search_term, limit)
         })
         .await?;
+        match projected {
+            Ok(results) => return Ok(results),
+            Err(error) => eprintln!("local memory projection unavailable, using SQLite: {error}"),
+        }
     }
     SqliteMemory::new(&mut s.db()?, s.id(), s.node()).search(query, limit)
 }
@@ -175,22 +180,19 @@ impl ControlPlane for Plane<'_> {
             } => conversation_id,
         };
         let mut c = self.s.db()?;
-        let frozen: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM conversation_prefix WHERE conversation_id=?1)",
-            [id],
-            |r| r.get(0),
+        tarla_memory::freeze_supervisor_snapshot(
+            &mut c,
+            self.s.id(),
+            self.s.node(),
+            id,
+            &self.s.ws.soul,
+            self.s.ws.config.memory.prefetch_token_budget,
         )?;
-        let prefix = if frozen {
-            String::new()
-        } else {
-            SqliteMemory::new(&mut c, self.s.id(), self.s.node())
-                .prefetch_frozen_snapshot("global", self.s.ws.config.memory.prefetch_token_budget)?
-        };
         let policy = context_policy(
             self.s,
             self.skill.as_ref().map_or(0, skills::Selection::cost),
         )?;
-        let history = tarla_context::assemble(&mut c, id, &self.s.ws.soul, &prefix, &policy)?;
+        let history = tarla_context::assemble(&mut c, id, &self.s.ws.soul, "", &policy)?;
         let mut messages: Vec<_> = history
             .into_iter()
             .map(|m| match m.role.as_str() {

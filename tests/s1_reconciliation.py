@@ -4,6 +4,7 @@ Run with TARLA_TEST_HC to execute a successful real PTY mission. Without it,
 the executor generates a genuine startup failure and the same durable receipt.
 """
 import contextlib
+from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -42,7 +43,12 @@ class Link(ThreadingHTTPServer):
         self.lock = threading.Lock()
         self.receipt = None
         self.earlier = None
+        self.claim_held = threading.Event()
+        self.release_claim = threading.Event()
         self.allow_pull = threading.Event()
+        self.hold_pull = threading.Event()
+        self.pause_push = threading.Event()
+        self.pulled_history = threading.Event()
         self.dropped = threading.Event()
         self.marker = "PRIVATE_S0_" + secrets.token_hex(16)
         self.leaked = threading.Event()
@@ -81,6 +87,10 @@ class Handler(BaseHTTPRequestHandler):
         payload = json.loads(raw)
         mode = "pass"
         if self.path == "/peer/v1/s1_pull" and not link.allow_pull.is_set():
+            if not link.hold_pull.is_set() or not link.allow_pull.wait(timeout=6):
+                self.send_error(503)
+                return
+        if self.path == "/peer/v1/sync" and link.pause_push.is_set():
             self.send_error(503)
             return
         if self.path == "/peer/v1/sync" and payload.get("events"):
@@ -94,6 +104,10 @@ class Handler(BaseHTTPRequestHandler):
                     # Let the initial claim reach the supervisor. Its acknowledgement
                     # authorizes the worker to start the original command.
                     link.earlier = payload
+                if (any(e["event_type"] == "run_claimed" for e in payload["events"])
+                        and not link.release_claim.is_set()):
+                    link.claim_held.set()
+                    mode = "hold"
         if mode == "hold":
             self.send_error(503)
             return
@@ -104,6 +118,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if link.marker.encode() in body:
             link.leaked.set()
+        if self.path == "/peer/v1/s1_pull" and code == 200 and json.loads(body)["events"]:
+            link.pulled_history.set()
         if mode == "drop" and code == 200:
             # Supervisor committed. Close the socket before any acknowledgement reaches
             # the executor, then hold all retries until the test inspects both ledgers.
@@ -192,6 +208,13 @@ def check(root, hc):
         dispatch = {"conversation_id":"recovery","goal":"check S1 recovery",
                     "node_id":"worker","slot_id":"fixture","request_id":"once"}
         run = chief.api("/v1/runs", dispatch)["run_id"]
+        assert link.claim_held.wait(15), "worker did not present its durable claim"
+        assert rows(worker, "SELECT phase FROM service_claims WHERE run_id=?", run) == [("offered",)]
+        assert not rows(chief, "SELECT claim_id FROM service_s1_claims WHERE run_id=?", run)
+        assert not rows(worker, "SELECT 1 FROM outbox_events WHERE event_type='run_receipt' AND run_id=?", run)
+        if hc:
+            assert not (work / "launches").exists()
+        link.release_claim.set()
         packet = until(lambda: link.receipt, "executor's unacknowledged completion")
         seq = [event["seq"] for event in packet["events"]]
         assert seq[-1] > 1 and seq == list(range(seq[0], seq[-1] + 1)), seq
@@ -213,6 +236,14 @@ def check(root, hc):
         for replay in (link.earlier, packet):
             code, body = link.send("/peer/v1/sync", replay)
             assert code in (200, 409), (code, body)
+        conflict = deepcopy(packet)
+        original = conflict["events"][-1]
+        revised = json.loads(original["payload_json"])
+        revised["executive_summary"] = "Different contents under the previously accepted identity"
+        original["payload_json"] = json.dumps(revised)
+        code, body = link.send("/peer/v1/sync", conflict)
+        assert code in (400, 409, 422), (code, body)
+        assert chief.api("/v1/runs/" + run)["receipt_summary"] == first["receipt_summary"]
         single_wake(chief, run)
         link.set_mode("pass")
         until(lambda: acknowledged(worker, receipt["event_id"]), "executor persisted receipt acknowledgement")
@@ -221,9 +252,33 @@ def check(root, hc):
             worker.stop()
             chief.stop()
             backup(snapshot, chief.dir / "state.db")
+            if snapshot == before_dispatch:
+                # The supported restore command leaves this one-shot marker in the
+                # restored ledger before the supervisor can accept traffic.
+                with sqlite3.connect(chief.dir / "state.db") as db:
+                    db.execute("INSERT OR REPLACE INTO service_restore_barrier VALUES(1)")
+                # Permit only supervisor-initiated history reconciliation on this
+                # restart; the first restore already exercised executor push alone.
+                link.pause_push.set()
+                reverse.hold_pull.set()
+                worker.start(token)
             chief.start(token)
             assert not rows(chief, "SELECT 1 FROM service_wakes WHERE json_extract(receipt,'$.run_id')=?", run)
             if snapshot == before_dispatch:
+                assert not rows(chief, "SELECT 1 FROM runs WHERE run_id=?", run)
+                barrier=json.loads(chief.cli("recovery-status"))
+                assert barrier["phase"]=="reconciling" and [n["node_id"] for n in barrier["pending"]]==[worker.name],barrier
+                try:
+                    chief.api("/v1/runs", dispatch)
+                except HTTPError as err:
+                    assert "reconciling S1" in err.read().decode(), err
+                else:
+                    raise AssertionError("forgotten prior dispatch slipped through the restore fence")
+                assert not rows(chief, "SELECT 1 FROM runs WHERE run_id=?", run)
+                altered = deepcopy(link.earlier)
+                altered["claims"][run]["assignment"]["target_slot_id"] = "different-slot"
+                code, body = link.send("/peer/v1/sync", altered)
+                assert code in (400, 409, 422), (code, body)
                 assert not rows(chief, "SELECT 1 FROM runs WHERE run_id=?", run)
                 # Deliver the authentic final event before any of its predecessors,
                 # including the signed claim. The acknowledgement cannot skip the gap.
@@ -234,11 +289,16 @@ def check(root, hc):
                     assert code in (400, 409, 422), (code, body)
                 assert not rows(chief, "SELECT 1 FROM service_wakes WHERE json_extract(receipt,'$.run_id')=?", run)
                 reverse.allow_pull.set()
-            worker.start(token)
+            else:
+                worker.start(token)
             recovered = wait_terminal(chief, run, state)
+            if snapshot == before_dispatch:
+                assert reverse.pulled_history.is_set(), "restored ledger did not pull its missing executor history"
+                link.pause_push.clear()
             single_wake(chief, run)
             for key in ("run_id","conversation_id","target_node_id","target_slot_id","receipt_summary"):
                 assert recovered[key] == first[key] == owned[key], (key, recovered)
+            assert chief.api("/v1/recovery")["phase"] == "ready"
             assert chief.api("/v1/runs", dispatch)["run_id"] == run
             assert rows(chief, "SELECT s0_log_local_path FROM runs WHERE run_id=?", run) == [(None,)]
             assert not list(chief.dir.rglob("transcript.jsonl"))

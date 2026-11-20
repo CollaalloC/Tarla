@@ -433,10 +433,17 @@ async fn spawn_transport(
                 Sha256::digest(runtime.to_string_lossy().as_bytes())
             ));
             let state = runtime.join("ts.state");
+            // v1.82 derives its auxiliary VarRoot only when the state file's
+            // parent is named "tailscale". Keep certs and other files private
+            // while preserving established node identities in ts.state.
+            let state_dir = runtime.join("tailscale");
+            private_dir(&state_dir)?;
             c.args([
                 OsStr::new("--tun=userspace-networking"),
                 OsStr::new("--state"),
                 state.as_os_str(),
+                OsStr::new("--statedir"),
+                state_dir.as_os_str(),
                 OsStr::new("--socket"),
                 &socket,
             ])
