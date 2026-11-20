@@ -106,12 +106,11 @@ impl ToolSpec {
             );
         }
         if self.name == ControlTool::MemoryManage {
-            match args["operation"].as_str() {
-                Some("update" | "archive") => ensure!(
+            if let Some("update" | "archive") = args["operation"].as_str() {
+                ensure!(
                     args["memory_id"].is_string() && args["base_version"].is_u64(),
                     "update and archive require memory_id and base_version"
-                ),
-                _ => {}
+                );
             }
             if matches!(args["operation"].as_str(), Some("create" | "update")) {
                 ensure!(args["content"].is_string(), "memory content required");

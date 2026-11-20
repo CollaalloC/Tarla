@@ -427,10 +427,13 @@ pub fn save_offer(db: &Connection, s: &Service, id: &str, item: &Value, fresh: b
         [id],
         |r| r.get(0),
     )?;
-    if item["desired_state"] == "cancelled" || item["authorized_claim"].as_str() == Some(&local) {
-        if db.execute("UPDATE service_claims SET phase='queued',updated_at=? WHERE run_id=? AND phase='offered'",params![now(),id])?!=0 {
-            s.notify.notify_one();
-        }
+    if (item["desired_state"] == "cancelled" || item["authorized_claim"].as_str() == Some(&local))
+        && db.execute(
+            "UPDATE service_claims SET phase='queued',updated_at=? WHERE run_id=? AND phase='offered'",
+            params![now(), id],
+        )? != 0
+    {
+        s.notify.notify_one();
     }
     Ok(())
 }

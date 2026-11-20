@@ -77,15 +77,13 @@ async fn keychain(item: &str) -> io::Result<String> {
         CredFree(entry.cast());
         buf
     };
-    if bytes.len() % 2 != 0 {
+    let (pairs, rem) = bytes.as_chunks::<2>();
+    if !rem.is_empty() {
         return Err(invalid(
             "use a UTF-16LE Windows generic credential password",
         ));
     }
-    let words: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|s| u16::from_le_bytes([s[0], s[1]]))
-        .collect();
+    let words: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
     String::from_utf16(&words).map_err(|_| invalid("invalid Windows credential password"))
 }
 

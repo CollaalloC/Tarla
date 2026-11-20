@@ -461,7 +461,7 @@ async fn spawn_transport(
         opts.mode(0o600);
     }
     let log = opts.open(err_log)?;
-    cmd.current_dir(&runtime)
+    cmd.current_dir(runtime)
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .kill_on_drop(true);

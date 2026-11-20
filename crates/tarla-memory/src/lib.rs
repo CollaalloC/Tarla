@@ -197,7 +197,7 @@ pub struct Mutation {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum MutationResult {
     Applied {
-        memory: Memory,
+        memory: Box<Memory>,
     },
     Conflict {
         candidate_id: String,
@@ -518,7 +518,14 @@ impl MemoryBackend for SqliteMemory<'_> {
                 .as_ref()
                 .map_or_else(|| "user_manual".to_owned(), |r| format!("run:{r}"));
             MutationResult::Applied {
-                memory: apply_proposal(&tx, self.workspace, self.node, p, current, &author)?,
+                memory: Box::new(apply_proposal(
+                    &tx,
+                    self.workspace,
+                    self.node,
+                    p,
+                    current,
+                    &author,
+                )?),
             }
         };
         tx.execute(

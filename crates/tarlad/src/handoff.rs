@@ -56,14 +56,14 @@ fn path_for(s: &Service, slot: &AgentSlotSnapshot) -> Result<String> {
             .map(|p| p.workdir.to_string_lossy().into_owned())
             .context("missing local slot");
     }
-    Ok(s.db()?
+    s.db()?
         .query_row(
             "SELECT workdir FROM service_slot_paths WHERE node_id=? AND slot_id=?",
             params![slot.node_id, slot.slot_id],
             |r| r.get(0),
         )
         .optional()?
-        .context("peer has not advertised the slot workdir")?)
+        .context("peer has not advertised the slot workdir")
 }
 pub fn bind(s: &Service, conv: &str, v: &Value) -> Result<Value> {
     let mut c = s.db()?;
@@ -87,10 +87,9 @@ pub fn bind(s: &Service, conv: &str, v: &Value) -> Result<Value> {
                 .iter()
                 .find(|x| x.node_id == node && x.slot_id == slot)
                 .context("unknown slot")?;
-            if s.node() == node || path_for(s, selected).is_ok() {
-                if path != path_for(s, selected)? {
-                    bail!("workdir does not match configured slot")
-                }
+            if (s.node() == node || path_for(s, selected).is_ok()) && path != path_for(s, selected)?
+            {
+                bail!("workdir does not match configured slot")
             }
             if path.trim().is_empty() || path.len() > 4096 {
                 bail!("invalid pinned workdir")
@@ -251,10 +250,10 @@ pub fn pinned(
         let old = slots
             .iter()
             .find(|x| x.node_id == node && x.slot_id == slot);
-        if old.is_none_or(|x| select_best_slot(&req(s), std::slice::from_ref(x), now()).is_none()) {
-            if active_turn(&db, conv)?.is_none() {
-                switch(s, conv, "", source, None)?;
-            }
+        if old.is_none_or(|x| select_best_slot(&req(s), std::slice::from_ref(x), now()).is_none())
+            && active_turn(&db, conv)?.is_none()
+        {
+            switch(s, conv, "", source, None)?;
         }
     }
     let (node, slot, path) = current(&db, conv)?.context("binding changed")?;
