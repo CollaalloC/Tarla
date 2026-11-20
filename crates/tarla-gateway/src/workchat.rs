@@ -94,6 +94,7 @@ pub async fn slack(State(g): Data, headers: HeaderMap, body: Bytes) -> WebResult
             Input::Button {
                 value: text(&v["actions"][0], "value")?,
                 callback_id: None,
+                message_id: None,
             },
         )
     } else {
@@ -150,6 +151,7 @@ pub async fn discord(State(g): Data, headers: HeaderMap, body: Bytes) -> WebResu
         Some(3) => Input::Button {
             value: text(&v["data"], "custom_id")?,
             callback_id: None,
+            message_id: None,
         },
         _ => return Err(StatusCode::BAD_REQUEST),
     };
