@@ -48,6 +48,35 @@ impl Gateway {
         }
         Ok(req.send().await?.error_for_status()?.json().await?)
     }
+    /// Queue one page of committed replies in history order. A short page
+    /// means this route has caught up to the history visible at request time.
+    pub(crate) async fn queue_history_page(
+        &self,
+        route_id: &str,
+        platform: &str,
+        conversation: &str,
+    ) -> Result<bool> {
+        const LIMIT: usize = 100;
+        let cursor: i64 =
+            self.db()?
+                .query_row("SELECT cursor FROM routes WHERE id=?", [route_id], |r| {
+                    r.get(0)
+                })?;
+        let page = self
+            .core(
+                Method::GET,
+                &["conversations", conversation, "messages"],
+                &[
+                    ("after_seq", cursor.to_string()),
+                    ("limit", LIMIT.to_string()),
+                ],
+                None,
+            )
+            .await?;
+        let rows = page.as_array().context("invalid conversation history")?;
+        store::queue_messages(&mut *self.db()?, route_id, platform, rows)?;
+        Ok(rows.len() < LIMIT)
+    }
     async fn feishu_token(&self) -> Result<String> {
         let mut cached = self.feishu_token.lock().await;
         if let Some((expires, token)) = &*cached {
@@ -439,19 +468,9 @@ async fn poll(g: &Gateway) -> Result<()> {
         vec![]
     };
     for b in bindings {
-        if let Ok(msgs) = g
-            .core(
-                Method::GET,
-                &["conversations", &b.conversation_id, "messages"],
-                &[("after_seq", b.cursor.to_string()), ("limit", "100".into())],
-                None,
-            )
-            .await
-        {
-            if let Some(rows) = msgs.as_array() {
-                store::queue_messages(&mut *g.db()?, &b, rows)?
-            }
-        }
+        let _ = g
+            .queue_history_page(&b.id, &b.route.platform, &b.conversation_id)
+            .await;
         if !b.approvals {
             continue;
         }

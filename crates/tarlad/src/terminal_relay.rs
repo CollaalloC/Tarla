@@ -56,10 +56,16 @@ pub async fn connect(
         ));
     }
     terminal::consume(s, &grant)?;
-    let remote = peers::call(s, owner, "ticket", &json!({"run_id":id,"mode":grant.mode})).await?;
+    let remote = terminal::peer_ticket(s, owner, id, grant.mode).await?;
+    let remote_ticket = string(&remote, "ticket")?;
+    // Older executors include the terminal address only inside their ticket.
+    let same_terminal = match remote.get("hc_terminal_id") {
+        Some(terminal) => terminal == &grant.hc_terminal_id,
+        None => grant.matches_peer_ticket_scope(remote_ticket),
+    };
     if remote["run_id"] != grant.run_id
         || remote["node_id"] != grant.node_id
-        || remote["hc_terminal_id"] != grant.hc_terminal_id
+        || !same_terminal
         || remote["mode"] != json!(grant.mode)
     {
         return Err(ApiError(
@@ -81,10 +87,15 @@ pub async fn connect(
         .header("Upgrade", "websocket")
         .header("Sec-WebSocket-Version", "13")
         .header("Sec-WebSocket-Key", &key)
-        .bearer_auth(string(&remote, "ticket")?)
+        .bearer_auth(remote_ticket)
         .send()
         .await
-        .map_err(anyhow::Error::from)?;
+        .map_err(|_| {
+            ApiError(
+                StatusCode::BAD_GATEWAY,
+                "could not connect to the executor terminal".into(),
+            )
+        })?;
     if res.status() != 101
         || !res
             .headers()
@@ -102,37 +113,58 @@ pub async fn connect(
             "executor declined terminal attachment".into(),
         ));
     }
-    let upstream = res.upgrade().await.map_err(anyhow::Error::from)?;
+    let upstream = res.upgrade().await.map_err(|_| {
+        ApiError(
+            StatusCode::BAD_GATEWAY,
+            "executor terminal connection closed during upgrade".into(),
+        )
+    })?;
+    // Executor output can contain an entire screen repaint in one frame.
     let cfg = WebSocketConfig::default()
-        .max_message_size(Some(65536))
-        .max_frame_size(Some(65536));
+        .max_message_size(Some(tarla_sidecar::MAX_HERDR_FRAME_BYTES))
+        .max_frame_size(Some(tarla_sidecar::MAX_HERDR_FRAME_BYTES));
     let mut remote = WebSocketStream::from_raw_socket(upstream, Role::Client, Some(cfg)).await;
-    Ok(upgrade.max_message_size(65536).on_upgrade(move |mut client|async move {
+    let interactive = grant.mode == AttachMode::Interactive;
+    Ok(upgrade.max_message_size(tarla_sidecar::MAX_TERMINAL_INPUT_BYTES).on_upgrade(move |mut client| async move {
         loop {
             tokio::select! {
-                stream=remote.next()=> {
-                    let frame=match stream {
-                        Some(Ok(Remote::Binary(b)))=>Message::Binary(b),
-                        Some(Ok(Remote::Text(t)))=>Message::Text(t.as_str().into()),
-                        Some(Ok(Remote::Ping(_)))=>{if remote.flush().await.is_err(){break}continue},
-                        Some(Ok(Remote::Pong(_)))=>continue,
-                        _=>break,
+                incoming = remote.next() => {
+                    let frame = match incoming {
+                        Some(Ok(Remote::Binary(bytes))) => Message::Binary(bytes),
+                        Some(Ok(Remote::Text(text))) => Message::Text(text.as_str().into()),
+                        Some(Ok(Remote::Ping(_))) => {
+                            if remote.flush().await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Some(Ok(Remote::Pong(_))) => continue,
+                        _ => break,
                     };
-                    if client.send(frame).await.is_err(){break}
+                    if client.send(frame).await.is_err() {
+                        break;
+                    }
                 }
-                stream=client.next()=> {
-                    let frame=match stream{
-                        Some(Ok(Message::Binary(b))) if grant.mode==AttachMode::Interactive=>Remote::Binary(b),
-                        Some(Ok(Message::Text(t))) if grant.mode==AttachMode::Interactive=>Remote::Text(t.as_str().into()),
-                        Some(Ok(Message::Ping(_)))=>{if client.flush().await.is_err(){break}continue},
-                        Some(Ok(Message::Pong(_)))=>continue,
-                        _=>break,
+                incoming = client.next() => {
+                    let frame = match incoming {
+                        Some(Ok(Message::Binary(bytes))) if interactive => Remote::Binary(bytes),
+                        Some(Ok(Message::Text(text))) if interactive => Remote::Text(text.as_str().into()),
+                        Some(Ok(Message::Ping(_))) => {
+                            if client.flush().await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Some(Ok(Message::Pong(_))) => continue,
+                        _ => break,
                     };
-                    if remote.send(frame).await.is_err(){break}
+                    if remote.send(frame).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
-        let _=remote.close(None).await;
-        let _=client.close().await;
+        let _ = remote.close(None).await;
+        let _ = client.close().await;
     }))
 }

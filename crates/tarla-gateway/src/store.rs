@@ -216,12 +216,13 @@ pub fn bindings(db: &Connection) -> Result<Vec<Binding>> {
 }
 pub fn queue_messages(
     db: &mut Connection,
-    b: &Binding,
+    route_id: &str,
+    platform: &str,
     messages: &[serde_json::Value],
 ) -> Result<()> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let Some(mut cursor): Option<i64> = tx
-        .query_row("SELECT cursor FROM routes WHERE id=?", [&b.id], |q| {
+        .query_row("SELECT cursor FROM routes WHERE id=?", [route_id], |q| {
             q.get(0)
         })
         .optional()?
@@ -238,15 +239,8 @@ pub fn queue_messages(
         if m["sender_role"] == "assistant" {
             let text = m["content"].as_str().context("invalid assistant message")?;
             let source = m["source_msg_id"].as_str().unwrap_or("");
-            let final_preview = crate::drafts::close(&tx, &b.id, source)?;
-            let mut fragments = chunks(
-                text,
-                if b.route.platform == "discord" {
-                    1900
-                } else {
-                    3500
-                },
-            );
+            let final_preview = crate::drafts::close(&tx, route_id, source)?;
+            let mut fragments = chunks(text, if platform == "discord" { 1900 } else { 3500 });
             if final_preview && fragments.is_empty() {
                 fragments.push("(Empty reply)".to_owned());
             }
@@ -261,7 +255,7 @@ pub fn queue_messages(
                 };
                 tx.execute(
                     "INSERT INTO outgoing(route,job) VALUES (?,?)",
-                    params![b.id, serde_json::to_string(&job)?],
+                    params![route_id, serde_json::to_string(&job)?],
                 )?;
             }
         }
@@ -269,7 +263,7 @@ pub fn queue_messages(
     }
     tx.execute(
         "UPDATE routes SET cursor=? WHERE id=?",
-        params![cursor, b.id],
+        params![cursor, route_id],
     )?;
     tx.commit()?;
     Ok(())

@@ -19,8 +19,8 @@ type Ipc = tokio::net::UnixStream;
 #[cfg(windows)]
 type Ipc = tokio::net::windows::named_pipe::NamedPipeClient;
 
-const MAX_FRAME: usize = 16 * 1024 * 1024;
-const MAX_INPUT: usize = 64 * 1024;
+pub const MAX_HERDR_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Clone)]
@@ -109,10 +109,10 @@ async fn plain<S: AsyncRead + AsyncWrite + Unpin>(
     stream.get_mut().write_all(&request).await?;
     let mut reply = Vec::new();
     (&mut *stream)
-        .take((MAX_FRAME + 1) as u64)
+        .take((MAX_HERDR_FRAME_BYTES + 1) as u64)
         .read_until(b'\n', &mut reply)
         .await?;
-    if reply.len() > MAX_FRAME || reply.last() != Some(&b'\n') {
+    if reply.len() > MAX_HERDR_FRAME_BYTES || reply.last() != Some(&b'\n') {
         return Err(invalid("truncated or oversized RPC response"));
     }
     reply_result(serde_json::from_slice(&reply)?, 1)
@@ -277,7 +277,7 @@ impl Herdr {
         Ok(())
     }
     pub async fn send(&self, run_id: &str, terminal: &str, text: &str) -> io::Result<()> {
-        if text.len() > MAX_INPUT {
+        if text.len() > MAX_TERMINAL_INPUT_BYTES {
             return Err(invalid("message too long"));
         }
         self.run_rpc(
@@ -355,7 +355,7 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<(u32, u8, Vec
     let channel = r.read_u32_le().await?;
     let kind = r.read_u8().await?;
     let len = r.read_u32_le().await? as usize;
-    if len > MAX_FRAME {
+    if len > MAX_HERDR_FRAME_BYTES {
         return Err(invalid("oversized core frame"));
     }
     let mut bytes = vec![0; len];
@@ -395,7 +395,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> TerminalReader<S> {
                 let channel = u32::from_le_bytes(self.pending[..4].try_into().unwrap());
                 let kind = self.pending[4];
                 let length = u32::from_le_bytes(self.pending[5..9].try_into().unwrap()) as usize;
-                if length > MAX_FRAME {
+                if length > MAX_HERDR_FRAME_BYTES {
                     return Err(invalid("oversized core frame"));
                 }
                 if self.pending.len() >= 9 + length {
@@ -447,7 +447,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> TerminalWriter<S> {
     }
     pub async fn input(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.check_interactive()?;
-        if bytes.len() > MAX_INPUT {
+        if bytes.len() > MAX_TERMINAL_INPUT_BYTES {
             return Err(invalid("oversized input"));
         }
         write_frame(&mut self.write, self.channel, 0, bytes).await

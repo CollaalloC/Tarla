@@ -130,6 +130,26 @@ pub async fn local_ticket(s: &Service, id: &str, v: &Value) -> Api<Value> {
         json!({"ticket":AttachLease::issue(s.ws.attach_key.as_bytes(),s.id(),s.node(),id,term,mode,now())?,"mode":mode,"route":"direct","run_id":id,"node_id":s.node(),"hc_terminal_id":term,"expires_in":60}),
     )
 }
+
+pub(super) async fn peer_ticket(s: &Service, node: &str, id: &str, mode: AttachMode) -> Api<Value> {
+    let grant = peers::call(s, node, "ticket", &json!({"run_id":id,"mode":mode}))
+        .await
+        .map_err(|error| {
+            if error.is::<reqwest::Error>() {
+                ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "could not get a terminal ticket from the executor".into(),
+                )
+            } else {
+                error.into()
+            }
+        })?;
+    if mode == AttachMode::Interactive && !grant["hc_terminal_id"].is_string() {
+        return Err(ApiError(StatusCode::CONFLICT, UNKNOWN.into()));
+    }
+    Ok(grant)
+}
+
 pub async fn issue(State(s): State<S>, Route(id): Route<String>, Json(v): Json<Value>) -> Api {
     let route = v["route"].as_str().unwrap_or("direct");
     if !matches!(route, "auto" | "direct" | "supervisor") {
@@ -145,15 +165,14 @@ pub async fn issue(State(s): State<S>, Route(id): Route<String>, Json(v): Json<V
     check_mode(&r, mode)?;
     let target = string(&r, "target_node_id")?;
     let peer = s.peers.get(target).context("executor is not paired")?;
-    let public = peer.client_url.as_deref().or_else(|| {
-        peer.url
-            .starts_with("https://")
-            .then_some(peer.url.as_str())
-    });
+    // A peer may use HTTPS inside the private network. Only client_url
+    // explicitly advertises an executor address reachable by clients.
+    let public = peer.client_url.as_deref();
     if route == "supervisor" || (route == "auto" && public.is_none()) {
         return Ok(Json(terminal_relay::issue(&s, &r, &id, mode)?));
     }
-    let mut remote = peers::call(&s, target, "ticket", &json!({"run_id":id,"mode":mode})).await?;
+    let mut remote = peer_ticket(&s, target, &id, mode).await?;
+    remote["route"] = json!("direct");
     remote["node_url"] = json!(public.unwrap_or(&peer.url));
     Ok(Json(remote))
 }
@@ -191,7 +210,7 @@ pub async fn socket(
         .attach(&lease.run_id, &lease.hc_terminal_id, observe, 80, 24)
         .await
         .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e.to_string()))?;
-    Ok(upgrade.max_message_size(65536).on_upgrade(move|socket|async move{
+    Ok(upgrade.max_message_size(tarla_sidecar::MAX_TERMINAL_INPUT_BYTES).on_upgrade(move|socket|async move{
         let(mut sink,mut source)=socket.split();let(tx,mut rx)=tokio::sync::mpsc::channel(4);
         let pump=tokio::spawn(async move{while let Ok(event)=reader.next().await{let closed=matches!(&event,TerminalEvent::Closed(_));if tx.send(event).await.is_err()||closed{break}}});
         loop{tokio::select!{

@@ -1,18 +1,23 @@
 """Use real private PTYs, two daemons and the CLI to verify direct and relayed terminal grants."""
+import argparse
 import base64
 import contextlib
 import hashlib
+import hmac
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import secrets
 import socket
+import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 from urllib.error import HTTPError
 
-from acceptance import BIN, Node, install_test_slot, until
+from acceptance import BIN, Node, free_port, install_test_slot, until
 from pinned import fixtures
 
 WORKER = """import json, pathlib, select, sys, time
@@ -127,6 +132,101 @@ def send(p, message, log):
     until(observed, "terminal delivered " + message)
 
 
+class LegacyExecutor(BaseHTTPRequestHandler):
+    """The previous executor returns the terminal address only inside its signed ticket."""
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path != "/peer/v1/ticket":
+            self.send_error(404)
+            return
+        assert self.headers["Authorization"] == "Bearer " + self.server.pair_secret
+        grant = {"workspace_id": body["workspace_id"], "node_id": "worker", "run_id": body["run_id"],
+                 "mode": body["mode"], "hc_terminal_id": self.server.terminal, "nonce": secrets.token_hex(16),
+                 "expires_at": int(time.time()) + 60}
+        payload = base64.urlsafe_b64encode(json.dumps(grant).encode()).rstrip(b"=")
+        signature = hmac.digest(self.server.signing_key, b"tarla/attach/v1\0" + payload, "sha256")
+        token = (payload + b"." + base64.urlsafe_b64encode(signature).rstrip(b"=")).decode()
+        self.server.issued.add(token)
+        response = json.dumps({"run_id": grant["run_id"], "node_id": "worker", "mode": grant["mode"],
+                               "expires_in": 60, "ticket": token}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+
+    def do_GET(self):
+        token = self.headers.get("Authorization", "").removeprefix("Bearer ")
+        if token not in self.server.issued or self.path != "/v1/terminal/legacy-run":
+            self.send_error(401)
+            return
+        self.server.issued.remove(token)
+        key = self.headers["Sec-WebSocket-Key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+        self.send_response(101)
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Sec-WebSocket-Accept", base64.b64encode(hashlib.sha1(key.encode()).digest()).decode())
+        self.end_headers()
+        payload = self.server.repaint
+        self.wfile.write(b"\x82\x7f" + len(payload).to_bytes(8, "big") + payload + b"\x88\x00")
+        self.close_connection = True
+
+    def log_message(self, *_):
+        pass
+
+
+def check_routes(root):
+    chief = Node(root, "chief", "supervisor_only")
+    rid = "legacy-run"
+    public = "https://worker.example.invalid"
+    with contextlib.ExitStack() as stack:
+        peer = stack.enter_context(ThreadingHTTPServer(("127.0.0.1", 0), LegacyExecutor))
+        peer.terminal, peer.issued = "t1b", set()
+        peer.repaint = b"screen repaint\r\n" * 8192  # one valid output frame larger than the input limit
+        peer.pair_secret, peer.signing_key = secrets.token_hex(32), secrets.token_bytes(32)
+        threading.Thread(target=peer.serve_forever, daemon=True).start()
+        stack.callback(peer.shutdown)
+        private = f"http://127.0.0.1:{peer.server_port}"
+        chief.cli("pair", "worker", private, "--token-env", "TARLA_PAIR_TEST", "--client-url", public)
+        config = chief.dir / "workspace.toml"
+        original = config.read_text()
+        stack.callback(chief.stop)
+        chief.start(peer.pair_secret)
+        with contextlib.closing(sqlite3.connect(chief.dir / "state.db")) as db, db:
+            db.execute("""INSERT INTO runs(run_id,workspace_id,conversation_id,supervisor_term,target_node_id,
+                target_slot_id,desired_state,observed_state,mission_packet_json,hc_terminal_id,created_at,updated_at)
+                VALUES(?,?,'chat',1,'worker','slot','running','running','{}','t1b',0,0)""", (rid, chief.workspace))
+        direct = ticket(chief, rid, route="auto")
+        assert direct["route"] == "direct" and direct["node_url"] == public
+        denied(lambda: ticket(chief, rid, mode="interactive", route="supervisor"), 409)
+        # Even a previously cached capability cannot upgrade a legacy observer.
+        with contextlib.closing(sqlite3.connect(chief.dir / "state.db")) as db, db:
+            db.execute("INSERT INTO service_terminal_input VALUES(?,1)", (rid,))
+        denied(lambda: ticket(chief, rid, mode="interactive", route="direct"), 409)
+        interactive = ticket(chief, rid, mode="interactive", route="supervisor")
+        assert ws_status(chief, rid, interactive["ticket"]) == 409
+        grant = ticket(chief, rid, route="supervisor")
+        with upgrade(chief, rid, grant["ticket"]) as (status, _, stream):
+            assert status == 101 and stream.read(2) == b"\x82\x7f"
+            assert int.from_bytes(stream.read(8), "big") == len(peer.repaint)
+            assert stream.read(len(peer.repaint)) == peer.repaint
+        assert ws_status(chief, rid, grant["ticket"]) == 401
+        peer.terminal = "t2"
+        assert ws_status(chief, rid, ticket(chief, rid, route="supervisor")["ticket"]) == 409
+        chief.stop()
+        # This peer is private HTTPS, with no public origin and no reachable transport.
+        offline = f"https://127.0.0.1:{free_port()}"
+        config.write_text(original.replace(f'client_url = "{public}"', "").replace(private, offline))
+        chief.start(peer.pair_secret)
+        grant = ticket(chief, rid, route="auto")
+        assert grant["route"] == "supervisor" and "node_url" not in grant
+        denied(lambda: ticket(chief, rid, route="direct"), 502)
+        assert ws_status(chief, rid, grant["ticket"]) == 502
+    print("PASS private HTTPS relay selection, explicit client origin, legacy observer, scoped ticket and offline errors")
+
+
 def run(root):
     hc = os.environ["TARLA_TEST_HC"]
     chief = Node(root / "a", "chief", "supervisor_and_executor")
@@ -207,5 +307,10 @@ def run(root):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--routes-only", action="store_true", help="exercise paired HTTP and WebSocket routes without a PTY")
+    args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="s3pty-") as temp:
-        run(Path(temp))
+        check_routes(Path(temp) / "routes")
+        if not args.routes_only:
+            run(Path(temp))
