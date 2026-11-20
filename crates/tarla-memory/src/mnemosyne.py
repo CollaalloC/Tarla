@@ -27,8 +27,8 @@ def main():
                 if remote:
                     mapping.append((str(remote), identity, version))
             with contextlib.closing(sqlite3.connect(staged)) as source:
-                source.execute("CREATE TABLE tarla_projection(workspace TEXT PRIMARY KEY, cursor INTEGER)")
-                source.execute("INSERT INTO tarla_projection VALUES(?,?)", (workspace, cursor))
+                source.execute("CREATE TABLE tarla_projection(workspace TEXT PRIMARY KEY, cursor INTEGER, history_hash TEXT)")
+                source.execute("INSERT INTO tarla_projection VALUES(?,?,?)", (workspace, cursor, request["history_hash"]))
                 source.execute("CREATE TABLE tarla_members(remote_id TEXT PRIMARY KEY, memory_id TEXT, version INTEGER)")
                 source.executemany("INSERT INTO tarla_members VALUES(?,?,?)", mapping)
                 source.commit()

@@ -141,19 +141,33 @@ pub fn subscription_registry(
 mod subscription_tests;
 
 pub fn snapshots(s: &Service) -> Result<Vec<AgentSlotSnapshot>> {
-    let mut slots = local_slots(s)?;
-    let c = s.db()?;
-    for p in list(&c, "SELECT node_id,slots,seen FROM service_peers", &[])? {
-        if !s.peers.contains_key(string(&p, "node_id")?) {
+    snapshots_in(s, &s.db()?)
+}
+fn snapshots_in(s: &Service, c: &Connection) -> Result<Vec<AgentSlotSnapshot>> {
+    let mut slots = if s.can_execute() {
+        reported_slots(c, &s.slots)?
+    } else {
+        vec![]
+    };
+    let mut remote_load = c.prepare(
+        "SELECT count(*) FROM runs WHERE target_node_id=? AND target_slot_id=?
+         AND observed_state NOT IN ('failed','succeeded','cancelled')",
+    )?;
+    for p in list(c, "SELECT node_id,slots,seen FROM service_peers", &[])? {
+        let node = string(&p, "node_id")?;
+        if !s.peers.contains_key(node) {
             continue;
         }
-        let mut remote: Vec<AgentSlotSnapshot> = serde_json::from_str(string(&p, "slots")?)?;
-        if p["seen"].as_i64().unwrap_or(0) < now() - 15 {
-            for r in &mut remote {
-                r.health = SlotHealth::NodeOffline;
+        let remote: Vec<AgentSlotSnapshot> = serde_json::from_str(string(&p, "slots")?)?;
+        for mut slot in remote {
+            if p["seen"].as_i64().unwrap_or(0) < now() - 15 {
+                slot.health = SlotHealth::NodeOffline;
             }
+            // Bind reservations are authoritative before a remote heartbeat can include them.
+            let reserved: u32 = remote_load.query_row(params![node, slot.slot_id], |r| r.get(0))?;
+            slot.active_runs = slot.active_runs.max(reserved);
+            slots.push(slot);
         }
-        slots.extend(remote);
     }
     Ok(slots)
 }
@@ -163,6 +177,7 @@ pub fn dispatch(s: &Service, conv: &str, arg: &Value, run_id: Option<String>) ->
 pub enum Acknowledgement<'a> {
     Supervisor(&'a str),
     Command(&'a str),
+    Continuation(&'a str),
 }
 
 pub fn dispatch_selected(
@@ -177,12 +192,13 @@ pub fn dispatch_selected(
         bail!("only the designated supervisor can dispatch")
     }
     let mut c = s.db()?;
-    control::ensure_conversation(&c, s, conv)?;
+    let dbtx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    control::ensure_conversation(&dbtx, s, conv)?;
     let rid = run_id.unwrap_or_else(uid);
-    if let Some(result) = existing_dispatch(&c, conv, &rid, arg)? {
+    if let Some(result) = existing_dispatch(&dbtx, conv, &rid, arg)? {
         return Ok(result);
     }
-    let mut slots = snapshots(s)?;
+    let mut slots = snapshots_in(s, &dbtx)?;
     if let Some(n) = arg["node_id"].as_str() {
         slots.retain(|x| x.node_id == n)
     }
@@ -204,7 +220,7 @@ pub fn dispatch_selected(
                     .context("author_run_id must be a run identifier")
             })
             .transpose()?;
-        let family = author_family(&c, conv, author_run)?;
+        let family = author_family(&dbtx, conv, author_run)?;
         slots.retain(|slot| slot.model_family != family);
     } else if arg.get("author_run_id").is_some() {
         bail!("author_run_id applies only to reviews")
@@ -264,12 +280,13 @@ pub fn dispatch_selected(
     if let Some(skill) = skill {
         decisions.insert(0, skill.instructions.clone());
     }
-    for item in tarla_context::related_decisions(&c, conv, goal, 5)? {
+    for item in tarla_context::related_decisions(&dbtx, conv, goal, 5)? {
         if !decisions.contains(&item) {
             decisions.push(item);
         }
     }
-    let m = SqliteMemory::new(&mut c, s.id(), s.node());
+    let mut memory_db = s.db()?;
+    let m = SqliteMemory::new(&mut memory_db, s.id(), s.node());
     let mut acceptance = strings(arg, "acceptance_criteria")?;
     if acceptance.is_empty() {
         acceptance = strings(arg, "acceptance")?
@@ -290,15 +307,16 @@ pub fn dispatch_selected(
         },
         s.ws.config.context_policy.mission_packet_max_tokens,
     )?;
+    if matches!(acknowledgement, Some(Acknowledgement::Continuation(_)))
+        && packet.distilled_context.first().map(String::as_str)
+            != arg["distilled_context"][0].as_str()
+    {
+        bail!("continuation checkpoint does not fit the bounded mission")
+    }
     if let Some(skill) = skill {
         if packet.distilled_context.first() != Some(&skill.instructions) {
             bail!("selected skill does not fit the complete bounded mission; shorten the skill or task")
         }
-    }
-    let dbtx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    // Concurrent API requests may compile the same stable identity before either commits.
-    if let Some(result) = existing_dispatch(&dbtx, conv, &rid, arg)? {
-        return Ok(result);
     }
     insert_run(
         &dbtx,
@@ -308,11 +326,21 @@ pub fn dispatch_selected(
         &candidate.slot_id,
         &packet,
     )?;
+    distillation::freeze_baseline(&dbtx, &rid, scope, goal)?;
     dbtx.execute(
         "INSERT INTO service_requirements VALUES(?,?,?,?)",
         params![rid, role, candidate.model_family, arg.to_string()],
     )?;
-    if let Some(path) = arg["pinned_workdir"].as_str() {
+    if let Some(Acknowledgement::Continuation(parent)) = acknowledgement {
+        handoff::commit_continuation(
+            &dbtx,
+            conv,
+            parent,
+            &rid,
+            candidate,
+            arg["pinned_workdir"].as_str(),
+        )?;
+    } else if let Some(path) = arg["pinned_workdir"].as_str() {
         handoff::register(
             &dbtx,
             conv,
@@ -328,13 +356,14 @@ pub fn dispatch_selected(
     }
     let result =
         json!({"run_id":rid,"target_node_id":candidate.node_id,"target_slot_id":candidate.slot_id});
-    if let Some(origin) = acknowledgement {
-        let (source, reply) = match origin {
-            Acknowledgement::Supervisor(source) => {
-                (source, tarla_supervisor::dispatch_acknowledgement(&rid))
-            }
-            Acknowledgement::Command(source) => (source, result.to_string()),
-        };
+    let reply = match acknowledgement {
+        None | Some(Acknowledgement::Continuation(_)) => None,
+        Some(Acknowledgement::Supervisor(source)) => {
+            Some((source, tarla_supervisor::dispatch_acknowledgement(&rid)))
+        }
+        Some(Acknowledgement::Command(source)) => Some((source, result.to_string())),
+    };
+    if let Some((source, reply)) = reply {
         control::record_run_reply(&dbtx, s.id(), conv, source, &rid, &reply)?;
     }
     dbtx.commit()?;
@@ -365,7 +394,13 @@ fn existing_dispatch(
     let Some((owner, node, slot, request)) = saved else {
         return Ok(None);
     };
-    if owner != conversation || request.is_some_and(|old| old != args.to_string()) {
+    if owner != conversation
+        || request.is_some_and(|old| {
+            let supplied = args.to_string();
+            old != supplied
+                && old.strip_prefix("sha256:") != Some(s1::request_digest(&supplied).as_str())
+        })
+    {
         bail!("run identity conflict")
     }
     Ok(Some(
@@ -375,7 +410,11 @@ fn existing_dispatch(
 
 // A caller's optional family exclusion is an additional preference. The
 // persisted slot that authored the work always determines reviewer independence.
-fn author_family(db: &Connection, conversation: &str, run: Option<&str>) -> Result<String> {
+pub(crate) fn author_family(
+    db: &Connection,
+    conversation: &str,
+    run: Option<&str>,
+) -> Result<String> {
     let mut stmt = db.prepare(
         "SELECT q.model_family FROM service_requirements q JOIN runs r USING(run_id)
          WHERE r.conversation_id=?1 AND q.role IN ('architect','implementer')
@@ -392,7 +431,7 @@ fn author_family(db: &Connection, conversation: &str, run: Option<&str>) -> Resu
     Ok(family)
 }
 
-fn strings(arg: &Value, k: &str) -> Result<Vec<String>> {
+pub(crate) fn strings(arg: &Value, k: &str) -> Result<Vec<String>> {
     match arg.get(k) {
         None | Some(Value::Null) => Ok(vec![]),
         Some(Value::String(s)) => Ok(vec![s.clone()]),
@@ -851,10 +890,15 @@ pub(crate) fn finish(
         .as_ref()
         .filter(|n| status == "succeeded" && !n.answer.is_empty())
         .map_or(summary, |n| n.answer.as_str());
+    let observed = if status == "succeeded" && native.as_ref().is_none_or(|n| n.answer.is_empty()) {
+        distillation::screen_finding(transcript, s.distiller.is_some())
+    } else {
+        None
+    };
     let mut receipt = RunReceipt {
         run_id: id.to_owned(),
         final_state: status.to_owned(),
-        executive_summary: summary.chars().take(400).collect(),
+        executive_summary: observed.unwrap_or_else(|| summary.chars().take(400).collect()),
         artifact_refs: vec![],
         s0_transcript_pointer: format!("node:{}/run:{id}/transcript.jsonl", s.node()),
     };
@@ -870,7 +914,7 @@ pub(crate) fn finish(
         receipt.executive_summary = draft.executive_summary;
         receipt.artifact_refs = draft.artifact_refs;
     }
-    if let Some(reason) = abandoned {
+    if let Some(reason) = &abandoned {
         receipt.executive_summary =
             format!("Owner closed an unconfirmed run. Earlier effects are unknown. {reason}");
     }
@@ -883,6 +927,41 @@ pub(crate) fn finish(
         "UPDATE service_claims SET phase='finished',updated_at=? WHERE run_id=?",
         params![now(), id],
     )?;
+    if status == "failed" && abandoned.is_none() {
+        if let Some(until) = native.as_ref().and_then(|out| out.rate_limit) {
+            let progress = native
+                .as_ref()
+                .map(|n| n.answer.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(&receipt.executive_summary);
+            // A run hook can provide a more specific checkpoint and reset time.
+            tx.execute(
+                "INSERT OR IGNORE INTO service_rate_limits VALUES(?,?,?)",
+                params![id, until, progress.chars().take(380).collect::<String>()],
+            )?;
+        }
+        let limit = tx
+            .query_row(
+                "SELECT resets_at,checkpoint FROM service_rate_limits WHERE run_id=?",
+                [id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((until, checkpoint)) = limit {
+            let slot: String = tx.query_row(
+                "SELECT target_slot_id FROM runs WHERE run_id=?",
+                [id],
+                |r| r.get(0),
+            )?;
+            slot_reports::cooldown(&tx, &slot, until)?;
+            push(
+                &tx,
+                id,
+                "quota_checkpoint",
+                &json!({"run_id":id,"resets_at":until,"checkpoint":checkpoint}),
+            )?;
+        }
+    }
     if let Some(n) = native {
         tx.execute(
             "UPDATE runs SET native_session_ref=? WHERE run_id=?",
@@ -891,6 +970,7 @@ pub(crate) fn finish(
     }
     push(&tx, id, "run_receipt", &json!(receipt))?;
     tx.commit()?;
+    s.distill_wake.notify_one();
     s.account_locks
         .lock()
         .map_err(|_| anyhow!("lock registry unavailable"))?

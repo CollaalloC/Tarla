@@ -1,31 +1,26 @@
 use crate::{invalid, private_dir, Herdr};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    ffi::OsStr,
     fs::{self, OpenOptions},
-    io::{self, Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpListener},
+    io::{self, Read},
     path::{Path, PathBuf},
     process::Stdio,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    process::{Child, Command},
+    process::Command,
     time::{sleep, timeout},
 };
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct PinnedTool {
     version: String,
     file: String,
     sha256: String,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Manifest {
     tools: BTreeMap<String, PinnedTool>,
 }
@@ -42,6 +37,7 @@ fn component(id: &str) -> bool {
 }
 
 /// Trust root is the operator's installed private manifest. Nothing resolves from PATH.
+#[derive(Clone)]
 pub struct Toolchain {
     bin: PathBuf,
     manifest: Manifest,
@@ -117,7 +113,7 @@ impl Toolchain {
     }
 }
 
-fn clean_command(program: &Path) -> Command {
+pub(crate) fn clean_command(program: &Path) -> Command {
     let mut cmd = Command::new(program);
     cmd.env_clear()
         .stdin(Stdio::null())
@@ -191,354 +187,4 @@ pub fn credential_environment(
         _ => "TARLA_SLOT_HOME",
     };
     Ok(BTreeMap::from([(key.to_owned(), dir)]))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum NetworkSpec {
-    ReuseHostNetwork,
-    EasyTier {
-        network_name: String,
-        secret_env: String,
-        peers: Vec<String>,
-    },
-    EasyTierStatic {
-        network_name: String,
-        secret_env: String,
-        peers: Vec<String>,
-        ipv4: String,
-    },
-    Tailscale,
-}
-pub struct ManagedNetwork {
-    child: Child,
-    socks5: SocketAddr,
-    record: PathBuf,
-    pid: u32,
-}
-impl ManagedNetwork {
-    pub fn proxy_url(&self) -> String {
-        format!("socks5h://{}", self.socks5)
-    }
-    pub fn is_running(&mut self) -> io::Result<bool> {
-        Ok(self.child.try_wait()?.is_none())
-    }
-}
-impl Drop for ManagedNetwork {
-    fn drop(&mut self) {
-        let ours = fs::read(&self.record)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| v["pid"].as_u64())
-            == Some(u64::from(self.pid));
-        if ours {
-            let _ = fs::remove_file(&self.record);
-        }
-    }
-}
-
-fn write_record(path: &Path, data: &[u8]) -> io::Result<()> {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let tmp = path.with_extension(format!("{}-{suffix}.tmp", std::process::id()));
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(&tmp)?;
-    let result = (|| {
-        file.write_all(data)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(tmp);
-    }
-    result
-}
-
-async fn socks_ready(addr: SocketAddr) -> bool {
-    let handshake = async {
-        let mut stream = TcpStream::connect(addr).await?;
-        stream.write_all(&[5u8, 1, 0]).await?;
-        let mut reply = [0u8; 2];
-        stream.read_exact(&mut reply).await?;
-        io::Result::Ok(reply == [5, 0])
-    };
-    matches!(
-        timeout(Duration::from_millis(400), handshake).await,
-        Ok(Ok(true))
-    )
-}
-
-/// Start an owned network process in userspace, then publish its actual private
-/// endpoint only after a successful SOCKS handshake. A separate tailnet login
-/// is required for a new Tailscale state, using this workspace's local socket.
-pub async fn start_network(
-    tools: &Toolchain,
-    runtime: &Path,
-    spec: &NetworkSpec,
-) -> io::Result<Option<ManagedNetwork>> {
-    start_network_impl(tools, runtime, spec, None, None).await
-}
-
-pub struct NetworkPorts {
-    pub api: SocketAddr,
-    pub easytier_listen: Option<SocketAddr>,
-}
-
-impl From<SocketAddr> for NetworkPorts {
-    fn from(api: SocketAddr) -> Self {
-        Self {
-            api,
-            easytier_listen: None,
-        }
-    }
-}
-
-/// Publish only the authenticated API port through a managed userspace mesh.
-/// Both backends connect incoming tailnet/overlay TCP flows to local IPv4
-/// loopback on the same port. Tailscale's grants are set by the tailnet admin.
-pub async fn start_network_for(
-    tools: &Toolchain,
-    runtime: &Path,
-    spec: &NetworkSpec,
-    ports: impl Into<NetworkPorts>,
-) -> io::Result<Option<ManagedNetwork>> {
-    let NetworkPorts {
-        api,
-        easytier_listen,
-    } = ports.into();
-    if !api.is_ipv4() || !(api.ip().is_loopback() || api.ip().is_unspecified()) || api.port() == 0 {
-        return Err(invalid(
-            "managed mesh ingress requires a bound IPv4 loopback-compatible API address",
-        ));
-    }
-    start_network_impl(tools, runtime, spec, Some(api.port()), easytier_listen).await
-}
-
-fn easytier_identity(runtime: &Path) -> io::Result<uuid::Uuid> {
-    let file = runtime.join("easytier-instance");
-    match fs::read_to_string(&file) {
-        Ok(id) => uuid::Uuid::parse_str(id.trim())
-            .map_err(|_| invalid("invalid saved EasyTier instance id")),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let id = uuid::Uuid::new_v4();
-            write_record(&file, id.to_string().as_bytes())?;
-            Ok(id)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-fn address_config(spec: &NetworkSpec) -> io::Result<String> {
-    if let NetworkSpec::EasyTierStatic { ipv4, .. } = spec {
-        let (ip, prefix) = ipv4.split_once('/').unwrap_or((ipv4, "24"));
-        let ip = ip
-            .parse::<Ipv4Addr>()
-            .map_err(|_| invalid("invalid EasyTier IPv4 address"))?;
-        let prefix = prefix
-            .parse::<u8>()
-            .map_err(|_| invalid("invalid EasyTier prefix length"))?;
-        if ip.is_loopback()
-            || ip.is_unspecified()
-            || ip.is_multicast()
-            || ip.is_broadcast()
-            || prefix == 0
-            || prefix > 32
-        {
-            return Err(invalid("invalid EasyTier virtual IPv4 CIDR"));
-        }
-        return Ok(format!("dhcp = false\nipv4 = \"{ip}/{prefix}\""));
-    }
-    Ok("dhcp = true".into())
-}
-
-async fn start_network_impl(
-    tools: &Toolchain,
-    runtime: &Path,
-    spec: &NetworkSpec,
-    api_port: Option<u16>,
-    easytier_listen: Option<SocketAddr>,
-) -> io::Result<Option<ManagedNetwork>> {
-    if matches!(spec, NetworkSpec::ReuseHostNetwork) {
-        return Ok(None);
-    }
-    private_dir(runtime)?;
-    let runtime = runtime.canonicalize()?;
-    let reserve = || TcpListener::bind((Ipv4Addr::LOCALHOST, 0));
-    let socks_guard = reserve()?;
-    let socks = socks_guard.local_addr()?;
-    let rpc_guard = reserve()?;
-    let rpc_addr = rpc_guard.local_addr()?;
-    let mut config = None;
-    let (mut cmd, name, rpc) = match spec {
-        NetworkSpec::ReuseHostNetwork => unreachable!(),
-        NetworkSpec::EasyTier {
-            network_name,
-            secret_env,
-            peers,
-        }
-        | NetworkSpec::EasyTierStatic {
-            network_name,
-            secret_env,
-            peers,
-            ..
-        } => {
-            if network_name.is_empty() || secret_env.is_empty() {
-                return Err(invalid("EasyTier requires a private network identity"));
-            }
-            let secret = crate::secrets::resolve(secret_env).await?;
-            if secret.is_empty() {
-                return Err(invalid("EasyTier secret must be nonempty"));
-            }
-            // v2.7.0's --socks5 accepts only a port and binds 0.0.0.0. Use
-            // the structured config to explicitly constrain SOCKS to loopback.
-            let q = |s: &str| serde_json::to_string(s).map_err(io::Error::from);
-            let listen = easytier_listen.unwrap_or_else(|| (Ipv4Addr::UNSPECIFIED, 0).into());
-            let mut toml = format!(
-                concat!(
-                    "instance_id = \"{}\"\n{}\nlisteners = [\"tcp://{}\"]\n",
-                    "socks5_proxy = \"socks5://{}\"\n",
-                    "tcp_whitelist = [\"{}\"]\nudp_whitelist = [\"0\"]\n",
-                    "[network_identity]\nnetwork_name = {}\nnetwork_secret = {}\n",
-                    // With no kernel TUN there are no overlay routes to exclude.
-                    // Pinning a connector to a physical NIC prevents loopback
-                    // (and some split-routed) bootstrap addresses from working.
-                    "[flags]\nno_tun = true\nbind_device = false\nprivate_mode = true\n"
-                ),
-                easytier_identity(&runtime)?,
-                address_config(spec)?,
-                listen,
-                socks,
-                api_port.unwrap_or(0),
-                q(network_name)?,
-                q(&secret)?
-            );
-            for peer in peers {
-                toml.push_str(&format!("[[peer]]\nuri = {}\n", q(peer)?));
-            }
-            let mut c = clean_command(&tools.verified("easytier")?);
-            c.args([
-                "--config-file",
-                "-",
-                "--disable-env-parsing",
-                "--rpc-portal",
-                &rpc_addr.to_string(),
-            ])
-            .stdin(Stdio::piped());
-            config = Some(toml);
-            (c, "easytier", rpc_addr.to_string())
-        }
-        NetworkSpec::Tailscale => {
-            let mut c = clean_command(&tools.verified("tailscale")?);
-            // The host may trust a private CA for a self-hosted Headscale server.
-            for key in ["SSL_CERT_FILE", "SSL_CERT_DIR"] {
-                if let Some(value) = std::env::var_os(key) {
-                    c.env(key, value);
-                }
-            }
-            #[cfg(not(windows))]
-            let socket = runtime.join("ts.sock").into_os_string();
-            #[cfg(windows)]
-            let socket = std::ffi::OsString::from(format!(
-                r"\\.\pipe\tarla-ts-{:x}",
-                Sha256::digest(runtime.to_string_lossy().as_bytes())
-            ));
-            let state = runtime.join("ts.state");
-            c.args([
-                OsStr::new("--tun=userspace-networking"),
-                OsStr::new("--state"),
-                state.as_os_str(),
-                OsStr::new("--socket"),
-                &socket,
-            ])
-            .arg("--port=0")
-            .arg(format!("--socks5-server={socks}"));
-            (c, "tailscale", socket.to_string_lossy().into_owned())
-        }
-    };
-    let err_log = runtime.join(format!("{name}.log"));
-    let mut opts = OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let log = opts.open(err_log)?;
-    cmd.current_dir(&runtime)
-        .stdout(Stdio::from(log.try_clone()?))
-        .stderr(Stdio::from(log))
-        .kill_on_drop(true);
-    #[cfg(target_os = "linux")]
-    cmd.as_std_mut().prctl_parent_death();
-    drop((socks_guard, rpc_guard));
-    let mut child = cmd.spawn()?;
-    if let Some(toml) = config {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| invalid("no private config pipe"))?;
-        stdin.write_all(toml.as_bytes()).await?;
-        stdin.shutdown().await?;
-    }
-    let pid = child.id().ok_or_else(|| invalid("missing sidecar pid"))?;
-    timeout(Duration::from_secs(12), async {
-        loop {
-            if let Some(status) = child.try_wait()? {
-                return Err(io::Error::other(format!(
-                    "{name} exited ({status}); inspect private runtime log"
-                )));
-            }
-            if socks_ready(socks).await {
-                break;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-        io::Result::Ok(())
-    })
-    .await??;
-    let record = runtime.join(format!("{name}.json"));
-    write_record(
-        &record,
-        &serde_json::to_vec(&json!({"pid":pid,"socks5":socks,"rpc":rpc,"api_port":api_port}))?,
-    )?;
-    Ok(Some(ManagedNetwork {
-        child,
-        socks5: socks,
-        pid,
-        record,
-    }))
-}
-
-// A workspace-owned network daemon cannot outlive tarlad on Linux. Herdr's
-// holder processes deliberately do outlive it and are not started this way.
-#[cfg(target_os = "linux")]
-trait LinuxChild {
-    fn prctl_parent_death(&mut self);
-}
-#[cfg(target_os = "linux")]
-impl LinuxChild for std::process::Command {
-    fn prctl_parent_death(&mut self) {
-        use std::os::unix::process::CommandExt;
-        let parent = std::process::id();
-        unsafe {
-            self.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::getppid() as u32 != parent {
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "parent exited"));
-                }
-                Ok(())
-            });
-        }
-    }
 }

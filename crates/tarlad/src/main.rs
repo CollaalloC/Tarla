@@ -1,14 +1,18 @@
 mod api;
+mod authority;
 mod control;
+mod distillation;
 mod drafts;
 mod facts;
 mod fleet;
 mod handoff;
 mod hooks;
 mod launch;
+mod local_distiller;
 mod local_endpoint;
 mod maintenance;
 mod peers;
+mod s1;
 mod skills;
 mod slot_reports;
 mod terminal;
@@ -28,6 +32,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
+    future::IntoFuture,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -53,6 +58,8 @@ struct Args {
 }
 
 struct Service {
+    distiller: Option<local_distiller::LocalDistiller>,
+    distill_wake: tokio::sync::Notify,
     memory_index: Option<tarla_memory::MnemosyneIndex>,
     hosted_index: Option<tarla_memory::HostedIndex>,
     transcripts: transcript::Captures,
@@ -72,10 +79,17 @@ struct Service {
     sync_wake: tokio::sync::Notify,
     receipt_wake: tokio::sync::Notify,
     context_wake: tokio::sync::Notify,
+    reload: tokio::sync::Notify,
+    authority_change: std::sync::Mutex<()>,
+    retired: std::sync::atomic::AtomicBool,
 }
 type S = Arc<Service>;
 impl Service {
     fn db(&self) -> Result<Connection> {
+        anyhow::ensure!(
+            !self.retired.load(std::sync::atomic::Ordering::Acquire),
+            "authority changed; reconnect"
+        );
         let c = Connection::open(&self.db_path)?;
         c.busy_timeout(Duration::from_secs(5))?;
         c.pragma_update(None, "foreign_keys", true)?;
@@ -208,11 +222,12 @@ fn main() -> Result<()> {
             .context("missing pinned launch record")?;
         std::process::exit(handoff::helper(Path::new(&path))?);
     }
-    serve()
+    while serve()? {}
+    Ok(())
 }
 
 #[tokio::main]
-async fn serve() -> Result<()> {
+async fn serve() -> Result<bool> {
     let a = Args::parse();
     if a.publish_local_endpoint && !a.listen.ip().is_loopback() {
         bail!("local endpoint discovery requires a loopback listener");
@@ -251,8 +266,14 @@ async fn serve() -> Result<()> {
     let mut initial = tarla_memory::open(&db_path, &a.workspace)?;
     initial.execute_batch(MIGRATIONS)?;
     initial.execute_batch(launch::SCHEMA)?;
+    initial.execute_batch(s1::SCHEMA)?;
     drafts::migrate(&mut initial)?;
     peers::check_term(&mut initial, &ws)?;
+    initial.execute_batch(tarla_workspace::authority::SCHEMA)?;
+    let identity = &ws.config.workspace;
+    if identity.node_id == identity.supervisor_node_id && identity.role_mode != "executor_only" {
+        tarla_workspace::authority::ensure_signer(&mut initial, identity)?;
+    }
     facts::configure(&mut initial, &conf, &ws.config.workspace.node_id)?;
     let slots = fleet::load(&conf, &ws, &home)?;
     let peers = peers::load(&conf, &ws)?;
@@ -351,6 +372,13 @@ async fn serve() -> Result<()> {
     )
     .with_window_budget(ws.config.context_policy.supervisor_active_budget_tokens);
     let mut hosted_index = None;
+    let distiller = ws
+        .config
+        .memory
+        .distiller
+        .as_ref()
+        .map(local_distiller::LocalDistiller::new)
+        .transpose()?;
     let memory_index = match ws.config.memory.primary_backend.as_str() {
         "builtin_sqlite" => None,
         "mnemosyne" => {
@@ -385,6 +413,8 @@ async fn serve() -> Result<()> {
         actual.to_string()
     };
     let service = Arc::new(Service {
+        distiller,
+        distill_wake: Default::default(),
         memory_index,
         hosted_index,
         local_url: format!("http://{host}"),
@@ -404,6 +434,9 @@ async fn serve() -> Result<()> {
         sync_wake: Default::default(),
         receipt_wake: Default::default(),
         context_wake: Default::default(),
+        reload: Default::default(),
+        authority_change: Default::default(),
+        retired: Default::default(),
     });
 
     let routes = Router::new()
@@ -456,9 +489,13 @@ async fn serve() -> Result<()> {
         None
     };
     tokio::spawn(fleet::worker(service.clone()));
+    authority::start(&service);
     peers::start_s2_notifications(&service);
+    s1::startup(&service);
     tokio::spawn(peers::replicate(service.clone()));
+    tokio::spawn(handoff::transfers(service.clone()));
     tokio::spawn(control::deliver_receipts(service.clone()));
+    tokio::spawn(distillation::worker(service.clone()));
     tokio::spawn(maintenance::maintain_context(service.clone()));
     if service.hosted_index.is_some() {
         tokio::spawn(control::publish_memories(service.clone()));
@@ -469,10 +506,23 @@ async fn serve() -> Result<()> {
         service.node(),
         actual
     );
-    axum::serve(listener, routes.layer(DefaultBodyLimit::max(128 * 1024)))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
-    Ok(())
+    let server = axum::serve(listener, routes.layer(DefaultBodyLimit::max(128 * 1024)))
+        .with_graceful_shutdown(shutdown_signal());
+    tokio::select! {
+        result=server.into_future()=>{result?;Ok(false)},
+        _=service.reload.notified()=>Ok(true),
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        tokio::select! {
+            _ = term.recv() => (),
+            _ = tokio::signal::ctrl_c() => (),
+        }
+        return;
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }

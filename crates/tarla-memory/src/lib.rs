@@ -1,5 +1,7 @@
 //! The SQLite file belongs to one workspace on one host. Replication sends revisions,
 //! never the file or its WAL. Executor and supervisor authorization is enforced by tarlad.
+mod replica;
+pub use replica::{ReplicaReply, ReplicaRequest};
 mod hosted;
 pub use hosted::{HostedIndex, Projection};
 mod mnemosyne;
@@ -26,7 +28,7 @@ pub fn open(path: &Path, workspace: &str) -> Result<Connection> {
             tx.execute_batch(include_str!("schema.sql"))?;
             tx.execute("INSERT INTO workspace_identity VALUES(1,?1)", [workspace])?;
         }
-        1..=3 => verify_workspace(&tx, workspace)?,
+        1..=4 => verify_workspace(&tx, workspace)?,
         version => bail!("unsupported database schema version {version}"),
     }
     if version < 2 {
@@ -44,6 +46,10 @@ pub fn open(path: &Path, workspace: &str) -> Result<Connection> {
             CREATE TRIGGER index_dag_summary AFTER INSERT ON context_dag_nodes BEGIN
                 INSERT INTO dag_search(rowid,summary_text) VALUES(NEW.rowid,NEW.summary_text); END;")?;
         tx.pragma_update(None, "user_version", 3)?;
+    }
+    if version < 4 {
+        replica::migrate(&tx)?;
+        tx.pragma_update(None, "user_version", 4)?;
     }
     tx.commit()?;
     Ok(db)
@@ -267,6 +273,11 @@ fn validate_clock(clock: &Hlc) -> Result<()> {
     Ok(())
 }
 
+/// Stamp an outgoing mutation in the same transaction that durably enqueues it.
+pub fn next_local_hlc(tx: &Transaction<'_>, node: &str) -> Result<Hlc> {
+    merge_clock(tx, node, None)
+}
+
 fn merge_clock(tx: &Transaction<'_>, node: &str, remote: Option<&Hlc>) -> Result<Hlc> {
     let (local_p, local_l): (i64, i64) = tx
         .query_row(
@@ -297,7 +308,7 @@ fn merge_clock(tx: &Transaction<'_>, node: &str, remote: Option<&Hlc>) -> Result
     })
 }
 
-fn persist_revision(tx: &Transaction<'_>, item: &Memory) -> Result<()> {
+fn materialize(tx: &Transaction<'_>, item: &Memory) -> Result<()> {
     tx.execute("INSERT INTO memories(memory_id,workspace_id,scope,content,content_hash,version,hlc_timestamp,updated_by,is_deleted,sync_seq,updated_at)
         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
         ON CONFLICT(memory_id) DO UPDATE SET scope=excluded.scope,content=excluded.content,content_hash=excluded.content_hash,
@@ -305,9 +316,17 @@ fn persist_revision(tx: &Transaction<'_>, item: &Memory) -> Result<()> {
         sync_seq=excluded.sync_seq,updated_at=excluded.updated_at",
         params![item.memory_id,item.workspace_id,item.scope,item.content,item.content_hash,item.version,
             serde_json::to_string(&item.hlc_timestamp)?,item.updated_by,item.is_deleted,item.sync_seq,item.updated_at])?;
+    Ok(())
+}
+
+fn persist_revision(tx: &Transaction<'_>, item: &Memory) -> Result<()> {
+    materialize(tx, item)?;
+    let previous =
+        replica::checkpoint(tx, item.sync_seq - 1)?.context("missing preceding S2 revision")?;
+    let raw = serde_json::to_string(item)?;
     tx.execute(
-        "INSERT INTO memory_changes VALUES(?1,?2,?3)",
-        params![item.sync_seq, item.memory_id, serde_json::to_string(item)?],
+        "INSERT INTO memory_changes(sync_seq,memory_id,revision_json,history_hash) VALUES(?1,?2,?3,?4)",
+        params![item.sync_seq, item.memory_id, raw, replica::extend(&previous.hash, &raw)],
     )?;
     Ok(())
 }
@@ -346,30 +365,36 @@ fn apply_proposal(
     Ok(item)
 }
 
+/// Validate proposed content before queueing or authoritative version assignment.
+pub fn validate_mutation(p: &Mutation) -> Result<()> {
+    ensure!(
+        !p.memory_id.trim().is_empty()
+            && !p.proposal_id.trim().is_empty()
+            && !p.source_node_id.trim().is_empty(),
+        "missing proposal identity"
+    );
+    ensure!(
+        p.scope == "global"
+            || p.scope
+                .strip_prefix("project:")
+                .is_some_and(|s| !s.trim().is_empty()),
+        "invalid memory scope"
+    );
+    ensure!(
+        p.base_version >= 0
+            && p.content.len() <= 65536
+            && (p.is_deleted || !p.content.trim().is_empty()),
+        "invalid proposal content or version"
+    );
+    if let Some(clock) = &p.hlc_timestamp {
+        validate_clock(clock)?;
+    }
+    Ok(())
+}
+
 impl MemoryBackend for SqliteMemory<'_> {
     fn propose_mutation(&mut self, p: &Mutation) -> Result<MutationResult> {
-        ensure!(
-            !p.memory_id.trim().is_empty()
-                && !p.proposal_id.trim().is_empty()
-                && !p.source_node_id.trim().is_empty(),
-            "missing proposal identity"
-        );
-        ensure!(
-            p.scope == "global"
-                || p.scope
-                    .strip_prefix("project:")
-                    .is_some_and(|s| !s.trim().is_empty()),
-            "invalid memory scope"
-        );
-        ensure!(
-            p.base_version >= 0
-                && p.content.len() <= 65536
-                && (p.is_deleted || !p.content.trim().is_empty()),
-            "invalid proposal content or version"
-        );
-        if let Some(clock) = &p.hlc_timestamp {
-            validate_clock(clock)?;
-        }
+        validate_mutation(p)?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

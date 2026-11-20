@@ -93,7 +93,11 @@ pub async fn create_run(State(s): State<S>, Json(v): Json<Value>) -> Api {
     Ok(Json(fleet::dispatch(&s, cid, &v, rid)?))
 }
 pub fn one(s: &Service, id: &str) -> Result<Value> {
-    list(&s.db()?,"SELECT run_id,workspace_id,conversation_id,supervisor_term,target_node_id,target_slot_id,desired_state,observed_state,json_extract(mission_packet_json,'$.objective') AS objective,hc_terminal_id,receipt_summary,artifacts_json,created_at,updated_at FROM runs WHERE run_id=?",&[&id])?.pop().context("unknown run")
+    list(&s.db()?,"SELECT r.run_id,r.workspace_id,r.conversation_id,r.supervisor_term,r.target_node_id,r.target_slot_id,
+        r.desired_state,r.observed_state,json_extract(r.mission_packet_json,'$.objective') AS objective,r.hc_terminal_id,
+        r.receipt_summary,r.artifacts_json,r.created_at,r.updated_at,t.state AS handoff_state,t.successor AS successor_run_id,
+        t.last_error AS handoff_detail,o.predecessor AS predecessor_run_id FROM runs r
+        LEFT JOIN service_turn_transfers t USING(run_id) LEFT JOIN service_resume_origins o USING(run_id) WHERE r.run_id=?",&[&id])?.pop().context("unknown run")
 }
 pub async fn get_run(State(s): State<S>, Route(id): Route<String>) -> Api {
     Ok(Json(one(&s, &id).map_err(|e| {
@@ -102,8 +106,17 @@ pub async fn get_run(State(s): State<S>, Route(id): Route<String>) -> Api {
 }
 pub async fn cancel(State(s): State<S>, Route(id): Route<String>) -> Api {
     ensure_supervisor(&s)?;
-    let c = s.db()?;
-    if c.execute("UPDATE runs SET desired_state='cancelled' WHERE run_id=? AND observed_state NOT IN ('succeeded','failed','cancelled')",[&id])?!=1{return Err(ApiError(StatusCode::CONFLICT,"run is absent or already terminal".into()))}
+    let mut db = s.db()?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let pending=tx.execute("UPDATE service_turn_transfers SET state='cancelled',last_error=NULL WHERE run_id=? AND state='pending'",[&id])?;
+    let running=tx.execute("UPDATE runs SET desired_state='cancelled' WHERE run_id=? AND observed_state NOT IN ('succeeded','failed','cancelled')",[&id])?;
+    if running + pending == 0 {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "run is absent or already terminal".into(),
+        ));
+    }
+    tx.commit()?;
     s.notify.notify_waiters();
     Ok(Json(one(&s, &id)?))
 }
@@ -152,7 +165,7 @@ pub async fn facts(State(s): State<S>) -> Api {
 pub async fn actions(State(s): State<S>) -> Api {
     let c = s.db()?;
     let mut a=list(&c,"SELECT a.approval_id AS id,CASE WHEN o.approval_id IS NULL THEN 'approval' ELSE 'terminal_input' END AS kind,a.tool_or_cmd AS title,a.run_id,a.node_id,a.risk_reason,a.created_at FROM approvals a LEFT JOIN service_osc o ON a.approval_id=o.approval_id WHERE a.resolution='pending'",&[])?;
-    a.extend(list(&c,"SELECT c.candidate_id AS id,'memory_conflict' AS kind,c.memory_id AS title,c.memory_id,c.base_version,coalesce(m.version,0) AS current_version,coalesce(m.content,'') AS content,c.proposed_text,c.created_at FROM memory_candidates c LEFT JOIN memories m USING(memory_id) WHERE c.status='pending'",&[])?);
+    a.extend(list(&c,"SELECT c.candidate_id AS id,'memory_conflict' AS kind,json_extract(d.request_json,'$.memory_id') AS title,json_extract(d.request_json,'$.memory_id') AS memory_id,c.base_version,coalesce(m.version,0) AS current_version,coalesce(m.content,'') AS content,c.proposed_text,c.created_at FROM memory_candidates c JOIN memory_candidate_details d USING(candidate_id) LEFT JOIN memories m ON m.memory_id=json_extract(d.request_json,'$.memory_id') WHERE c.status='pending'",&[])?);
     for slot in fleet::snapshots(&s)? {
         if let SlotHealth::AuthExpired { message } = slot.health {
             a.push(json!({"id":format!("auth:{}:{}",slot.node_id,slot.slot_id),"kind":"auth_expired","title":message,"slot_id":slot.slot_id,"node_id":slot.node_id}))
@@ -231,6 +244,19 @@ pub fn resolve_local_approval(s: &Service, id: &str, v: &str) -> Result<Value> {
             .optional()?;
         if prior.as_deref() != Some(v) {
             bail!("approval is no longer pending for an active run")
+        }
+    }
+    if n == 1 {
+        let run: Option<String> = tx
+            .query_row(
+                "SELECT run_id FROM approvals WHERE approval_id=? AND node_id=?",
+                params![id, s.node()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(run) = run {
+            let event = json!({"run_id":run,"approval_id":id,"resolution":v});
+            tx.execute("INSERT INTO outbox_events(event_id,run_id,event_type,payload_json,created_at) VALUES(?,?,'approval_resolved',?,?)",params![uid(),run,event.to_string(),now()])?;
         }
     }
     tx.commit()?;

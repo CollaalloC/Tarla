@@ -8,24 +8,27 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+from time import monotonic
 
 from acceptance import Node, free_port, until
+from overlay import record, recover_child, request, unreachable
 
 
 def configure(node, peer, local_ip, peer_ip, seeds, listen=None):
     bin_dir = node.home / "bin"
     executable = bin_dir / "easytier" / "2.7.0" / "easytier-core"
-    executable.parent.mkdir(parents=True)
-    shutil.copy2(os.environ["TARLA_TEST_EASYTIER"], executable)
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    if not executable.exists():
+        shutil.copy2(os.environ["TARLA_TEST_EASYTIER"], executable)
     (bin_dir / "toolchain-manifest.json").write_text(json.dumps({"tools": {"easytier": {
         "version": "2.7.0", "file": executable.name,
         "sha256": hashlib.sha256(executable.read_bytes()).hexdigest()}}}))
     cfg = node.dir / "workspace.toml"
     body = (cfg.read_text()
             .replace("enable_easytier = false", "enable_easytier = true")
-            .replace('easytier_network_name = ""', 'easytier_network_name = "tarla-mesh-test"')
+            .replace('easytier_network_name = ""', f'easytier_network_name = "tarla-{node.workspace}-mesh"')
             .replace('easytier_network_secret_ref = ""',
-                     'easytier_network_secret_ref = "env:TARLA_TEST_NETWORK_KEY"'
+                     f'easytier_network_secret_ref = "env:TARLA_TEST_NETWORK_KEY_{node.workspace.upper()}"'
                      + f'\neasytier_ipv4 = "{local_ip}/24"\neasytier_peers = ' + json.dumps(seeds)))
     if listen:
         body = body.replace("enable_easytier = true",
@@ -58,7 +61,8 @@ def run(tmp):
     b = Node(tmp / "b", "worker", "executor_only")
     ip_a, ip_b = "10.74.63.1", "10.74.63.2"
     secret = secrets.token_hex(32)
-    os.environ["TARLA_TEST_NETWORK_KEY"] = secrets.token_hex(32)
+    os.environ["TARLA_TEST_NETWORK_KEY_WORK"] = secrets.token_hex(32)
+    os.environ["TARLA_TEST_NETWORK_KEY_LIFE"] = secrets.token_hex(32)
     listen = f"127.0.0.1:{free_port()}"
     seed = "tcp://" + listen
     configure(a, b, ip_a, ip_b, [], listen=listen)
@@ -93,7 +97,36 @@ def run(tmp):
         a.api("/v1/memories", {**memory, "content": "both restarted", "base_version": 2})
         until(lambda: any(m["content"] == "both restarted" for m in b.api("/v1/memories")),
               "rediscover the fixed seed after both nodes restart")
-        print("PASS two paired daemons exchanged memory over EasyTier before and after both nodes restarted")
+        # Two installations each host work and life simultaneously on overlapping
+        # subnets. Life's executor is even given work's seed as another candidate.
+        c = Node(a.home, "chief", "supervisor_only", workspace="life")
+        d = Node(b.home, "worker", "executor_only", workspace="life")
+        life_secret = secrets.token_hex(32)
+        ip_c, ip_d = "10.74.63.3", "10.74.63.4"
+        life_listen = f"127.0.0.1:{free_port()}"
+        configure(c, d, ip_c, ip_d, [], listen=life_listen)
+        configure(d, c, ip_d, ip_c, ["tcp://" + life_listen, seed])
+        cleanup.callback(c.stop)
+        cleanup.callback(d.stop)
+        c.start(life_secret)
+        d.start(life_secret)
+        c.api("/v1/memories", {**memory, "content": "life only"})
+        until(lambda: any(m["content"] == "life only" for m in d.api("/v1/memories")), "independent life overlay")
+        assert len({record(n,"easytier")["socks5"] for n in (a,b,c,d)}) == 4
+        assert len({(n.dir / "runtime/easytier-instance").read_text() for n in (a,b,c,d)}) == 4
+        assert request(d, "easytier", ip_c, c.port, c.token, "life")[0] == 200
+        assert request(b, "easytier", ip_a, a.port, c.token)[0] == 401
+        assert request(b, "easytier", ip_a, a.port, a.token, "life")[0] == 409
+        unreachable(d, "easytier", ip_a, a.port)
+        unreachable(b, "easytier", ip_c, c.port)
+        unreachable(b, "easytier", ip_a, c.port)  # wrong local service on the same host
+        started = recover_child(b, "easytier", b.home / "bin/easytier/2.7.0/easytier-core")
+        a.api("/v1/memories", {**memory, "content": "transport recovered", "base_version": 3})
+        until(lambda: any(m["content"] == "transport recovered" for m in b.api("/v1/memories")),
+              "work recovers with the original tarlad/SOCKS address", timeout=45)
+        elapsed = monotonic() - started
+        assert [m["content"] for m in d.api("/v1/memories")] == ["life only"]
+        print(f"PASS four workspace daemons on two isolated EasyTier meshes; native child recovery, including replication, {elapsed:.2f}s")
 
 
 if __name__ == "__main__":

@@ -75,6 +75,23 @@ jobs:
       - name: Atomic dispatch, reviewer provenance and independent receipt delivery
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: python3 tests/dispatch_recovery.py
+      - name: Signed supervisor recovery and retirement
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: python3 tests/authority_recovery.py
+      - name: Cross-node claim and acknowledged event recovery
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: python3 tests/s1_reconciliation.py
+      - name: Four-stage scheduler and durable S2 fork recovery
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: |
+          python3 tests/stage2_scheduler.py
+          python3 tests/s2_recovery.py
+      - name: Automatic completion lesson and offline mirror
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: python3 tests/stage2_distillation.py
+      - name: Three network-isolated hosts with a partitioned mirror
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: sudo --preserve-env=TARLA_TEST_HC unshare --mount --net --propagation private python3 tests/stage2_network_hosts.py
       - name: Workspace skill activation
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: python3 tests/skills.py

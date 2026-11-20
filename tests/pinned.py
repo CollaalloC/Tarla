@@ -31,7 +31,9 @@ if session.exists():
 else:
     expected=str(uuid.uuid4())
     session.write_text(expected)
-if packet["objective"]=="wait": time.sleep(2)
+if packet["objective"]=="wait":
+    pathlib.Path("waiting").touch()
+    while not pathlib.Path("release").exists(): time.sleep(.05)
 with open("calls", "a") as f: print(json.dumps([key,args,expected]),file=f)
 if codex:
     assert args[0]=="exec" and "--json" in args
@@ -71,14 +73,20 @@ def check(tmp, hc):
              data=json.dumps({"mode":"pinned","node_id":"worker","slot_id":"codex","workdir":str(work)}).encode(),
              headers={"Content-Type":"application/json","Authorization":"Bearer "+chief.token})
         HTTP.open(bind).close()
-        one=chat("wait","c1")["run_id"]
-        try:
-            chat("/switch claude","busy")
-            raise AssertionError("switched active turn")
-        except HTTPError as e:
-            assert e.code in (400,409) and b"still active" in e.read()
+        one=chat("start","c1")["run_id"]
         wait_turn(one)
-        wait_turn(chat("continue","c2")["run_id"])
+        waiting=chat("wait","c2")["run_id"]
+        until(lambda: (work / "waiting").exists(),"active native turn")
+        pending=json.loads(chat("/switch claude","busy")["reply"])
+        assert pending["handoff"]=="pending" and pending["after_run_id"]==waiting
+        chief.stop()
+        chief.start(secret)
+        assert json.loads(chat("/switch claude","busy")["reply"])==pending
+        assert chief.api("/v1/conversations")[0]["pinned_slot_id"]=="codex"
+        (work/"release").touch()
+        wait_turn(waiting)
+        until(lambda: chief.api("/v1/runs/"+waiting)["handoff_state"]=="applied","deferred switch")
+        assert chief.api("/v1/conversations")[0]["pinned_slot_id"]=="claude"
         token=remote.api("/v1/slots/codex/telemetry-token",{})["token"]
         payload={"health":"healthy","window_used_pct":97,"node_id":"worker","slot_id":"codex"}
         try:

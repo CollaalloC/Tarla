@@ -158,6 +158,17 @@ pub async fn receive(
             "invalid peer authentication".into(),
         ));
     }
+    if v["workspace_id"] == s.id() {
+        if op == "authority_state" {
+            let public = tarla_workspace::authority::known(&s.db()?, s.supervisor(), s.term())?;
+            return Ok(Json(
+                json!({"workspace_id":s.id(),"supervisor":s.supervisor(),"term":s.term(),"public":public}),
+            ));
+        }
+        if op == "authority_update" {
+            return Ok(Json(authority::receive(&s, node, &v)?));
+        }
+    }
     if v["workspace_id"] != s.id() || v["term"] != s.term() {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -190,6 +201,19 @@ pub async fn receive(
                 s.sync_wake.notify_one();
             }
             json!({"workspace_id":s.id(),"term":s.term()})
+        }
+        "s1_pull" => {
+            if node != s.supervisor() || s.is_supervisor() {
+                return Err(ApiError(
+                    StatusCode::FORBIDDEN,
+                    "only the designated supervisor can reconcile this executor".into(),
+                ));
+            }
+            let mut result =
+                s1::batch(&s.db()?, v["cursor"].as_i64().context("missing S1 cursor")?)?;
+            result["workspace_id"] = json!(s.id());
+            result["term"] = json!(s.term());
+            result
         }
         "ticket" | "log" | "resolve" | "forward" => {
             if node != s.supervisor() {
@@ -248,13 +272,41 @@ fn sync(s: &Service, node: &str, v: &Value) -> Result<Value> {
             .into_iter()
             .filter(|r| r["node_id"] != node),
     );
-    let ack = accept_events(
-        &tx,
-        s,
-        node,
-        v["events"].as_array().context("expected event batch")?,
-    )?;
-    let assignments=list(&tx,"SELECT r.run_id,r.conversation_id,r.target_slot_id,r.desired_state,r.observed_state,r.mission_packet_json,p.workdir AS pinned_workdir,e.epoch AS pin_epoch FROM runs r LEFT JOIN service_run_paths p USING(run_id) LEFT JOIN service_pin_epochs e USING(run_id) WHERE target_node_id=? AND observed_state NOT IN ('failed','succeeded','cancelled') ORDER BY created_at,run_id",&[&node])?;
+    let ordered = v.get("s1_cursor").is_some();
+    let (frontier, ack) = if ordered {
+        s1::accept(&tx, s, node, v)?
+    } else {
+        (
+            0,
+            accept_events(
+                &tx,
+                s,
+                node,
+                v["events"].as_array().context("expected event batch")?,
+            )?,
+        )
+    };
+    let page = if ordered {
+        v["assignment_after"].as_str().unwrap_or("")
+    } else {
+        ""
+    };
+    let limit = if ordered { 16_i64 } else { -1 };
+    let mut assignments=list(&tx,"SELECT r.run_id,r.supervisor_term,r.conversation_id,r.target_slot_id,r.desired_state,r.observed_state,r.mission_packet_json,p.workdir AS pinned_workdir,e.epoch AS pin_epoch,
+        b.scope AS lesson_scope,b.base_version AS lesson_base,o.predecessor AS resume_from
+        FROM runs r LEFT JOIN service_run_paths p USING(run_id) LEFT JOIN service_pin_epochs e USING(run_id)
+        LEFT JOIN service_lesson_baselines b USING(run_id) LEFT JOIN service_resume_origins o USING(run_id)
+        WHERE target_node_id=? AND r.run_id>? AND observed_state NOT IN ('failed','succeeded','cancelled') ORDER BY r.run_id LIMIT ?",&[&node,&page,&limit])?;
+    let next_page = if ordered && assignments.len() == 16 {
+        string(assignments.last().unwrap(), "run_id")?.to_owned()
+    } else {
+        String::new()
+    };
+    if ordered {
+        for row in &mut assignments {
+            s1::certify(&tx, s, node, row)?;
+        }
+    }
     tx.commit()?;
     if v["events"]
         .as_array()
@@ -263,12 +315,25 @@ fn sync(s: &Service, node: &str, v: &Value) -> Result<Value> {
         s.receipt_wake.notify_one();
     }
     let cursor = v["cursor"].as_i64().context("missing memory cursor")?;
-    let delta = SqliteMemory::new(&mut db, s.id(), s.node()).pull_delta_since(cursor, 32)?;
+    let mut memory = SqliteMemory::new(&mut db, s.id(), s.node());
+    let (delta, s2) = if let Some(proof) = v.get("s2") {
+        let req: tarla_memory::ReplicaRequest = serde_json::from_value(proof.clone())?;
+        let reply = memory.answer_replica(node, &req)?;
+        memory_changed(s, memory.sync_cursor()?);
+        (vec![], Some(reply))
+    } else {
+        (memory.pull_delta_since(cursor, 32)?, None)
+    };
     Ok(
-        json!({"workspace_id":s.id(),"term":s.term(),"ack":ack,"assignments":assignments,"delta":delta,"facts":advertised}),
+        json!({"workspace_id":s.id(),"term":s.term(),"s1_cursor":frontier,"assignment_after":next_page,"ack":ack,"assignments":assignments,"delta":delta,"s2":s2,"facts":advertised}),
     )
 }
-fn accept_events(c: &Connection, s: &Service, node: &str, events: &[Value]) -> Result<Vec<String>> {
+pub(super) fn accept_events(
+    c: &Connection,
+    s: &Service,
+    node: &str,
+    events: &[Value],
+) -> Result<Vec<String>> {
     if events.len() > 24 {
         bail!("too many events")
     }
@@ -285,6 +350,21 @@ fn accept_events(c: &Connection, s: &Service, node: &str, events: &[Value]) -> R
         if owner != node {
             bail!("event does not own that run")
         }
+        let digest =
+            s1::request_digest(&json!([id, e["event_type"], e["payload_json"]]).to_string());
+        let previous:Option<(String,Option<String>)>=c.query_row(
+            "SELECT i.run_id,d.digest FROM service_inbox i LEFT JOIN service_event_digests d USING(event_id) WHERE i.event_id=?",
+            [eid],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if let Some((original, previous)) = previous {
+            anyhow::ensure!(
+                original == id && previous.is_none_or(|d| d == digest),
+                "conflicting reused outbox event id"
+            );
+        }
+        c.execute(
+            "INSERT OR IGNORE INTO service_event_digests VALUES(?,?)",
+            params![eid, digest],
+        )?;
         if c.execute(
             "INSERT OR IGNORE INTO service_inbox VALUES(?,?)",
             params![eid, id],
@@ -296,7 +376,18 @@ fn accept_events(c: &Connection, s: &Service, node: &str, events: &[Value]) -> R
             }
             let terminal = matches!(state.as_str(), "succeeded" | "failed" | "cancelled");
             match string(e, "event_type")? {
-                "state_changed" if !terminal => {
+                "run_claimed" => s1::accept_claim(c, id, string(&p, "claim_id")?)?,
+                "quota_checkpoint" => handoff::accept_quota(c, s, id, &p)?,
+                "approval_resolved" => {
+                    let decision = string(&p, "resolution")?;
+                    anyhow::ensure!(
+                        matches!(decision, "approved" | "rejected"),
+                        "invalid approval resolution"
+                    );
+                    c.execute("UPDATE approvals SET resolution=?,resolved_at=?,resolved_by='paired_user' WHERE approval_id=? AND run_id=? AND resolution='pending'",
+                              params![decision,now(),string(&p,"approval_id")?,id])?;
+                }
+                "state_changed" if !terminal && node != s.node() => {
                     let next = string(&p, "state")?;
                     if !matches!(next, "running" | "unconfirmed" | "blocked") {
                         bail!("unknown executor state")
@@ -323,6 +414,14 @@ fn accept_events(c: &Connection, s: &Service, node: &str, events: &[Value]) -> R
                         serde_json::from_value::<RunReceipt>(p)?,
                         s.ws.config.context_policy.run_receipt_max_tokens,
                     )?;
+                    anyhow::ensure!(
+                        matches!(r.final_state.as_str(), "failed" | "succeeded" | "cancelled"),
+                        "receipt requires a terminal state"
+                    );
+                    anyhow::ensure!(
+                        r.s0_transcript_pointer == format!("node:{node}/run:{id}/transcript.jsonl"),
+                        "invalid S0 origin"
+                    );
                     if terminal && state != r.final_state {
                         bail!("conflicting terminal state")
                     }
@@ -346,11 +445,11 @@ fn accept_events(c: &Connection, s: &Service, node: &str, events: &[Value]) -> R
 }
 pub async fn replicate(s: S) {
     loop {
-        if let Err(e) = hooks::flush_memory(&s).await {
-            eprintln!("memory proposal deferred: {e}")
-        }
         if let Err(e) = round(&s).await {
             eprintln!("replication deferred: {e}")
+        }
+        if let Err(e) = hooks::flush_memory(&s).await {
+            eprintln!("memory proposal deferred: {e}")
         }
         tokio::select! {_=s.sync_wake.notified()=>(),_=s.notify.notified()=>(),_=tokio::time::sleep(Duration::from_millis(900))=>()}
     }
@@ -379,7 +478,22 @@ async fn round(s: &Service) -> Result<()> {
     }
     let p = {
         let mut c = s.db()?;
-        json!({"cursor":SqliteMemory::new(&mut c,s.id(),s.node()).sync_cursor()?,"slots":fleet::local_slots(s)?,"slot_paths":s.slots.iter().filter(|_|s.can_execute()).map(|p|(&p.snapshot.slot_id,p.workdir.to_string_lossy())).collect::<BTreeMap<_,_>>(),"events":pending(&c)?,"facts":facts::local(&c,s.node())?})
+        let mut memory = SqliteMemory::new(&mut c, s.id(), s.node());
+        let mut payload: Value = json!({"cursor":memory.sync_cursor()?,"s2":memory.replica_request(s.term())?,"slots":fleet::local_slots(s)?,"slot_paths":s.slots.iter().filter(|_|s.can_execute()).map(|p|(&p.snapshot.slot_id,p.workdir.to_string_lossy())).collect::<BTreeMap<_,_>>(),"facts":facts::local(&c,s.node())?});
+        let after = s1::sent(&c, s.supervisor())?;
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(s1::batch(&c, after)?.as_object().unwrap().clone());
+        let page: Option<String> = c
+            .query_row(
+                "SELECT after_run FROM service_assignment_pages WHERE peer=?",
+                [s.supervisor()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        payload["assignment_after"] = json!(page.unwrap_or_default());
+        payload
     };
     let response = call(s, s.supervisor(), "sync", &p).await?;
     if response["workspace_id"] != s.id() || response["term"] != s.term() {
@@ -438,18 +552,9 @@ async fn round(s: &Service) -> Result<()> {
             }
         } else {
             fleet::insert_run(&tx, s, conv, s.node(), slot, &packet)?;
-            if let Some(path) = item["pinned_workdir"].as_str() {
-                tx.execute(
-                    "INSERT INTO service_pin_epochs VALUES(?,?)",
-                    params![id, item["pin_epoch"].as_str().unwrap_or("legacy")],
-                )?;
-                tx.execute(
-                    "INSERT INTO service_run_paths VALUES(?,?)",
-                    params![id, path],
-                )?;
-            }
-            fleet::claim(&tx, s, id)?;
+            s1::apply_metadata(&tx, id, item)?;
         }
+        s1::save_offer(&tx, s, id, item, current.is_empty())?;
         if item["desired_state"] == "cancelled" {
             tx.execute(
                 "UPDATE runs SET desired_state='cancelled' WHERE run_id=?",
@@ -491,10 +596,57 @@ async fn round(s: &Service) -> Result<()> {
             params![now(), eid],
         )?;
     }
+    if let Some(next) = response["s1_cursor"].as_i64() {
+        let max: i64 = tx.query_row(
+            "SELECT coalesce(max(seq),0) FROM service_s1_sequence",
+            [],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(
+            next >= 0 && next <= max,
+            "supervisor S1 cursor exceeds local history"
+        );
+        tx.execute(
+            "UPDATE outbox_events SET acked_at=? WHERE acked_at IS NULL AND event_id IN
+            (SELECT event_id FROM service_s1_sequence WHERE seq<=?)",
+            params![now(), next],
+        )?;
+        tx.execute("INSERT INTO service_s1_delivery VALUES(?,?) ON CONFLICT(supervisor) DO UPDATE SET seq=excluded.seq",params![s.supervisor(),next])?;
+        if next < max {
+            s.sync_wake.notify_one();
+        }
+    } else if let Some(seq) = p["events"]
+        .as_array()
+        .and_then(|v| v.last())
+        .and_then(|e| e["seq"].as_i64())
+    {
+        if response["ack"]
+            .as_array()
+            .is_some_and(|a| a.len() == p["events"].as_array().unwrap().len())
+        {
+            tx.execute("INSERT INTO service_s1_delivery VALUES(?,?) ON CONFLICT(supervisor) DO UPDATE SET seq=excluded.seq",params![s.supervisor(),seq])?;
+        }
+    }
+    if let Some(page) = response["assignment_after"].as_str() {
+        tx.execute("INSERT INTO service_assignment_pages VALUES(?,?) ON CONFLICT(peer) DO UPDATE SET after_run=excluded.after_run",params![s.supervisor(),page])?;
+        if !page.is_empty() {
+            s.sync_wake.notify_one();
+        }
+    }
     tx.commit()?;
-    let delta: Vec<Memory> = serde_json::from_value(response["delta"].clone())?;
-    SqliteMemory::new(&mut c, s.id(), s.node()).apply_delta(&delta)?;
-    if delta.len() == 32 {
+    let mut memory = SqliteMemory::new(&mut c, s.id(), s.node());
+    let more = if !response["s2"].is_null() {
+        memory.consume_replica_reply(
+            s.term(),
+            &serde_json::from_value(p["s2"].clone())?,
+            &serde_json::from_value(response["s2"].clone())?,
+        )?
+    } else {
+        let delta: Vec<Memory> = serde_json::from_value(response["delta"].clone())?;
+        memory.apply_delta(&delta)?;
+        delta.len() == 32
+    };
+    if more {
         s.sync_wake.notify_one();
     }
     Ok(())

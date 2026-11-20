@@ -96,6 +96,19 @@ pub fn store(s: &Service, slot: &str, raw: &Value) -> Result<()> {
     } else {
         json!({})
     };
+    // A new sample belongs to the new window once the preceding reset has passed.
+    // Keeping the expired reset would incorrectly zero even a fresh 100% measurement.
+    for (usage, reset) in [
+        ("window_used_pct", "window_resets_at"),
+        ("weekly_used_pct", "weekly_resets_at"),
+    ] {
+        if report.contains_key(usage)
+            && !report.contains_key(reset)
+            && out[reset].as_i64().is_some_and(|end| end <= ts)
+        {
+            out[reset] = Value::Null;
+        }
+    }
     let mut changed = false;
     for (k, v) in report {
         match k.as_str() {
@@ -128,5 +141,15 @@ pub fn store(s: &Service, slot: &str, raw: &Value) -> Result<()> {
     tx.execute("INSERT INTO service_telemetry VALUES(?,?,?) ON CONFLICT(slot_id) DO UPDATE SET report=excluded.report,updated_at=excluded.updated_at",params![slot,out.to_string(),ts])?;
     tx.commit()?;
     s.notify.notify_waiters();
+    Ok(())
+}
+
+pub fn cooldown(db: &Connection, slot: &str, until: i64) -> Result<()> {
+    let health = serde_json::to_string(&SlotHealth::CoolingDown {
+        resets_at_unix: until,
+    })?;
+    db.execute("INSERT INTO service_telemetry(slot_id,report,updated_at) VALUES(?,json_object('health',json(?)),?)
+        ON CONFLICT(slot_id) DO UPDATE SET report=json_set(report,'$.health',json(?)),updated_at=excluded.updated_at",
+        params![slot,health,now(),health])?;
     Ok(())
 }

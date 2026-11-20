@@ -1,12 +1,11 @@
 //! Private workspace-owned execution and network sidecars.
 mod herdr;
 mod managed;
+mod network;
 mod secrets;
 pub use herdr::{Herdr, TerminalEvent, TerminalReader, TerminalStatus, TerminalWriter};
-pub use managed::{
-    credential_environment, start_network, start_network_for, try_lock_slot, ManagedNetwork,
-    NetworkPorts, NetworkSpec, Toolchain,
-};
+pub use managed::{credential_environment, try_lock_slot, Toolchain};
+pub use network::{start_network, start_network_for, ManagedNetwork, NetworkPorts, NetworkSpec};
 
 use std::{fs, io, path::Path};
 pub(crate) fn invalid(s: impl Into<String>) -> io::Error {

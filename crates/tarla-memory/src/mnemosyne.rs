@@ -89,6 +89,9 @@ impl MnemosyneIndex {
         lock.lock()?;
         let tx = db.transaction()?;
         let seq = cursor(&tx)?;
+        let history = super::replica::checkpoint(&tx, seq)?
+            .context("missing source history")?
+            .hash;
         let rebuild = if self.database.exists() {
             let index =
                 Connection::open_with_flags(&self.database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -110,7 +113,14 @@ impl MnemosyneIndex {
                     owner == workspace,
                     "Mnemosyne projection belongs to a different workspace"
                 );
+                let has_history: bool = index.query_row(
+                    "SELECT exists(SELECT 1 FROM pragma_table_info('tarla_projection') WHERE name='history_hash')",
+                    [], |r| r.get(0))?;
                 current != seq
+                    || !has_history
+                    || index.query_row("SELECT history_hash FROM tarla_projection", [], |r| {
+                        r.get::<_, String>(0)
+                    })? != history
             }
         } else {
             true
@@ -128,7 +138,7 @@ impl MnemosyneIndex {
         let mut input = tempfile::tempfile_in(&self.private_config)?;
         serde_json::to_writer(
             &input,
-            &json!({"db":self.database,"workspace":workspace,"cursor":seq,
+            &json!({"db":self.database,"workspace":workspace,"cursor":seq,"history_hash":history,
             "records":records,"rebuild":rebuild,"query":query,"limit":limit}),
         )?;
         input.seek(SeekFrom::Start(0))?;

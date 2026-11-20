@@ -4,9 +4,17 @@ use tarla_scheduler::{
     select_best_slot, select_handoff, AgentRole, AgentSlotSnapshot, TaskRequirement, TurnBoundary,
 };
 
+#[path = "native_resume.rs"]
+mod native_resume;
+#[path = "transfer.rs"]
+mod transfer;
+pub use transfer::{accept_quota, commit_continuation, record_limit, worker as transfers};
+
+fn active_turn(db: &Connection, conv: &str) -> Result<Option<String>> {
+    Ok(db.query_row("SELECT r.run_id FROM runs r JOIN service_run_paths p USING(run_id) WHERE r.conversation_id=? AND r.observed_state NOT IN ('failed','succeeded','cancelled') LIMIT 1",[conv],|r|r.get(0)).optional()?)
+}
 fn idle(db: &Connection, conv: &str) -> Result<()> {
-    let pending:Option<String>=db.query_row("SELECT r.run_id FROM runs r JOIN service_run_paths p USING(run_id) WHERE r.conversation_id=? AND r.observed_state NOT IN ('failed','succeeded','cancelled') LIMIT 1",[conv],|r|r.get(0)).optional()?;
-    if let Some(run) = pending {
+    if let Some(run) = active_turn(db, conv)? {
         bail!("Pinned turn {run} is still active or unconfirmed. Wait for its receipt before sending or switching.")
     }
     Ok(())
@@ -103,9 +111,53 @@ fn req(s: &Service) -> TaskRequirement {
     }
 }
 
+fn matches_target(slot: &AgentSlotSnapshot, target: &str) -> bool {
+    target.is_empty()
+        || slot.slot_id == target
+        || slot.driver == target
+        || format!("{}/{}", slot.node_id, slot.slot_id) == target
+}
+fn destination<'a>(
+    require: &TaskRequirement,
+    slots: &'a [AgentSlotSnapshot],
+    node: &str,
+    slot: &str,
+    target: &str,
+    allow_current: bool,
+) -> Option<&'a AgentSlotSnapshot> {
+    let old = slots
+        .iter()
+        .find(|s| s.node_id == node && s.slot_id == slot);
+    let choices: Vec<_> = slots
+        .iter()
+        .filter(|s| matches_target(s, target))
+        .cloned()
+        .collect();
+    let selected = if let Some(old) = old {
+        select_handoff(require, old, &choices, TurnBoundary::Checkpointed, now())
+            .map(|h| h.slot)
+            .or_else(|| {
+                (allow_current && !target.is_empty() && matches_target(old, target))
+                    .then(|| select_best_slot(require, std::slice::from_ref(old), now()))
+                    .flatten()
+            })
+    } else {
+        select_best_slot(require, &choices, now())
+    }?;
+    slots
+        .iter()
+        .find(|s| s.node_id == selected.node_id && s.slot_id == selected.slot_id)
+}
+
 /// Commits switches at an acknowledged turn boundary. Retrying a source message
 /// observes the same switch even if its reply was interrupted by a restart.
-fn switch(s: &Service, conv: &str, target: &str, source: &str) -> Result<String> {
+fn switch(
+    s: &Service,
+    conv: &str,
+    target: &str,
+    source: &str,
+    followup: Option<&str>,
+) -> Result<String> {
     let mut c = s.db()?;
     let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some((saved_conv, ans)) = tx
@@ -121,45 +173,38 @@ fn switch(s: &Service, conv: &str, target: &str, source: &str) -> Result<String>
         }
         return Ok(ans);
     }
-    idle(&tx, conv)?;
     let (node, slot, _) =
         current(&tx, conv)?.context("pin the conversation before switching slots")?;
-    let slots = fleet::snapshots(s)?;
-    let old = slots
-        .iter()
-        .find(|x| x.node_id == node && x.slot_id == slot);
-    let matches = |s: &AgentSlotSnapshot| {
-        target.is_empty()
-            || s.slot_id == target
-            || s.driver == target
-            || format!("{}/{}", s.node_id, s.slot_id) == target
-    };
-    let candidates = slots
-        .iter()
-        .filter(|x| matches(x))
-        .cloned()
-        .collect::<Vec<_>>();
-    let selected = if let Some(old) = old {
-        select_handoff(&req(s), old, &candidates, TurnBoundary::Checkpointed, now())
-            .map(|h| h.slot)
-            .or_else(|| {
-                (!target.is_empty() && matches(old))
-                    .then(|| select_best_slot(&req(s), std::slice::from_ref(old), now()))
-                    .flatten()
-            })
+    let ans = if let Some(run) = active_turn(&tx, conv)? {
+        if !target.is_empty()
+            && !fleet::snapshots(s)?
+                .iter()
+                .any(|slot| matches_target(slot, target))
+        {
+            bail!("unknown destination slot");
+        }
+        let changed = tx.execute("INSERT INTO service_turn_transfers(run_id,target,prompt,manual_source) VALUES(?,?,?,?)
+                 ON CONFLICT(run_id) DO UPDATE SET target=excluded.target,prompt=excluded.prompt,manual_source=excluded.manual_source
+                 WHERE state='pending' AND (manual_source IS NULL OR manual_source=excluded.manual_source)",
+            params![run,target,followup,source])?;
+        if changed == 0 {
+            bail!("a different switch is already pending for this turn")
+        }
+        json!({"mode":"pinned", "handoff":"pending", "after_run_id":run, "target":target})
+            .to_string()
     } else {
-        select_best_slot(&req(s), &candidates, now())
-    }
-    .context("no eligible destination slot")?;
-    change(
-        &tx,
-        conv,
-        &selected.node_id,
-        &selected.slot_id,
-        &path_for(s, selected)?,
-    )?;
-    let ans =
-        json!({"mode":"pinned","node_id":selected.node_id,"slot_id":selected.slot_id}).to_string();
+        let slots = fleet::snapshots(s)?;
+        let selected = destination(&req(s), &slots, &node, &slot, target, true)
+            .context("no eligible destination slot")?;
+        change(
+            &tx,
+            conv,
+            &selected.node_id,
+            &selected.slot_id,
+            &path_for(s, selected)?,
+        )?;
+        json!({"mode":"pinned","node_id":selected.node_id,"slot_id":selected.slot_id}).to_string()
+    };
     tx.execute(
         "INSERT INTO service_handoffs VALUES(?,?,?)",
         params![source, conv, ans],
@@ -185,6 +230,7 @@ pub fn pinned(
             conv,
             command.strip_prefix("/switch").unwrap().trim(),
             source,
+            None,
         )?));
     }
     let Some((node, slot, _)) = binding else {
@@ -194,8 +240,9 @@ pub fn pinned(
         let (target, rest) = mention
             .split_once(char::is_whitespace)
             .unwrap_or((mention, ""));
-        let reply = switch(s, conv, target, source)?;
-        if rest.trim().is_empty() {
+        let followup = (!rest.trim().is_empty()).then_some(rest.trim());
+        let reply = switch(s, conv, target, source, followup)?;
+        if followup.is_none() || serde_json::from_str::<Value>(&reply)?["handoff"] == "pending" {
             return Ok(Some(reply));
         }
         prompt = rest.trim()
@@ -205,7 +252,9 @@ pub fn pinned(
             .iter()
             .find(|x| x.node_id == node && x.slot_id == slot);
         if old.is_none_or(|x| select_best_slot(&req(s), std::slice::from_ref(x), now()).is_none()) {
-            switch(s, conv, "", source)?;
+            if active_turn(&db, conv)?.is_none() {
+                switch(s, conv, "", source, None)?;
+            }
         }
     }
     let (node, slot, path) = current(&db, conv)?.context("binding changed")?;
@@ -246,6 +295,10 @@ pub fn register(
     path: &str,
     arg: &Value,
 ) -> Result<()> {
+    if db.query_row("SELECT EXISTS(SELECT 1 FROM service_turn_transfers t JOIN runs r USING(run_id)
+        WHERE r.conversation_id=? AND t.state='pending' AND t.run_id IN (SELECT run_id FROM service_run_paths))",[conv],|r|r.get::<_,bool>(0))? {
+        bail!("a turn-boundary handoff is pending for this conversation")
+    }
     idle(db, conv)?;
     let current = current(db, conv)?.context("conversation is no longer pinned")?;
     let (ep, _) = epoch(db, conv)?;
@@ -271,6 +324,8 @@ struct Launch {
     argv: Vec<String>,
     driver: String,
     expected: Option<String>,
+    #[serde(default)]
+    workdir: Option<PathBuf>,
 }
 fn metadata_path(root: &Path, id: &str) -> PathBuf {
     root.join("runtime/pinned").join(format!("{id}.result"))
@@ -320,7 +375,8 @@ fn argv_for(slot: &fleet::Slot, prompt: String, session: Option<&str>) -> Result
     Ok(args)
 }
 pub fn launch(s: &Service, job: &Value, slot: &fleet::Slot, prompt: String) -> Result<Vec<String>> {
-    if job["pinned_workdir"].is_null() || !native(&slot.snapshot.driver) {
+    let pinned = job["pinned_workdir"].is_string();
+    if !native(&slot.snapshot.driver) || (!pinned && argv_for(slot, String::new(), None).is_err()) {
         let mut args = slot.argv.clone();
         args.push(prompt);
         return Ok(args);
@@ -336,7 +392,18 @@ pub fn launch(s: &Service, job: &Value, slot: &fleet::Slot, prompt: String) -> R
         )
         .optional()?
         .unwrap_or_else(|| "legacy".into());
-    let session:Option<String>=db.query_row("SELECT r.native_session_ref FROM runs r JOIN service_run_paths p USING(run_id) LEFT JOIN service_pin_epochs e USING(run_id) WHERE r.conversation_id=? AND r.target_node_id=? AND r.target_slot_id=? AND p.workdir=? AND coalesce(e.epoch,'legacy')=? AND r.native_session_ref IS NOT NULL ORDER BY r.rowid DESC LIMIT 1",params![conv,s.node(),slot.snapshot.slot_id,job["pinned_workdir"].as_str(),ep],|r|r.get(0)).optional()?;
+    let prior: Option<String> = if pinned {
+        db.query_row("SELECT r.native_session_ref FROM runs r JOIN service_run_paths p USING(run_id) LEFT JOIN service_pin_epochs e USING(run_id) WHERE r.conversation_id=? AND r.target_node_id=? AND r.target_slot_id=? AND p.workdir=? AND coalesce(e.epoch,'legacy')=? AND r.native_session_ref IS NOT NULL ORDER BY r.rowid DESC LIMIT 1",params![conv,s.node(),slot.snapshot.slot_id,job["pinned_workdir"].as_str(),ep],|r|r.get(0)).optional()?
+    } else {
+        None
+    };
+    let session = match prior {
+        Some(id) => Some(id),
+        None => native_resume::session(s, job, slot).unwrap_or_else(|e| {
+            eprintln!("native session unavailable; using bounded checkpoint: {e}");
+            None
+        }),
+    };
     let argv = argv_for(slot, prompt, session.as_deref())?;
     let result = metadata_path(&s.ws.root, id);
     std::fs::create_dir_all(result.parent().unwrap())?;
@@ -347,6 +414,7 @@ pub fn launch(s: &Service, job: &Value, slot: &fleet::Slot, prompt: String) -> R
             argv,
             driver: slot.snapshot.driver.clone(),
             expected: session,
+            workdir: Some(slot.workdir.clone()),
         })?,
     )?;
     Ok(vec![
@@ -362,8 +430,38 @@ pub fn launch(s: &Service, job: &Value, slot: &fleet::Slot, prompt: String) -> R
 pub struct Outcome {
     pub session: Option<String>,
     pub answer: String,
+    #[serde(default)]
+    pub rate_limit: Option<i64>,
 }
 fn extract(driver: &str, v: &Value, out: &mut Outcome) {
+    let failure = matches!(v["type"].as_str(), Some("error" | "turn.failed"))
+        || (v["type"] == "result" && v["is_error"] == true)
+        || v["type"] == "rate_limit_event";
+    let error = &v["error"];
+    let limited = [
+        error.get("code"),
+        error.get("type"),
+        v.get("error"),
+        v.get("code"),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| {
+        matches!(
+            value.as_str(),
+            Some("rate_limit_error" | "rate_limit_exceeded" | "usage_limit_reached" | "429")
+        ) || value.as_i64() == Some(429)
+    }) || error["status"].as_i64() == Some(429)
+        || v["status"].as_i64() == Some(429)
+        || (v["type"] == "rate_limit_event" && v["rate_limit_info"]["status"] == "rejected");
+    if failure && limited {
+        out.rate_limit = Some(
+            error["resets_at"]
+                .as_i64()
+                .or(v["rate_limit_info"]["resetsAt"].as_i64())
+                .unwrap_or_else(|| now() + 300),
+        );
+    }
     let session = if driver == "codex" {
         if v["type"] == "item.completed" && v["item"]["type"] == "agent_message" {
             if let Some(s) = v["item"]["text"].as_str() {
@@ -420,7 +518,10 @@ pub fn helper(path: &Path) -> Result<i32> {
         std::io::stdout().write_all(&buf)?;
     }
     let code = p.wait()?.code().unwrap_or(1);
-    if out.session.is_some() && (plan.expected.is_none() || out.session == plan.expected) {
+    if plan.expected.is_some() && out.session != plan.expected {
+        out.session = None;
+    }
+    if out.session.is_some() || (code != 0 && out.rate_limit.is_some()) {
         let tmp = path.with_extension("result.tmp");
         std::fs::write(&tmp, serde_json::to_vec(&out)?)?;
         std::fs::rename(tmp, path.with_extension("result"))?;

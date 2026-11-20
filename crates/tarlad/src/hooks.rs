@@ -117,6 +117,14 @@ pub async fn callback(
             tx.commit()?;
             json!({"stored":true})
         }
+        "rate-limit" => {
+            let mut db = s.db()?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            require_active(&tx, &id, s.node())?;
+            handoff::record_limit(&tx, &id, &v)?;
+            tx.commit()?;
+            json!({"stored":true})
+        }
         "telemetry" => {
             slot_reports::store(&s, string(&row, "target_slot_id")?, &v)?;
             json!({"stored":true})
@@ -131,7 +139,7 @@ pub fn queue_proposal(s: &Service, v: &Value, run: Option<&str>) -> Result<Value
         .map(String::from)
         .unwrap_or_else(uid);
     validate_id(&key)?;
-    let proposal = Mutation {
+    let mut proposal = Mutation {
         proposal_id: format!("{:x}", Sha256::digest(format!("{}:{key}", s.node()))),
         memory_id: string(v, "memory_id")?.into(),
         scope: v["scope"].as_str().unwrap_or("global").into(),
@@ -140,12 +148,9 @@ pub fn queue_proposal(s: &Service, v: &Value, run: Option<&str>) -> Result<Value
         source_node_id: s.node().into(),
         source_run_id: run.map(String::from),
         is_deleted: v["operation"] == "archive",
-        hlc_timestamp: Some(tarla_memory::Hlc {
-            physical_ms: now() * 1000,
-            logical: 0,
-            node_id: s.node().into(),
-        }),
+        hlc_timestamp: None,
     };
+    tarla_memory::validate_mutation(&proposal)?;
     let mut c = s.db()?;
     let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     if let Some(id) = run {
@@ -171,6 +176,7 @@ pub fn queue_proposal(s: &Service, v: &Value, run: Option<&str>) -> Result<Value
             return Ok(serde_json::from_str(&result)?);
         }
     } else {
+        proposal.hlc_timestamp = Some(tarla_memory::next_local_hlc(&tx, s.node())?);
         tx.execute(
             "INSERT INTO service_proposals VALUES(?,?,NULL)",
             params![proposal.proposal_id, serde_json::to_string(&proposal)?],
@@ -211,6 +217,7 @@ pub fn apply(s: &Service, node: &str, p: &Mutation) -> Result<Value> {
         }
     }
     let mut c = s.db()?;
+    distillation::verify(&c, node, p)?;
     let result = SqliteMemory::new(&mut c, s.id(), s.node()).propose_mutation(p)?;
     peers::mutation_committed(s, &result);
     Ok(json!(result))

@@ -5,10 +5,12 @@ use fs2::FileExt;
 use rusqlite::{params, Connection, OpenFlags};
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
     path::{Path, PathBuf},
 };
-use tarla_workspace::{validate_name, Workspace};
+use tarla_workspace::{
+    authority::{self, set_config},
+    validate_name, Workspace,
+};
 use tempfile::NamedTempFile;
 
 #[derive(Subcommand)]
@@ -20,10 +22,20 @@ pub enum Operation {
         #[arg(long)]
         snapshot: PathBuf,
     },
+    /// Save a recoverable supervisor ledger while retaining the incumbent.
+    Backup {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        snapshot: PathBuf,
+    },
     /// Import a handover ledger into a freshly initialized supervisor on its designated node.
     Restore {
         #[arg(long)]
         snapshot: PathBuf,
+        /// Explicitly activate a recovery backup after taking the old supervisor offline.
+        #[arg(long)]
+        confirm_old_offline: bool,
     },
     /// Fence old authority locally. Set this on each peer during a manual migration or disaster recovery.
     SetAuthority {
@@ -43,24 +55,6 @@ fn lock(ws: &Workspace) -> Result<File> {
     FileExt::try_lock_exclusive(&file)
         .context("stop this workspace's tarlad before changing authority")?;
     Ok(file)
-}
-fn set_config(ws: &Workspace, supervisor: &str, term: i64, role: &str) -> Result<()> {
-    let path = ws.root.join("workspace.toml");
-    let mut cfg: toml::Value = fs::read_to_string(&path)?.parse()?;
-    let ident = cfg
-        .get_mut("workspace")
-        .and_then(toml::Value::as_table_mut)
-        .context("invalid identity")?;
-    ident.insert("supervisor_node_id".into(), supervisor.into());
-    ident.insert("supervisor_term".into(), term.into());
-    ident.insert("role_mode".into(), role.into());
-    let mut tmp = NamedTempFile::new_in(&ws.root)?;
-    tmp.write_all(toml::to_string_pretty(&cfg)?.as_bytes())?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path)?;
-    #[cfg(unix)]
-    File::open(&ws.root)?.sync_all()?;
-    Ok(())
 }
 fn role(ws: &Workspace, new_supervisor: &str) -> &'static str {
     if ws.config.workspace.node_id != new_supervisor {
@@ -94,7 +88,8 @@ pub fn run(home: &Path, id: &str, op: &Operation) -> Result<()> {
             set_config(&ws, node, *term, role(&ws, node))?;
             println!("Workspace {id} accepts supervisor {node} at term {term}");
         }
-        Operation::Handover { to, snapshot } => {
+        Operation::Handover { to, snapshot } | Operation::Backup { to, snapshot } => {
+            let backup = matches!(op, Operation::Backup { .. });
             validate_name(to)?;
             ensure!(
                 identity.node_id == identity.supervisor_node_id
@@ -114,17 +109,22 @@ pub fn run(home: &Path, id: &str, op: &Operation) -> Result<()> {
                 .filter(|v| !v.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."));
             let tmp = NamedTempFile::new_in(parent)?;
-            let c = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let mut c = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            let (grant, successor_secret) = authority::reserve(&mut c, identity, to)?;
             c.execute(
                 "VACUUM INTO ?1",
                 [tmp.path().to_str().context("invalid snapshot path")?],
             )?;
             drop(c);
             let mut copy = Connection::open(tmp.path())?;
+            copy.pragma_update(None, "secure_delete", true)?;
             let tx = copy.transaction()?;
             // Node-private facts, receipt queues and terminal state stay on the old executor.
             tx.execute_batch("DROP TABLE IF EXISTS handover_manifest;
                 CREATE TABLE handover_manifest(workspace_id TEXT, source TEXT, destination TEXT, term INTEGER);
+                DROP TABLE IF EXISTS handover_activation;
+                CREATE TABLE handover_activation(requires_confirmation INTEGER NOT NULL);
+                DELETE FROM authority_private; DELETE FROM authority_reservation;
                 DELETE FROM outbox_events; DELETE FROM service_claims; DELETE FROM service_peers;
                 DELETE FROM service_leases; DELETE FROM workspace_facts;
                 UPDATE runs SET s0_log_local_path=NULL;
@@ -133,29 +133,66 @@ pub fn run(home: &Path, id: &str, op: &Operation) -> Result<()> {
                 "INSERT INTO handover_manifest VALUES(?,?,?,?)",
                 params![id, identity.node_id, to, new_term],
             )?;
+            // The destination has its own sender sequence. Keep the receiver frontiers,
+            // signatures and original execution claim bindings for reconciliation.
+            for table in [
+                "service_s1_delivery",
+                "service_assignment_pages",
+                "service_s1_sequence",
+                "service_launch_permits",
+                "service_receipt_drafts",
+                "service_proposals",
+                "service_telemetry",
+            ] {
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
+                    [table],
+                    |r| r.get(0),
+                )?;
+                if exists {
+                    tx.execute(&format!("DELETE FROM {table}"), [])?;
+                }
+            }
+            tx.execute(
+                "DELETE FROM sqlite_sequence WHERE name='service_s1_sequence'",
+                [],
+            )?;
+            tx.execute("INSERT INTO handover_activation VALUES(?)", [backup])?;
+            authority::remember(&tx, &grant)?;
+            tx.execute(
+                "INSERT INTO authority_private VALUES(1,?,?,?)",
+                params![to, new_term, successor_secret],
+            )?;
             tx.commit()?;
             copy.execute_batch("PRAGMA journal_mode=DELETE; VACUUM;")?;
             drop(copy);
             tmp.as_file().sync_all()?;
             // Demote before publishing a snapshot that another host can activate.
-            set_config(&ws, to, new_term, "executor_only")?;
+            if !backup {
+                set_config(&ws, to, new_term, "executor_only")?;
+            }
             if let Err(e) = tmp.persist_noclobber(snapshot) {
-                set_config(
-                    &ws,
-                    &identity.supervisor_node_id,
-                    identity.supervisor_term,
-                    &identity.role_mode,
-                )?;
+                if !backup {
+                    set_config(
+                        &ws,
+                        &identity.supervisor_node_id,
+                        identity.supervisor_term,
+                        &identity.role_mode,
+                    )?;
+                }
                 return Err(e.error.into());
             }
             #[cfg(unix)]
             File::open(parent)?.sync_all()?;
             println!(
-                "Frozen {id} at term {new_term}; restore {} on {to}",
+                "Saved {id} ledger for {to} at term {new_term} to {}",
                 snapshot.display()
             );
         }
-        Operation::Restore { snapshot } => {
+        Operation::Restore {
+            snapshot,
+            confirm_old_offline,
+        } => {
             ensure!(
                 !db.exists(),
                 "restore into a freshly initialized workspace to preserve existing node state"
@@ -170,6 +207,18 @@ pub fn run(home: &Path, id: &str, op: &Operation) -> Result<()> {
                 space == id && dest == identity.node_id && term >= identity.supervisor_term,
                 "snapshot is for a different workspace, node or term"
             );
+            let has_activation:bool=from.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='handover_activation')",[],|r|r.get(0))?;
+            if has_activation {
+                let confirmation: bool = from.query_row(
+                    "SELECT requires_confirmation FROM handover_activation",
+                    [],
+                    |r| r.get(0),
+                )?;
+                ensure!(
+                    !confirmation || *confirm_old_offline,
+                    "recovery backup requires --confirm-old-offline"
+                );
+            }
             let check: String = from.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
             ensure!(check == "ok", "snapshot integrity check failed");
             let tmp = NamedTempFile::new_in(&ws.root)?;

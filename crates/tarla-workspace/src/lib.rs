@@ -1,4 +1,5 @@
 //! On-disk workspace identity, private bootstrap files, role profile and skill discovery.
+pub mod authority;
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -63,14 +64,22 @@ impl Default for ContextPolicy {
     }
 }
 #[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DistillerConfig {
+    pub endpoint: String,
+    pub model: String,
+}
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MemoryConfig {
+    pub distiller: Option<DistillerConfig>,
     pub primary_backend: String,
     pub prefetch_token_budget: usize,
 }
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
+            distiller: None,
             primary_backend: "builtin_sqlite".into(),
             prefetch_token_budget: 1200,
         }

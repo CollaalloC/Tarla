@@ -1698,7 +1698,11 @@ name = "tarla-workspace"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
+ "ring",
+ "rusqlite",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
  "uuid",

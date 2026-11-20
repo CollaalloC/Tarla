@@ -87,7 +87,7 @@ tarla --workspace work pair office https://office.example.net --token-env OFFICE
 
 启动两端后，主管根据执行机上报的工位选址。执行机在本地持久化认领，再启动任务。网络断开后，本地 Outbox 保存状态与回执。主管重连时通过同一 `run_id` 对账。S2 记忆保存在执行机本地，可在离线时读取。配对地址须在选定网络上双向可达，SOCKS 出站代理和对端服务的入站地址应分别配置。
 
-计划迁移时先停止旧主管，使用 `tarla supervisor handover --to <new-node> --snapshot <file>` 生成面向指定新机器的账本快照并降级旧主管。在新机器上用同一工作空间名及指定节点名初始化干净目录，再用 `tarla supervisor restore --snapshot <file>` 导入。根据新拓扑配置模型、网关及配对凭证后启动新主管。其余执行机停机调用 `tarla supervisor set-authority --node <new-node> --term <new-term>` 更新主管。手工恢复要求提供新任期，执行节点拒绝旧任期。快照含会话和长期记忆，应经私有通道传输。
+计划迁移时先停止旧主管，使用 `tarla supervisor handover --to <new-node> --snapshot <file>` 生成面向指定新机器的账本快照并降级旧主管。在新机器上用同一工作空间名及指定节点名初始化干净目录，再用 `tarla supervisor restore --snapshot <file>` 导入。根据新拓扑配置模型、网关及配对凭证后启动新主管。已预配新主管并记录原主管公钥的执行机会自动采用签署的更高任期。可用 `tarla supervisor backup` 提前制作灾难恢复备份，详见[主管迁移与恢复](docs/stage2.md#更换主管)。快照含会话和长期记忆，应经私有通道传输。
 
 ## 测试及客户端
 
@@ -102,7 +102,7 @@ python3 tests/acceptance.py
 | 工程规范阶段 | 可以复核的验收内容 | 入口 |
 | --- | --- | --- |
 | 一 · 单机主管 | 156 轮真实接口对话、异步派单与主动回报、宿主 Herdr 隔离、执行器重启与消息重放 | [单机使用与验收](docs/stage1.md) · [长会话测试](tests/stage1_history.py) · [执行恢复测试](tests/executor_recovery.py) |
-| 二 · 配对与同步 | 在独立进程间同步 S2 记忆，断线补传和重启对账，验证限时终端票据及工位交接 | [核心 CI](https://github.com/CollaalloC/Tarla/actions/workflows/check.yml) · [双网配置](docs/managed-networks.md) · [双节点延迟实测](docs/replication-latency.md) · [工位验收](tests/pinned.py) |
+| 二 · 配对与同步 | 在独立进程间同步 S2 记忆，断线补传和重启对账，验证限时终端票据及工位交接 | [双机使用与验收](docs/stage2.md) · [双网配置](docs/managed-networks.md) · [双节点延迟实测](docs/replication-latency.md) · [工位验收](tests/pinned.py) |
 | 三 · 网关与客户端 | 对话、任务、审批和记忆的客户端接口，四个 IM 平台的入站和出站协议，以及原生应用构建和模拟器启动 | [客户端对真实守护进程的测试](apps/tarla-app/test/daemon_contract_test.dart) · [网关配置](crates/tarla-gateway/README.md) · [客户端构建与下载](https://github.com/CollaalloC/Tarla/actions/workflows/flutter-platforms.yml) |
 
 - [Flutter 客户端及真机/模拟器连接](apps/tarla-app/README.md)
