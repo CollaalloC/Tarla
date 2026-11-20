@@ -142,6 +142,9 @@ class ExecutorFixture(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         assert self.headers["Authorization"] == "Bearer " + self.server.pair_secret
+        if self.server.ticket_status != 200:
+            self.send_error(self.server.ticket_status)
+            return
         grant = {"workspace_id": body["workspace_id"], "node_id": "worker", "run_id": body["run_id"],
                  "mode": body["mode"], "hc_terminal_id": self.server.terminal, "nonce": secrets.token_hex(16),
                  "expires_at": int(time.time()) + 60}
@@ -212,6 +215,7 @@ def check_routes(root):
         peer = stack.enter_context(ThreadingHTTPServer(("127.0.0.1", 0), ExecutorFixture))
         peer.terminal, peer.issued = "t1b", set()
         peer.current_protocol = False
+        peer.ticket_status = 200
         peer.repaint = b"screen repaint\r\n" * 8192  # one valid output frame larger than the input limit
         peer.pair_secret, peer.signing_key = secrets.token_hex(32), secrets.token_bytes(32)
         threading.Thread(target=peer.serve_forever, daemon=True).start()
@@ -245,6 +249,11 @@ def check_routes(root):
         assert ws_status(chief, rid, ticket(chief, rid, route="supervisor")["ticket"]) == 409
         peer.current_protocol, peer.terminal = True, "t1b"
         check_idle_cli_close(chief, rid)
+        for status, expected in [(409, 409), (503, 502)]:
+            peer.ticket_status = status
+            denied(lambda: ticket(chief, rid, route="direct"), expected)
+            relay = ticket(chief, rid, route="supervisor")
+            assert ws_status(chief, rid, relay["ticket"]) == expected
         chief.stop()
         # This peer is private HTTPS, with no public origin and no reachable transport.
         offline = f"https://127.0.0.1:{free_port()}"

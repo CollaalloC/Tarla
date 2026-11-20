@@ -382,6 +382,58 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn terminal_url(
+    base: &Url,
+    id: &str,
+    mode: &str,
+    via_supervisor: bool,
+    grant: &Value,
+) -> Result<Url> {
+    for (field, expected) in [("run_id", id), ("mode", mode)] {
+        if let Some(value) = grant.get(field) {
+            ensure!(value == expected, "terminal grant has a different {field}");
+        }
+    }
+    if let Some(route) = grant.get("route") {
+        // Local tasks always use a same-origin direct grant, even when the
+        // caller requested a relay. Older daemons omit the route field.
+        ensure!(
+            route == "direct" || (via_supervisor && route == "supervisor"),
+            "unexpected terminal grant route"
+        );
+    }
+    let mut url = match grant.get("node_url") {
+        None => base.clone(),
+        Some(endpoint) => {
+            ensure!(!via_supervisor, "expected a same-origin terminal route");
+            let url = Url::parse(endpoint.as_str().context("invalid executor origin")?)?;
+            ensure!(
+                matches!(url.scheme(), "http" | "https")
+                    && url.host().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+                    && url.path() == "/",
+                "expected a bare HTTP(S) executor origin"
+            );
+            url
+        }
+    };
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("invalid terminal endpoint"))?
+        .pop_if_empty()
+        .extend(["v1", "terminal", id]);
+    let scheme = match url.scheme() {
+        "https" => "wss",
+        "http" => "ws",
+        _ => bail!("invalid terminal endpoint"),
+    };
+    url.set_scheme(scheme)
+        .map_err(|_| anyhow::anyhow!("invalid terminal scheme"))?;
+    Ok(url)
+}
+
 async fn attach(c: &Client, id: &str, interactive: bool, via_supervisor: bool) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use std::io::Read;
@@ -408,25 +460,9 @@ async fn attach(c: &Client, id: &str, interactive: bool, via_supervisor: bool) -
         .await?;
     let ticket = grant["ticket"]
         .as_str()
+        .filter(|ticket| !ticket.is_empty())
         .context("missing terminal ticket")?;
-    let mut url = c.url(&["v1", "terminal", id])?;
-    if via_supervisor && grant.get("node_url").is_some() {
-        bail!("supervisor did not provide a same-origin terminal route");
-    }
-    if let Some(endpoint) = grant.get("node_url").and_then(Value::as_str) {
-        url = Url::parse(endpoint)?;
-        url.path_segments_mut()
-            .map_err(|_| anyhow::anyhow!("invalid executor origin"))?
-            .pop_if_empty()
-            .extend(["v1", "terminal", id]);
-    }
-    let scheme = match url.scheme() {
-        "https" | "wss" => "wss",
-        "http" | "ws" => "ws",
-        _ => bail!("invalid terminal endpoint"),
-    };
-    url.set_scheme(scheme)
-        .map_err(|_| anyhow::anyhow!("invalid terminal scheme"))?;
+    let url = terminal_url(&c.base, id, mode, via_supervisor, &grant)?;
     let mut req = url.as_str().into_client_request()?;
     req.headers_mut()
         .insert("Authorization", format!("Bearer {ticket}").parse()?);
@@ -509,4 +545,57 @@ async fn attach(c: &Client, id: &str, interactive: bool, via_supervisor: bool) -
     }
     let _ = socket.close(None).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_destinations_preserve_api_prefix_and_legacy_direct_grants() {
+        let base = Url::parse("https://chief.example/work/").unwrap();
+        let local = "wss://chief.example/work/v1/terminal/r1";
+        for grant in [
+            json!({}),
+            json!({"route":"direct"}),
+            json!({"route":"supervisor"}),
+        ] {
+            assert_eq!(
+                terminal_url(&base, "r1", "observe", true, &grant)
+                    .unwrap()
+                    .as_str(),
+                local
+            );
+        }
+        let old = json!({"run_id":"r1","mode":"observe","node_url":"http://100.64.0.2:7878"});
+        assert_eq!(
+            terminal_url(&base, "r1", "observe", false, &old)
+                .unwrap()
+                .as_str(),
+            "ws://100.64.0.2:7878/v1/terminal/r1"
+        );
+        assert!(terminal_url(&base, "r1", "observe", true, &old).is_err());
+    }
+
+    #[test]
+    fn terminal_grants_validate_scope_and_advertised_origin() {
+        let base = Url::parse("https://chief.example").unwrap();
+        for grant in [
+            json!({"run_id":"r2"}),
+            json!({"mode":"interactive"}),
+            json!({"route":"supervisor"}),
+            json!({"route":"unknown"}),
+            json!({"node_url":false}),
+            json!({"node_url":"ws://worker.example"}),
+            json!({"node_url":"https://user@worker.example"}),
+            json!({"node_url":"https://worker.example/path"}),
+            json!({"node_url":"https://worker.example/?query"}),
+            json!({"node_url":"https://worker.example/#fragment"}),
+        ] {
+            assert!(
+                terminal_url(&base, "r1", "observe", false, &grant).is_err(),
+                "{grant}"
+            );
+        }
+    }
 }

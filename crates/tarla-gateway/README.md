@@ -37,6 +37,8 @@ curl -X POST "$CORE/gateway/pairings" -H "Authorization: Bearer $TOKEN" \
 
 多个渠道可配对到相同会话，直接使用 Core 的会话绑定 API 设置 pinned 工位。生成配对码时记录会话游标，兑换后投递该游标之后的助手消息与当前待处理审批。审批卡只对绑定会话中的任务生效，且配对时需设置 `approvals:true`。使用授权的 `GET /gateway/pairings` 查看绑定，`DELETE /gateway/pairings/{id}` 撤销绑定及其待投递数据。
 
+撤销配对后，网关只保留已接收入站事件的平台名与事件 ID 用于去重。同一话题重新配对后，平台重送的旧事件不会进入新会话。飞书审批按钮绑定原卡片的消息 ID。首次升级后，仍待审批的旧卡片会重新投递，请使用新卡片操作。审批卡投递失败时会延迟重试，期间普通回复可以继续发送。若已在其他入口处理该审批，网关会在下一次成功同步待办时取消卡片重试。
+
 ## 独立进程
 
 独立网关读取其私有目录内的 `workspace.toml`。配置 `TARLA_WORKSPACE_DIR`、`TARLA_CORE_URL`、`TARLA_CORE_TOKEN`，启动 `tarla-gateway`。监听地址由 `TARLA_GATEWAY_LISTEN` 配置，默认 `127.0.0.1:7701`。同一平台应用只运行一组回调和投递服务。使用独立部署时，仅在网关端启用相应的渠道。

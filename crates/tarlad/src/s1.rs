@@ -237,15 +237,9 @@ pub fn accept_claim(db: &Connection, id: &str, claim: &str) -> Result<()> {
     Ok(())
 }
 
-/// Applies only a contiguous prefix. A delayed packet can acknowledge its
-/// identical prefix; a gap returns the exact cursor the executor must replay.
-pub fn accept(
-    db: &Connection,
-    s: &Service,
-    node: &str,
-    request: &Value,
-) -> Result<(i64, Vec<String>)> {
-    let stream = request["s1_stream"].as_str();
+/// Once paired to a specific journal, an executor must keep presenting it,
+/// including when an older installation reconnects without sequence numbers.
+pub(super) fn check_stream(db: &Connection, node: &str, stream: Option<&str>) -> Result<()> {
     let pinned: Option<String> = db
         .query_row(
             "SELECT stream FROM service_s1_streams WHERE node=?",
@@ -268,6 +262,19 @@ pub fn accept(
             params![node, id],
         )?;
     }
+    Ok(())
+}
+
+/// Applies only a contiguous prefix. A delayed packet can acknowledge its
+/// identical prefix; a gap returns the exact cursor the executor must replay.
+pub fn accept(
+    db: &Connection,
+    s: &Service,
+    node: &str,
+    request: &Value,
+) -> Result<(i64, Vec<String>)> {
+    let stream = request["s1_stream"].as_str();
+    check_stream(db, node, stream)?;
     let mut frontier = cursor(db, node)?;
     let start = request["s1_cursor"]
         .as_i64()
@@ -542,6 +549,20 @@ pub async fn recovery_status(axum::extract::State(s): axum::extract::State<S>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_identity_stays_required_after_a_peer_upgrades() -> Result<()> {
+        let db = tarla_memory::open(Path::new(":memory:"), "w")?;
+        db.execute_batch(SCHEMA)?;
+        let journal = "abcd0000000000000000000000000000";
+        check_stream(&db, "worker", None)?;
+        check_stream(&db, "worker", Some(journal))?;
+        check_stream(&db, "worker", Some(journal))?;
+        assert!(check_stream(&db, "worker", None).is_err());
+        assert!(check_stream(&db, "worker", Some("12340000000000000000000000000000")).is_err());
+        check_stream(&db, "older-worker", None)?;
+        Ok(())
+    }
 
     #[test]
     fn restore_fence_remembers_unpaired_executors_without_rearming_on_restart() {

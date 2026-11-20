@@ -1,7 +1,7 @@
 //! One optional live preview per paired inbound event. The committed message
 //! cursor owns final delivery; it stays correct if no drafts ever arrive.
 use crate::{platform::Route, store::Delivery, Gateway};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Method;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::json;
@@ -141,11 +141,25 @@ pub(crate) async fn post(
     };
     tokio::select! {biased;out=&mut pending=>out.map(|_|()),_=previews=>unreachable!()}
 }
-pub(crate) async fn send(g: &Gateway, rid: &str, r: &Route, n: i64, job: Delivery) -> Result<()> {
+pub(crate) async fn send(
+    g: &Gateway,
+    rid: &str,
+    r: &Route,
+    n: i64,
+    job: Delivery,
+) -> Result<Option<String>> {
     let (key, final_text) = match job {
         Delivery::Draft { source } => (source, None),
         Delivery::Final { source, text } => (source, Some(text)),
-        other => return g.deliver(r, n, other, None).await.map(|_| ()),
+        card @ Delivery::Approval { .. } if r.platform == "feishu" => {
+            let id = g
+                .deliver(r, n, card, None)
+                .await?
+                .filter(|id| !id.is_empty())
+                .context("missing Feishu card message ID")?;
+            return Ok(Some(id));
+        }
+        other => return g.deliver(r, n, other, None).await,
     };
     let row: Option<(Option<String>, String, bool)> = g
         .db()?
@@ -177,10 +191,10 @@ pub(crate) async fn send(g: &Gateway, rid: &str, r: &Route, n: i64, job: Deliver
         }
         // Retain the destination until the same transaction deletes the outbox
         // row: a crash between the HTTP edit and local ack replays the edit.
-        return Ok(());
+        return Ok(None);
     }
     let Some((remote, latest, false)) = row else {
-        return Ok(());
+        return Ok(None);
     };
     let update = g
         .deliver(r, n, Delivery::Text(latest.clone()), remote.as_deref())
@@ -189,14 +203,23 @@ pub(crate) async fn send(g: &Gateway, rid: &str, r: &Route, n: i64, job: Deliver
         g.db()?.execute("UPDATE live_drafts SET remote_id=coalesce(?,remote_id),sent=? WHERE route=? AND source=?",params![id,latest,rid,key])?;
     }
     // Preview failures must never hold up an authoritative reply in the outbox.
-    Ok(())
+    Ok(None)
 }
-pub(crate) fn ack(db: &Connection, rid: &str, raw: &str) -> Result<()> {
-    if let Delivery::Final { source, .. } = serde_json::from_str(raw)? {
-        db.execute(
-            "DELETE FROM live_drafts WHERE route=? AND source=?",
-            params![rid, source],
-        )?;
+pub(crate) fn ack(db: &Connection, rid: &str, raw: &str, message_id: Option<&str>) -> Result<()> {
+    match serde_json::from_str(raw)? {
+        Delivery::Final { source, .. } => {
+            db.execute(
+                "DELETE FROM live_drafts WHERE route=? AND source=?",
+                params![rid, source],
+            )?;
+        }
+        Delivery::Approval { token, .. } => {
+            db.execute(
+                "UPDATE cards SET message_id=? WHERE token=? AND route=?",
+                params![message_id, token, rid],
+            )?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -330,12 +353,12 @@ mod tests {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .unwrap();
-        send(g, &b.id, &b.route, n, serde_json::from_str(&raw).unwrap())
+        let message_id = send(g, &b.id, &b.route, n, serde_json::from_str(&raw).unwrap())
             .await
             .unwrap();
         let mut db = g.db().unwrap();
         let tx = db.transaction().unwrap();
-        ack(&tx, &b.id, &raw).unwrap();
+        ack(&tx, &b.id, &raw, message_id.as_deref()).unwrap();
         tx.execute("DELETE FROM outgoing WHERE n=?", [n]).unwrap();
         tx.commit().unwrap();
     }
@@ -357,7 +380,7 @@ mod tests {
             track(&db, &b.id, &key).unwrap();
         }
         let sample = |g: &Gateway, text: &str, ts| {
-            observe(&mut *g.db().unwrap(), &b.id, &key, &b.route, text, ts).unwrap()
+            observe(&mut g.db().unwrap(), &b.id, &key, &b.route, text, ts).unwrap()
         };
         sample(&g, "H", 10000);
         sample(&g, "Hello", 10100);
@@ -375,7 +398,7 @@ mod tests {
         // Restart after the edit. The permanent final must edit this same remote ID.
         drop(g);
         let g = gw(&file, api);
-        store::queue_messages(&mut *g.db().unwrap(),&b.id,&b.route.platform,&[json!({"seq_no":2,"source_msg_id":key,"sender_role":"assistant","content":"Final answer."})]).unwrap();
+        store::queue_messages(&mut g.db().unwrap(),&b.id,&b.route.platform,&[json!({"seq_no":2,"source_msg_id":key,"sender_role":"assistant","content":"Final answer."})]).unwrap();
         sample(&g, "late partial", 15000);
         drain(&g, &b).await;
         let transcript: Vec<_> = calls
@@ -429,6 +452,57 @@ mod tests {
     #[tokio::test]
     async fn feishu_draft_edits_survive_restart() {
         stream("feishu").await
+    }
+
+    #[tokio::test]
+    async fn feishu_card_receipt_identifies_the_action_after_restart() {
+        let folder = std::env::temp_dir().join(Uuid::new_v4().simple().to_string());
+        std::fs::create_dir(&folder).unwrap();
+        let db = folder.join("gateway.db");
+        let (api, _, server) = origin().await;
+        let g = gw(&db, api.clone());
+        let b = binding("feishu");
+        {
+            let mut db = g.db().unwrap();
+            db.execute(
+                "INSERT INTO routes VALUES('R','feishu','123','7','11','C',1,0,?)",
+                [serde_json::to_string(&b.route).unwrap()],
+            )
+            .unwrap();
+            store::queue_card(&mut db, &b, "decision", "Continue?").unwrap();
+        }
+        drain(&g, &b).await;
+        drop(g);
+        let g = gw(&db, api);
+        {
+            let mut db = g.db().unwrap();
+            let (token, message): (String, String) = db
+                .query_row(
+                    "SELECT token,message_id FROM cards WHERE action='decision'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(message, "om_draft");
+            for (event, message_id) in [("stale", "om_previous"), ("current", message.as_str())] {
+                let payload = json!({
+                    "header":{"event_type":"card.action.trigger","event_id":event},
+                    "event":{"operator":{"open_id":"11"},"context":{"open_chat_id":"123","open_message_id":message_id},
+                             "action":{"value":{"tarla":format!("a.{token}")}}}
+                });
+                let callback = crate::platform::feishu(&payload).unwrap().unwrap();
+                store::ingest(&mut db, callback).unwrap();
+            }
+            let (n, event): (u32, String) = db
+                .query_row("SELECT count(*),min(event) FROM inbox", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            assert_eq!((n, event.as_str()), (1, "current"));
+        }
+        drop(g);
+        server.abort();
+        std::fs::remove_dir_all(folder).unwrap();
     }
     #[tokio::test]
     async fn slack_draft_edits_survive_restart() {

@@ -147,7 +147,10 @@ pub async fn call(s: &Service, node: &str, op: &str, payload: &Value) -> Result<
         .bearer_auth(&peer.token)
         .json(&p)
         .send()
-        .await?;
+        .await?
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| format!("paired node rejected {op}"))?;
     if !res.status().is_success() {
         bail!("paired node rejected {op}: {}", res.status())
     }
@@ -297,6 +300,7 @@ fn sync(s: &Service, node: &str, v: &Value) -> Result<Value> {
     let (frontier, ack) = if ordered {
         s1::accept(&tx, s, node, v)?
     } else {
+        s1::check_stream(&tx, node, None)?;
         (
             0,
             accept_events(
@@ -635,19 +639,9 @@ async fn round(s: &Service, confirmed_through: &mut Option<i64>) -> Result<()> {
             }
         }
     }
-    for ack in response["ack"]
-        .as_array()
-        .context("missing acknowledgement")?
-    {
-        let eid = ack.as_str().context("invalid acknowledgement")?;
-        if !p["events"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| e["event_id"] == eid)
-        {
-            bail!("unexpected acknowledgement")
-        }
+    let sent = p["events"].as_array().context("missing sent events")?;
+    let acknowledged = acknowledged_events(sent, &response["ack"])?;
+    for eid in &acknowledged {
         tx.execute(
             "UPDATE outbox_events SET acked_at=? WHERE event_id=?",
             params![now(), eid],
@@ -672,15 +666,8 @@ async fn round(s: &Service, confirmed_through: &mut Option<i64>) -> Result<()> {
         if next < max {
             s.sync_wake.notify_one();
         }
-    } else if let Some(seq) = p["events"]
-        .as_array()
-        .and_then(|v| v.last())
-        .and_then(|e| e["seq"].as_i64())
-    {
-        if response["ack"]
-            .as_array()
-            .is_some_and(|a| a.len() == p["events"].as_array().unwrap().len())
-        {
+    } else if let Some(seq) = sent.last().and_then(|e| e["seq"].as_i64()) {
+        if acknowledged.len() == sent.len() {
             tx.execute("INSERT INTO service_s1_delivery VALUES(?,?) ON CONFLICT(supervisor) DO UPDATE SET seq=excluded.seq",params![s.supervisor(),seq])?;
         }
     }
@@ -709,4 +696,37 @@ async fn round(s: &Service, confirmed_through: &mut Option<i64>) -> Result<()> {
         s.sync_wake.notify_one();
     }
     Ok(())
+}
+
+fn acknowledged_events<'a>(
+    sent: &[Value],
+    ack: &'a Value,
+) -> Result<std::collections::BTreeSet<&'a str>> {
+    let mut ids = std::collections::BTreeSet::new();
+    for value in ack.as_array().context("missing acknowledgement")? {
+        let id = value.as_str().context("invalid acknowledgement")?;
+        anyhow::ensure!(
+            sent.iter().any(|event| event["event_id"] == id),
+            "unexpected acknowledgement"
+        );
+        ids.insert(id);
+    }
+    Ok(ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_repeated_legacy_acknowledgement_only_covers_one_event() -> Result<()> {
+        let sent = [json!({"event_id":"a"}), json!({"event_id":"b"})];
+        assert_eq!(acknowledged_events(&sent, &json!(["a", "a"]))?.len(), 1);
+        assert_eq!(
+            acknowledged_events(&sent, &json!(["b", "a", "a"]))?.len(),
+            2
+        );
+        assert!(acknowledged_events(&sent, &json!(["c"])).is_err());
+        Ok(())
+    }
 }

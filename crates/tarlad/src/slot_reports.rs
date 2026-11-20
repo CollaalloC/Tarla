@@ -53,13 +53,22 @@ pub async fn ingest(
         .ok_or_else(forbidden)?;
     let (expiry, _) = token.split_once('.').ok_or_else(forbidden)?;
     let ts = expiry.parse::<i64>().map_err(|_| forbidden())?;
-    if ts <= now() || ts > now() + 3600 || !secret_equal(token, &mac(&s, &slot, ts)?) {
+    if ts <= now() || !secret_equal(token, &mac(&s, &slot, ts)?) {
         return Err(forbidden());
     }
-    store(&s, &slot, &v)?;
+    let mut db = s.db()?;
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Waiting for the SQLite writer may outlast a short-lived credential.
+    let time = now();
+    if ts <= time || ts > time + 3600 {
+        return Err(forbidden());
+    }
+    store(&tx, &s, &slot, &v)?;
+    tx.commit()?;
+    s.notify.notify_waiters();
     Ok(Json(json!({"stored":true})))
 }
-pub fn store(s: &Service, slot: &str, raw: &Value) -> Result<()> {
+pub fn store(tx: &rusqlite::Transaction<'_>, s: &Service, slot: &str, raw: &Value) -> Result<()> {
     local(s, slot)?;
     let report = raw.as_object().context("expected slot report")?;
     for (key, expected) in [
@@ -79,8 +88,6 @@ pub fn store(s: &Service, slot: &str, raw: &Value) -> Result<()> {
             .filter(|n| *n <= time && *n >= time - 300)
             .context("invalid telemetry sample time")?,
     };
-    let mut c = s.db()?;
-    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let previous = tx
         .query_row(
             "SELECT report,updated_at FROM service_telemetry WHERE slot_id=?",
@@ -139,8 +146,6 @@ pub fn store(s: &Service, slot: &str, raw: &Value) -> Result<()> {
         bail!("empty slot report")
     }
     tx.execute("INSERT INTO service_telemetry VALUES(?,?,?) ON CONFLICT(slot_id) DO UPDATE SET report=excluded.report,updated_at=excluded.updated_at",params![slot,out.to_string(),ts])?;
-    tx.commit()?;
-    s.notify.notify_waiters();
     Ok(())
 }
 

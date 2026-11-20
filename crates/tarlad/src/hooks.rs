@@ -56,7 +56,6 @@ pub async fn callback(
             "invalid run hook credential".into(),
         ));
     }
-    let row = api::one(&s, &id)?;
     require_active(&s.db()?, &id, s.node())?;
     let out = match op.as_str() {
         "approval" => {
@@ -126,7 +125,17 @@ pub async fn callback(
             json!({"stored":true})
         }
         "telemetry" => {
-            slot_reports::store(&s, string(&row, "target_slot_id")?, &v)?;
+            let mut db = s.db()?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            require_active(&tx, &id, s.node())?;
+            let slot: String = tx.query_row(
+                "SELECT target_slot_id FROM runs WHERE run_id=?",
+                [&id],
+                |r| r.get(0),
+            )?;
+            slot_reports::store(&tx, &s, &slot, &v)?;
+            tx.commit()?;
+            s.notify.notify_waiters();
             json!({"stored":true})
         }
         _ => return Err(ApiError(StatusCode::NOT_FOUND, "unknown run hook".into())),

@@ -38,41 +38,33 @@ pub async fn connect(
     ticket: &str,
     upgrade: WebSocketUpgrade,
 ) -> Api<Response> {
-    ensure_supervisor(s)?;
-    let run = api::one(s, id)?;
-    let owner = string(&run, "target_node_id")?;
-    let peer = s.peers.get(owner).context("executor is not paired")?;
-    let grant =
-        AttachLease::verify(ticket, &signing_key(s), s.id(), owner, now()).map_err(|_| {
+    let grant = AttachLease::verify_for_workspace(ticket, &signing_key(s), s.id(), now()).map_err(
+        |_| {
             ApiError(
                 StatusCode::UNAUTHORIZED,
                 "invalid or expired relay lease".into(),
             )
-        })?;
-    if grant.run_id != id || run["hc_terminal_id"] != grant.hc_terminal_id || owner == s.node() {
+        },
+    )?;
+    ensure_supervisor(s)?;
+    if grant.run_id != id || grant.node_id == s.node() {
         return Err(ApiError(
             StatusCode::FORBIDDEN,
             "terminal relay scope mismatch".into(),
         ));
     }
-    terminal::consume(s, &grant)?;
-    let remote = terminal::peer_ticket(s, owner, id, grant.mode).await?;
-    let remote_ticket = string(&remote, "ticket")?;
-    // Older executors include the terminal address only inside their ticket.
-    let same_terminal = match remote.get("hc_terminal_id") {
-        Some(terminal) => terminal == &grant.hc_terminal_id,
-        None => grant.matches_peer_ticket_scope(remote_ticket),
-    };
-    if remote["run_id"] != grant.run_id
-        || remote["node_id"] != grant.node_id
-        || !same_terminal
-        || remote["mode"] != json!(grant.mode)
-    {
+    let run = api::one(s, id)?;
+    if run["target_node_id"] != grant.node_id || run["hc_terminal_id"] != grant.hc_terminal_id {
         return Err(ApiError(
-            StatusCode::CONFLICT,
-            "executor terminal changed; request a new terminal grant".into(),
+            StatusCode::FORBIDDEN,
+            "terminal relay scope mismatch".into(),
         ));
     }
+    let owner = &grant.node_id;
+    let peer = s.peers.get(owner).context("executor is not paired")?;
+    terminal::consume(&mut s.db()?, &grant)?;
+    let remote = terminal::peer_ticket(s, owner, id, &grant.hc_terminal_id, grant.mode).await?;
+    let remote_ticket = string(&remote, "ticket")?;
     let key = generate_key();
     let mut url = reqwest::Url::parse(&peer.url).map_err(anyhow::Error::from)?;
     url.path_segments_mut()
@@ -96,6 +88,12 @@ pub async fn connect(
                 "could not connect to the executor terminal".into(),
             )
         })?;
+    if res.status() == StatusCode::CONFLICT {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "the executor terminal changed before attachment".into(),
+        ));
+    }
     if res.status() != 101
         || !res
             .headers()

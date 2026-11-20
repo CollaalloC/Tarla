@@ -34,9 +34,30 @@ pub fn open(path: &Path) -> Result<Connection> {
     CREATE INDEX IF NOT EXISTS gateway_route_conversation ON routes(conv);
     CREATE INDEX IF NOT EXISTS gateway_pending_inbox ON inbox(route,n) WHERE done=0;
     CREATE INDEX IF NOT EXISTS gateway_pending_outgoing ON outgoing(route,n);
+    CREATE TABLE IF NOT EXISTS retired_events(platform TEXT NOT NULL, event TEXT NOT NULL, PRIMARY KEY(platform,event)) WITHOUT ROWID;
+    CREATE TRIGGER IF NOT EXISTS retire_inbox_event BEFORE DELETE ON inbox BEGIN
+        INSERT OR IGNORE INTO retired_events(platform,event) VALUES (OLD.platform,OLD.event);
+    END;
+    CREATE TRIGGER IF NOT EXISTS discard_card_delivery AFTER DELETE ON cards BEGIN
+        DELETE FROM outgoing WHERE route=OLD.route AND json_extract(job,'$.Approval.token')=OLD.token;
+    END;
     CREATE TABLE IF NOT EXISTS terminal_notices(route TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE, action TEXT NOT NULL, PRIMARY KEY(route,action));
     ")?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let bound_cards: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('cards') WHERE name='message_id')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !bound_cards {
+        // The next poll reissues legacy delivered Feishu cards for pending
+        // decisions. Only callbacks on a recorded delivery may authorize one.
+        tx.execute_batch("ALTER TABLE cards ADD COLUMN message_id TEXT;
+            UPDATE inbox SET done=1,job='' WHERE done=0 AND platform='feishu' AND json_type(job,'$.Action')='object';
+            DELETE FROM cards WHERE route IN (SELECT id FROM routes WHERE platform='feishu')
+            AND NOT EXISTS (SELECT 1 FROM outgoing o WHERE o.route=cards.route
+                AND json_extract(o.job,'$.Approval.token')=cards.token);")?;
+    }
     for table in ["inbox", "outgoing"] {
         let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?) WHERE name='lease')",
@@ -154,11 +175,23 @@ pub fn ingest(db: &mut Connection, e: Event) -> Result<()> {
                 },
             )
         }
-        Input::Button { value, callback_id } => {
+        Input::Button {
+            value,
+            callback_id,
+            message_id,
+        } => {
             let Ok((resolution, token)) = decision(&value) else {
                 return Ok(());
             };
-            let row:Option<(String,String)>=tx.query_row("SELECT r.id,c.action FROM cards c JOIN routes r ON c.route=r.id WHERE c.token=? AND r.platform=? AND r.chat=? AND r.actor=? AND r.approvals=1 AND (r.platform='feishu' OR r.thread=?)",params![token,r.platform,r.chat,r.actor,r.thread],|q|Ok((q.get(0)?,q.get(1)?))).optional()?;
+            let row: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT r.id,c.action FROM cards c JOIN routes r ON c.route=r.id
+                 WHERE c.token=? AND r.platform=? AND r.chat=? AND r.actor=? AND r.approvals=1
+                 AND CASE WHEN r.platform='feishu' THEN c.message_id=? ELSE r.thread=? END",
+                    params![token, r.platform, r.chat, r.actor, message_id, r.thread],
+                    |q| Ok((q.get(0)?, q.get(1)?)),
+                )
+                .optional()?;
             let Some((rid, action)) = row else {
                 return Ok(());
             };
@@ -173,7 +206,8 @@ pub fn ingest(db: &mut Connection, e: Event) -> Result<()> {
         }
     };
     let added = tx.execute(
-        "INSERT OR IGNORE INTO inbox(platform,event,route,job) VALUES (?,?,?,?)",
+        "INSERT OR IGNORE INTO inbox(platform,event,route,job)
+         SELECT ?1,?2,?3,?4 WHERE NOT EXISTS (SELECT 1 FROM retired_events WHERE platform=?1 AND event=?2)",
         params![r.platform, e.event_id, rid, serde_json::to_string(&job)?],
     )?;
     if added == 1 && matches!(job, Job::Message { .. }) {
@@ -290,7 +324,7 @@ pub fn queue_card(db: &mut Connection, b: &Binding, action: &str, title: &str) -
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let token = random();
     if tx.execute(
-        "INSERT OR IGNORE INTO cards VALUES (?,?,?)",
+        "INSERT OR IGNORE INTO cards(token,route,action) VALUES (?,?,?)",
         params![token, b.id, action],
     )? == 1
     {
@@ -304,6 +338,22 @@ pub fn queue_card(db: &mut Connection, b: &Binding, action: &str, title: &str) -
         )?;
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// An approval can be decided in the CLI or another paired route while a
+/// delivery is waiting for provider recovery.
+pub fn retire_finished_cards(db: &mut Connection, actions: &[serde_json::Value]) -> Result<()> {
+    let mut pending = Vec::new();
+    for action in actions.iter().filter(|a| a["kind"] == "approval") {
+        if action["resolution"].as_str().is_none_or(|r| r == "pending") {
+            pending.push(action["id"].as_str().context("invalid pending approval")?);
+        }
+    }
+    db.execute(
+        "DELETE FROM cards WHERE action NOT IN (SELECT value FROM json_each(?))",
+        [serde_json::to_string(&pending)?],
+    )?;
     Ok(())
 }
 
@@ -388,6 +438,7 @@ mod tests {
             e.input = Input::Button {
                 value: format!("a.{token}"),
                 callback_id: Some("q".into()),
+                message_id: None,
             };
             ingest(&mut db, e).unwrap();
         }
@@ -402,5 +453,117 @@ mod tests {
         assert!(
             matches!(serde_json::from_str(&raw).unwrap(),Job::Action{id,resolution,..} if id=="approval1" && resolution=="approved")
         );
+    }
+
+    #[test]
+    fn provider_retry_after_pairing_change_stays_with_the_retired_event() {
+        let mut db = open(Path::new(":memory:")).unwrap();
+        for conv in ["old", "new"] {
+            let code = issue(&db, "telegram", "7", conv, false, 0).unwrap();
+            ingest(&mut db, message("7", &format!("/pair {code}"), conv)).unwrap();
+            ingest(&mut db, message("7", "old question", "previous")).unwrap();
+            if conv == "old" {
+                db.execute("DELETE FROM routes WHERE conv='old'", [])
+                    .unwrap();
+            }
+        }
+        ingest(&mut db, message("7", "new question", "current")).unwrap();
+        let (count, event): (u32, String) = db
+            .query_row("SELECT count(*),min(event) FROM inbox", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((count, event.as_str()), (1, "current"));
+    }
+
+    #[test]
+    fn upgrade_keeps_unsent_feishu_cards_and_reissues_unbound_deliveries() {
+        let file = std::env::temp_dir().join(format!("tarla-gateway-{}.db", Uuid::new_v4()));
+        let mut db = open(&file).unwrap();
+        let code = issue(&db, "feishu", "7", "conv", true, 0).unwrap();
+        let mut pair = message("7", &format!("/pair {code}"), "pair");
+        pair.route.platform = "feishu".into();
+        ingest(&mut db, pair).unwrap();
+        let b = bindings(&db).unwrap().pop().unwrap();
+        for action in ["delivered", "unsent"] {
+            queue_card(&mut db, &b, action, "Review").unwrap();
+        }
+        let old_token: String = db
+            .query_row(
+                "SELECT token FROM cards WHERE action='delivered'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        db.execute(
+            "DELETE FROM outgoing WHERE json_extract(job,'$.Approval.token')=?",
+            [&old_token],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO inbox(platform,event,route,job) VALUES('feishu','old-click',?,?)",
+            params![
+                b.id,
+                serde_json::to_string(&Job::Action {
+                    id: "delivered".into(),
+                    resolution: "approved".into(),
+                    callback: None
+                })
+                .unwrap()
+            ],
+        )
+        .unwrap();
+        db.execute_batch(
+            "ALTER TABLE cards DROP COLUMN message_id;
+            DROP TRIGGER retire_inbox_event; DROP TABLE retired_events;",
+        )
+        .unwrap();
+        drop(db);
+
+        let mut db = open(&file).unwrap();
+        assert_eq!(
+            db.query_row("SELECT action FROM cards", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "unsent"
+        );
+        assert_eq!(
+            db.query_row("SELECT done FROM inbox WHERE event='old-click'", [], |r| r
+                .get::<_, u8>(
+                0
+            ))
+            .unwrap(),
+            1
+        );
+        for action in ["delivered", "unsent"] {
+            queue_card(&mut db, &b, action, "Review").unwrap();
+        }
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM outgoing WHERE json_type(job,'$.Approval')='object'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            2
+        );
+        assert_ne!(
+            db.query_row(
+                "SELECT token FROM cards WHERE action='delivered'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            old_token
+        );
+        db.execute("DELETE FROM routes WHERE id=?", [&b.id])
+            .unwrap();
+        assert_eq!(
+            db.query_row("SELECT event FROM retired_events", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "old-click"
+        );
+        drop(db);
+        std::fs::remove_file(file).unwrap();
     }
 }

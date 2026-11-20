@@ -84,6 +84,7 @@ pub enum Input {
     Button {
         value: String,
         callback_id: Option<String>,
+        message_id: Option<String>,
     },
 }
 #[derive(Serialize, Deserialize, Debug)]
@@ -116,6 +117,7 @@ pub fn telegram(v: Value) -> Result<Option<Event>> {
             Input::Button {
                 value: s(q, "data")?,
                 callback_id: Some(s(q, "id")?),
+                message_id: None,
             },
         )
     } else if let Some(m) = v.get("message") {
@@ -192,6 +194,7 @@ pub fn feishu(v: &Value) -> Result<Option<Event>> {
                 Input::Button {
                     value: s(&e["action"]["value"], "tarla")?,
                     callback_id: None,
+                    message_id: Some(s(&e["context"], "open_message_id")?),
                 },
             )
         }

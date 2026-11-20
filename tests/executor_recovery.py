@@ -94,6 +94,9 @@ def approval_race(root):
                 "request_id": key, "tool_or_cmd": "change file", "risk_reason": "owner decision"
             }, token)
 
+        def telemetry(used):
+            return node.api(f"/hooks/v1/{run}/telemetry", {"window_used_pct": used}, token)
+
         def attempt(call):
             try:
                 return call()
@@ -116,13 +119,17 @@ def approval_race(root):
         winner, = [d["resolution"] for d in decisions if d]
         assert approval("first")["resolution"] == winner
         assert node.api(f"/v1/runs/{run}")["observed_state"] == "blocked"
+        assert telemetry(25)["stored"]
 
         node.api(f"/v1/runs/{run}/cancel", {})
         assert attempt(lambda: node.api(f"/v1/actions/{pending}", {"resolution": "approved"})) is None
         assert attempt(lambda: approval("after-stop")) is None
+        assert attempt(lambda: telemetry(50)) is None
         with sqlite3.connect(db_path) as db:
             assert db.execute("SELECT count(*) FROM approvals WHERE run_id=?", (run,)).fetchone() == (2,)
-    print("PASS concurrent decisions choose one outcome; cancelled or unstarted runs cannot obtain approval")
+            report, = db.execute("SELECT report FROM service_telemetry WHERE slot_id=?", ("account",)).fetchone()
+            assert json.loads(report)["window_used_pct"] == 25
+    print("PASS concurrent decisions choose one outcome; cancellation closes approval and telemetry callbacks")
 
 
 def one_shot_launch(root):

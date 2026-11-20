@@ -87,6 +87,33 @@ impl AttachLease {
             B64.encode(mac.finalize().into_bytes())
         ))
     }
+    fn parts(ticket: &str) -> Result<(&str, &str)> {
+        ensure!(ticket.len() <= 8192, "ticket too large");
+        ticket.split_once('.').context("invalid ticket")
+    }
+
+    pub fn valid_at(&self, now: i64) -> bool {
+        self.expires_at > now && self.expires_at <= now.saturating_add(60)
+    }
+
+    /// Authenticate before consulting the ledger for the destination node of a relay.
+    pub fn verify_for_workspace(
+        ticket: &str,
+        secret: &[u8],
+        workspace: &str,
+        now: i64,
+    ) -> Result<Self> {
+        let (body, signature) = Self::parts(ticket)?;
+        let mut mac = Self::mac(secret)?;
+        mac.update(body.as_bytes());
+        mac.verify_slice(&B64.decode(signature)?)
+            .map_err(|_| anyhow::anyhow!("invalid signature"))?;
+        let lease: Self = serde_json::from_slice(&B64.decode(body)?)?;
+        ensure!(lease.workspace_id == workspace, "wrong ticket audience");
+        ensure!(lease.valid_at(now), "ticket outside validity window");
+        Ok(lease)
+    }
+
     /// The executor must atomically consume the verified nonce before bridging any bytes.
     pub fn verify(
         ticket: &str,
@@ -95,45 +122,44 @@ impl AttachLease {
         node: &str,
         now: i64,
     ) -> Result<Self> {
-        ensure!(ticket.len() <= 8192, "ticket too large");
-        let (body, signature) = ticket.split_once('.').context("invalid ticket")?;
-        let mut mac = Self::mac(secret)?;
-        mac.update(body.as_bytes());
-        mac.verify_slice(&B64.decode(signature)?)
-            .map_err(|_| anyhow::anyhow!("invalid signature"))?;
-        let lease: Self = serde_json::from_slice(&B64.decode(body)?)?;
-        ensure!(
-            lease.workspace_id == workspace && lease.node_id == node,
-            "wrong ticket audience"
-        );
-        ensure!(
-            lease.expires_at > now && lease.expires_at <= now.saturating_add(60),
-            "ticket outside validity window"
-        );
+        let lease = Self::verify_for_workspace(ticket, secret, workspace, now)?;
+        ensure!(lease.node_id == node, "wrong ticket audience");
         Ok(lease)
     }
 
-    /// Compare scope only. The paired executor still authenticates and consumes
-    /// its own ticket when the relay opens the executor WebSocket.
+    /// Check wire format and compare scope only. The executor authenticates its
+    /// own ticket with its private key when redeeming it on either route.
+    pub fn peer_ticket_has_scope(
+        ticket: &str,
+        workspace: &str,
+        node: &str,
+        run: &str,
+        terminal: &str,
+        mode: AttachMode,
+    ) -> Result<bool> {
+        let (body, signature) = Self::parts(ticket)?;
+        ensure!(
+            B64.decode(signature)?.len() == 32,
+            "invalid ticket signature size"
+        );
+        let peer: Self = serde_json::from_slice(&B64.decode(body)?)?;
+        Ok(peer.workspace_id == workspace
+            && peer.node_id == node
+            && peer.run_id == run
+            && peer.hc_terminal_id == terminal
+            && peer.mode == mode)
+    }
+
     pub fn matches_peer_ticket_scope(&self, ticket: &str) -> bool {
-        if ticket.len() > 8192 {
-            return false;
-        }
-        let Some((body, _)) = ticket.split_once('.') else {
-            return false;
-        };
-        let Some(peer) = B64
-            .decode(body)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
-        else {
-            return false;
-        };
-        self.workspace_id == peer.workspace_id
-            && self.node_id == peer.node_id
-            && self.run_id == peer.run_id
-            && self.hc_terminal_id == peer.hc_terminal_id
-            && self.mode == peer.mode
+        Self::peer_ticket_has_scope(
+            ticket,
+            &self.workspace_id,
+            &self.node_id,
+            &self.run_id,
+            &self.hc_terminal_id,
+            self.mode,
+        )
+        .unwrap_or(false)
     }
 }
 

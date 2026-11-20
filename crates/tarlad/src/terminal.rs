@@ -131,22 +131,88 @@ pub async fn local_ticket(s: &Service, id: &str, v: &Value) -> Api<Value> {
     )
 }
 
-pub(super) async fn peer_ticket(s: &Service, node: &str, id: &str, mode: AttachMode) -> Api<Value> {
+#[derive(serde::Deserialize)]
+struct PeerGrant<'a> {
+    ticket: &'a str,
+    run_id: &'a str,
+    node_id: &'a str,
+    hc_terminal_id: Option<&'a str>,
+    mode: AttachMode,
+    expires_in: u64,
+}
+
+fn validate_peer_grant(
+    value: &Value,
+    workspace: &str,
+    node: &str,
+    id: &str,
+    terminal: &str,
+    mode: AttachMode,
+) -> Api<()> {
+    use serde::Deserialize;
+    let malformed = || {
+        ApiError(
+            StatusCode::BAD_GATEWAY,
+            "executor returned a malformed terminal ticket".into(),
+        )
+    };
+    let fields = value.as_object().ok_or_else(malformed)?;
+    let grant = PeerGrant::deserialize(value).map_err(|_| malformed())?;
+    if !(1..=60).contains(&grant.expires_in)
+        || (fields.contains_key("hc_terminal_id") && grant.hc_terminal_id.is_none())
+    {
+        return Err(malformed());
+    }
+    let same_scope =
+        AttachLease::peer_ticket_has_scope(grant.ticket, workspace, node, id, terminal, mode)
+            .map_err(|_| malformed())?;
+    if !same_scope
+        || grant.run_id != id
+        || grant.node_id != node
+        || grant.mode != mode
+        || grant
+            .hc_terminal_id
+            .is_some_and(|address| address != terminal)
+    {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "executor terminal changed; request a new terminal grant".into(),
+        ));
+    }
+    // Previous executors did not confirm input support or repeat the address outside the ticket.
+    if mode == AttachMode::Interactive && grant.hc_terminal_id.is_none() {
+        return Err(ApiError(StatusCode::CONFLICT, UNKNOWN.into()));
+    }
+    Ok(())
+}
+
+pub(super) async fn peer_ticket(
+    s: &Service,
+    node: &str,
+    id: &str,
+    terminal: &str,
+    mode: AttachMode,
+) -> Api<Value> {
     let grant = peers::call(s, node, "ticket", &json!({"run_id":id,"mode":mode}))
         .await
         .map_err(|error| {
-            if error.is::<reqwest::Error>() {
+            if error
+                .downcast_ref::<reqwest::Error>()
+                .and_then(reqwest::Error::status)
+                == Some(StatusCode::CONFLICT)
+            {
+                ApiError(
+                    StatusCode::CONFLICT,
+                    "the executor no longer offers the requested terminal mode".into(),
+                )
+            } else {
                 ApiError(
                     StatusCode::BAD_GATEWAY,
                     "could not get a terminal ticket from the executor".into(),
                 )
-            } else {
-                error.into()
             }
         })?;
-    if mode == AttachMode::Interactive && !grant["hc_terminal_id"].is_string() {
-        return Err(ApiError(StatusCode::CONFLICT, UNKNOWN.into()));
-    }
+    validate_peer_grant(&grant, s.id(), node, id, terminal, mode)?;
     Ok(grant)
 }
 
@@ -171,7 +237,7 @@ pub async fn issue(State(s): State<S>, Route(id): Route<String>, Json(v): Json<V
     if route == "supervisor" || (route == "auto" && public.is_none()) {
         return Ok(Json(terminal_relay::issue(&s, &r, &id, mode)?));
     }
-    let mut remote = peer_ticket(&s, target, &id, mode).await?;
+    let mut remote = peer_ticket(&s, target, &id, string(&r, "hc_terminal_id")?, mode).await?;
     remote["route"] = json!("direct");
     remote["node_url"] = json!(public.unwrap_or(&peer.url));
     Ok(Json(remote))
@@ -192,11 +258,14 @@ pub async fn socket(
     }
     let lease = AttachLease::verify(ticket, s.ws.attach_key.as_bytes(), s.id(), s.node(), now())
         .map_err(|_| ApiError(StatusCode::UNAUTHORIZED, "invalid terminal lease".into()))?;
+    if lease.run_id != id {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "terminal scope mismatch".into(),
+        ));
+    }
     let mut run = api::one(&s, &id)?;
-    if lease.run_id != id
-        || run["hc_terminal_id"] != lease.hc_terminal_id
-        || run["target_node_id"] != s.node()
-    {
+    if run["hc_terminal_id"] != lease.hc_terminal_id || run["target_node_id"] != s.node() {
         return Err(ApiError(
             StatusCode::FORBIDDEN,
             "terminal scope mismatch".into(),
@@ -204,7 +273,7 @@ pub async fn socket(
     }
     describe(&s, &mut run).await?;
     check_mode(&run, lease.mode)?;
-    consume(&s, &lease)?;
+    consume(&mut s.db()?, &lease)?;
     let observe = lease.mode == AttachMode::Observe;
     let (mut reader, mut writer) = fleet::herdr(&s)?
         .attach(&lease.run_id, &lease.hc_terminal_id, observe, 80, 24)
@@ -234,10 +303,17 @@ pub async fn socket(
     }))
 }
 
-pub fn consume(s: &Service, lease: &AttachLease) -> Api<()> {
-    let mut c = s.db()?;
-    let tx = c.transaction()?;
-    tx.execute("DELETE FROM service_leases WHERE expires<=?", [now()])?;
+pub(super) fn consume(c: &mut Connection, lease: &AttachLease) -> Api<()> {
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // A competing redemption can hold the write lock until this ticket expires.
+    let at = now();
+    if !lease.valid_at(at) {
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "expired terminal ticket".into(),
+        ));
+    }
+    tx.execute("DELETE FROM service_leases WHERE expires<=?", [at])?;
     if tx.execute(
         "INSERT OR IGNORE INTO service_leases VALUES(?,?)",
         params![lease.nonce, lease.expires_at],
@@ -251,4 +327,87 @@ pub fn consume(s: &Service, lease: &AttachLease) -> Api<()> {
     tx.commit()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ticket(terminal: &str, mode: AttachMode, at: i64) -> String {
+        AttachLease::issue(&[1; 32], "work", "worker", "run", terminal, mode, at).unwrap()
+    }
+
+    #[test]
+    fn redemption_rechecks_the_lifetime_and_consumes_once() {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE service_leases(nonce TEXT PRIMARY KEY, expires INTEGER NOT NULL)",
+        )
+        .unwrap();
+        let at = now();
+        let verified_at_issue = |issued_at| {
+            AttachLease::verify(
+                &ticket("t1", AttachMode::Observe, issued_at),
+                &[1; 32],
+                "work",
+                "worker",
+                issued_at,
+            )
+            .unwrap()
+        };
+        let expired = verified_at_issue(at - 61);
+        assert_eq!(
+            consume(&mut db, &expired).err().unwrap().0,
+            StatusCode::UNAUTHORIZED
+        );
+        let valid = verified_at_issue(at);
+        assert!(consume(&mut db, &valid).is_ok());
+        assert_eq!(
+            consume(&mut db, &valid).err().unwrap().0,
+            StatusCode::UNAUTHORIZED
+        );
+        let rows: Vec<String> = db
+            .prepare("SELECT nonce FROM service_leases")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, [valid.nonce]);
+    }
+
+    #[test]
+    fn peer_reply_and_ticket_must_agree_with_requested_terminal() {
+        let mode = AttachMode::Observe;
+        let modern = json!({"ticket":ticket("t1",mode,now()), "run_id":"run", "node_id":"worker",
+                            "mode":"observe", "hc_terminal_id":"t1", "expires_in":60});
+        let check = |value: &Value| {
+            validate_peer_grant(value, "work", "worker", "run", "t1", mode)
+                .err()
+                .map(|e| e.0)
+        };
+        assert_eq!(check(&modern), None);
+        let mut legacy = modern.clone();
+        legacy.as_object_mut().unwrap().remove("hc_terminal_id");
+        assert_eq!(check(&legacy), None);
+        let positional = json!([modern["ticket"], "run", "worker", "t1", "observe", 60]);
+        assert_eq!(check(&positional), Some(StatusCode::BAD_GATEWAY));
+        for (key, value, status) in [
+            ("mode", json!("interactive"), StatusCode::CONFLICT),
+            ("run_id", json!("elsewhere"), StatusCode::CONFLICT),
+            ("node_id", json!("elsewhere"), StatusCode::CONFLICT),
+            ("hc_terminal_id", json!("t2"), StatusCode::CONFLICT),
+            (
+                "ticket",
+                json!(ticket("t2", mode, now())),
+                StatusCode::CONFLICT,
+            ),
+            ("ticket", json!("incomplete"), StatusCode::BAD_GATEWAY),
+            ("expires_in", json!(0), StatusCode::BAD_GATEWAY),
+        ] {
+            let mut changed = modern.clone();
+            changed[key] = value;
+            assert_eq!(check(&changed), Some(status), "{key}");
+        }
+    }
 }

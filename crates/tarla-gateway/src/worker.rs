@@ -292,7 +292,13 @@ impl Work {
                 WHERE earlier_route.conv=r.conv AND p.done=0 AND p.n<i.n)"
             }
             Self::Out => {
-                "AND NOT EXISTS(SELECT 1 FROM outgoing p WHERE p.route=i.route AND p.n<i.n)"
+                // Keep replies in order, but let them pass a rejected approval
+                // card during its backoff. Only one send per route runs at once.
+                "AND NOT EXISTS (SELECT 1 FROM outgoing p WHERE p.route=i.route AND p.n<i.n
+                    AND (p.retry<=?1 OR p.tries=0 OR p.lease IS NOT NULL
+                         OR json_type(p.job,'$.Approval') IS NULL))
+                 AND NOT EXISTS (SELECT 1 FROM outgoing p WHERE p.route=i.route AND p.n!=i.n
+                    AND p.lease IS NOT NULL AND p.retry>?1)"
             }
         };
         let sql=format!("SELECT i.n, r.dest,r.id,r.conv,i.job,i.tries FROM {table} i JOIN routes r ON r.id=i.route WHERE i.retry<=? {pending} ORDER BY i.n LIMIT 1");
@@ -352,7 +358,14 @@ impl Work {
                 }
             },
             Self::Out => {
-                crate::drafts::send(g, &i.rid, &i.route, i.n, serde_json::from_str(&i.job)?).await
+                return crate::drafts::send(
+                    g,
+                    &i.rid,
+                    &i.route,
+                    i.n,
+                    serde_json::from_str(&i.job)?,
+                )
+                .await;
             }
         };
         result?;
@@ -388,12 +401,12 @@ impl Work {
         }
         if let Err(ref e) = result {
             let status = e.downcast_ref::<reqwest::Error>().and_then(|e| e.status());
-            let final_reply = matches!(self, Self::Out)
+            let durable_delivery = matches!(self, Self::Out)
                 && matches!(
                     serde_json::from_str::<Delivery>(&i.job),
-                    Ok(Delivery::Final { .. })
+                    Ok(Delivery::Final { .. } | Delivery::Approval { .. })
                 );
-            let terminal = !final_reply
+            let terminal = !durable_delivery
                 && status.is_some_and(|s| {
                     s.is_client_error()
                         && !matches!(
@@ -445,7 +458,7 @@ impl Work {
                 }
             }
             Self::Out => {
-                crate::drafts::ack(&tx, &i.rid, &i.job)?;
+                crate::drafts::ack(&tx, &i.rid, &i.job, result.ok().flatten().as_deref())?;
                 tx.execute("DELETE FROM outgoing WHERE n=?", [i.n])?;
             }
         }
@@ -463,10 +476,13 @@ async fn poll(g: &Gateway) -> Result<()> {
             .await
             .ok()
             .and_then(|v| v.as_array().cloned())
-            .unwrap_or_default()
     } else {
-        vec![]
+        None
     };
+    if let Some(actions) = &approvals {
+        store::retire_finished_cards(&mut *g.db()?, actions)?;
+    }
+    let approvals = approvals.unwrap_or_default();
     for b in bindings {
         let _ = g
             .queue_history_page(&b.id, &b.route.platform, &b.conversation_id)
@@ -607,6 +623,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_card_waits_for_retry_while_ordinary_replies_progress() {
+        let app = Router::new().route(
+            "/bot55:test/sendMessage",
+            post(|Json(body): Json<Value>| async move {
+                if body["reply_markup"].is_object() {
+                    (StatusCode::FORBIDDEN, Json(json!({"ok":false})))
+                } else {
+                    (
+                        StatusCode::OK,
+                        Json(json!({"ok":true,"result":{"message_id":17}})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api: Url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut g = gateway(api.clone(), store::open(Path::new(":memory:")).unwrap());
+        g.cfg.telegram = Some(crate::config::Telegram {
+            token: "55:test".into(),
+            secret: "fixture".into(),
+        });
+        g.test_platform_origin = Some(api);
+        let binding = {
+            let mut db = g.db().unwrap();
+            let code = store::issue(&db, "telegram", "7", "main", true, 0).unwrap();
+            store::ingest(
+                &mut db,
+                Event {
+                    event_id: "pair".into(),
+                    route: Route {
+                        platform: "telegram".into(),
+                        chat: "7".into(),
+                        thread: String::new(),
+                        actor: "7".into(),
+                        reply_to: None,
+                    },
+                    input: Input::Message(format!("/pair {code}")),
+                },
+            )
+            .unwrap();
+            let b = store::bindings(&db).unwrap().pop().unwrap();
+            store::queue_card(&mut db, &b, "approval", "Review").unwrap();
+            store::queue_messages(
+                &mut db,
+                &b.id,
+                "telegram",
+                &[json!({"seq_no":1,"sender_role":"assistant","content":"Reply"})],
+            )
+            .unwrap();
+            b
+        };
+        assert!(Work::Out.one(&g).await.unwrap()); // Pairing confirmation.
+        assert!(Work::Out.one(&g).await.unwrap()); // Provider rejects the card.
+        {
+            let db = g.db().unwrap();
+            let tries: u32 = db
+                .query_row(
+                    "SELECT tries FROM outgoing WHERE json_type(job,'$.Approval')='object'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(tries, 1);
+            db.execute(
+                "UPDATE outgoing SET retry=? WHERE tries=1",
+                [store::now() + 60],
+            )
+            .unwrap();
+        }
+        assert!(Work::Out.one(&g).await.unwrap()); // The following reply is delivered.
+        assert!(!Work::Out.one(&g).await.unwrap());
+        let mut db = g.db().unwrap();
+        store::retire_finished_cards(&mut db, &[json!({"kind":"approval","id":"approval"})])
+            .unwrap();
+        let waiting = |db: &rusqlite::Connection| {
+            db.query_row(
+                "SELECT count(*) FROM outgoing WHERE route=?",
+                [&binding.id],
+                |r| r.get::<_, u32>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(waiting(&db), 1);
+        store::retire_finished_cards(&mut db, &[]).unwrap();
+        assert_eq!(waiting(&db), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn terminal_notice_is_scoped_and_never_issues_a_decision_token() {
         use axum::routing::get;
         let app = Router::new()
@@ -730,7 +838,7 @@ mod tests {
             ("e1", "hello".into()),
         ] {
             store::ingest(
-                &mut *g.db().unwrap(),
+                &mut g.db().unwrap(),
                 Event {
                     event_id: id.into(),
                     route: route.clone(),
