@@ -59,7 +59,8 @@ def exercise(root, model, hc, host_environment):
     project = install_test_slot(work, hc)
     (project / "job.py").write_text(
         "from pathlib import Path\nimport json,sys,time\n"
-        "packet=json.loads(sys.argv[1]); Path('packet').write_text(json.dumps(packet))\n"
+        "packet=json.loads(sys.argv[1]); Path('packet.tmp').write_text(json.dumps(packet))\n"
+        "Path('packet.tmp').replace('packet')\n"
         "print('stage-one-log-marker',flush=True)\n"
         "for _ in range(600):\n"
         "    if Path('finish').exists(): break\n"
@@ -80,6 +81,13 @@ def exercise(root, model, hc, host_environment):
         return work.cli("chat", "daily", name, "--source-id", "stage1-" + name)
     with contextlib.ExitStack() as cleanup:
         # tarlad uses its private socket even when an existing host daemon is selected.
+        runtime = work.dir / "runtime"
+        private_core = {**os.environ, "HC_SESSION": "tarla", "HC_SOCKET": str(runtime / "hc.sock"),
+                        "XDG_RUNTIME_DIR": str(runtime / "hc-runtime"), "XDG_STATE_HOME": str(runtime / "hc-state"),
+                        "XDG_CONFIG_HOME": str(runtime / "hc-config")}
+        cleanup.callback(subprocess.run, [hc, "server", "stop"], env=private_core,
+                         timeout=15, capture_output=True, check=False)
+        cleanup.callback((project / "finish").touch)
         cleanup.callback(other.stop)
         cleanup.callback(work.stop)
         work.start("unused")
@@ -116,17 +124,23 @@ def exercise(root, model, hc, host_environment):
         assert packet["acceptance_criteria"] == ["print marker"]
         assert "stage-one fixture" in str(packet["project_memory_snapshot"])
         assert other.api("/v1/runs") == []
+        marker = "stage-one-log-marker"
+        until(lambda: work.api(f"/v1/runs/{rid}/log?query={marker}")["lines"], "live PTY marker")
+        model.calls["inspect_run_log"] = {"run_id": rid, "query": marker}
+        assert "Finished inspect_run_log" in chat("inspect_run_log")
+        output = model.results["inspect_run_log"]
+        assert output["run_id"] == rid and any(marker in line for line in output["lines"]), output
         (project / "finish").touch()
-        until(lambda: any(m["content"] == "Completion received for the local mission."
+        until(lambda: any(m["sender_role"] == "assistant" and m["run_id"] == rid
+                          and m["content"] == "Completion received for the local mission."
                           for m in work.api("/v1/conversations/daily/messages")), "unprompted receipt")
         assert work.api("/v1/runs/" + rid)["observed_state"] == "succeeded"
-        model.calls["inspect_run_log"] = {"run_id": rid, "query": "stage-one-log-marker"}
-        assert "Finished inspect_run_log" in chat("inspect_run_log")
-        assert "stage-one-log-marker" in json.dumps(model.results["inspect_run_log"])
         assert "Finished bind_channel" in chat("bind_channel")
         assert work.api("/v1/conversations")[0]["pinned_slot_id"] == "fixture"
         assert model.fallbacks > 0
         assert Path(work.dir / "runtime/hc.sock").is_socket()
+        host_status = json.loads(subprocess.check_output([hc, "server", "status", "--json"], env=host_environment))
+        assert (host_status["core"]["id"], host_status["pid"]) == model.host_identity
         assert subprocess.check_output([hc, "ls", "--all", "--json"], env=host_environment) == model.host_before
 
 
@@ -135,20 +149,23 @@ def main():
     with tempfile.TemporaryDirectory(prefix="s1-") as tmp, contextlib.ExitStack() as cleanup:
         root = Path(tmp)
         native = root / "host"
-        native.mkdir()
+        native.mkdir(mode=0o700)
         env = {"HC_SOCKET": str(native / "hc.sock"), "HC_SESSION": "host"}
         for var in ("XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME"):
             directory = native / var
             directory.mkdir(mode=0o700)
             env[var] = str(directory)
         cleanup.enter_context(patch.dict(os.environ, env))
+        os.environ.pop("TARLA_TOKEN", None)
         host = dict(os.environ)
-        subprocess.run([hc, "server", "start"], env=host, check=True)
-        cleanup.callback(subprocess.run, [hc, "server", "stop"], env=host, check=False)
+        cleanup.callback(subprocess.run, [hc, "server", "stop"], env=host,
+                         timeout=15, capture_output=True, check=False)
+        status = json.loads(subprocess.check_output([hc, "server", "start", "--json"], env=host))
         model = ThreadingHTTPServer(("127.0.0.1", 0), Model)
         cleanup.callback(model.server_close)
         threading.Thread(target=model.serve_forever, daemon=True).start()
         cleanup.callback(model.shutdown)
+        model.host_identity = status["core"]["id"], status["pid"]
         model.host_before = subprocess.check_output([hc, "ls", "--all", "--json"], env=host)
         exercise(root, model, hc, host)
     print("PASS single-node CLI, six model tools, async receipt, isolated work/life and concurrent host Herdr")

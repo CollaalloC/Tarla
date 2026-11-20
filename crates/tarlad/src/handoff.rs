@@ -544,15 +544,20 @@ mod tests {
     }
     #[test]
     fn unfinished_turn_fences_changes_and_old_generation_cannot_dispatch() {
-        let c = Connection::open_in_memory().unwrap();
-        c.execute_batch("CREATE TABLE conversations(conversation_id PRIMARY KEY,binding_mode,pinned_node_id,pinned_slot_id,pinned_workdir);
-        CREATE TABLE runs(run_id PRIMARY KEY,conversation_id,target_node_id,target_slot_id,observed_state,created_at,mission_packet_json,receipt_summary,artifacts_json);
-        INSERT INTO conversations VALUES('c','orchestrator',NULL,NULL,NULL);").unwrap();
+        let c = tarla_memory::open(Path::new(":memory:"), "w").unwrap();
         c.execute_batch(MIGRATIONS).unwrap();
+        c.execute(
+            "INSERT INTO conversations(conversation_id,workspace_id,created_at,updated_at) VALUES('c','w',1,1)",
+            [],
+        )
+        .unwrap();
         change(&c, "c", "node", "a", "/work").unwrap();
         let (old, _) = epoch(&c, "c").unwrap();
         c.execute(
-            "INSERT INTO runs VALUES('r','c','node','a','unconfirmed',1,'{}','ok','[]')",
+            "INSERT INTO runs(run_id,workspace_id,conversation_id,supervisor_term,target_node_id,
+                target_slot_id,desired_state,observed_state,created_at,updated_at,mission_packet_json,
+                receipt_summary,artifacts_json)
+             VALUES('r','w','c',1,'node','a','running','unconfirmed',1,1,'{}','ok','[]')",
             [],
         )
         .unwrap();

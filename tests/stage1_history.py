@@ -45,8 +45,10 @@ class LocalModel(BaseHTTPRequestHandler):
         assert len(data) <= WINDOW, len(data)
         if cls.prefix is None:
             cls.prefix = turn[0]["content"]
-        assert turn[0]["content"] == cls.prefix
-        assert PROFILE in cls.prefix
+        if turn[-1]["content"] in ("测量", "空闲压缩探针"):
+            assert turn[0]["content"].startswith("这个新设定只用于新会话。")
+        else:
+            assert turn[0]["content"] == cls.prefix and PROFILE in cls.prefix
         cls.summaries = [m["content"] for m in turn if m["content"].startswith("[history ")]
         latest = turn[-1]
         reply = {"role": "assistant", "content": "现场记录已收到。"}
@@ -54,6 +56,9 @@ class LocalModel(BaseHTTPRequestHandler):
         if latest["role"] == "tool":
             cls.page = json.loads(latest["content"])
             reply["content"] = cls.page["content"]
+        elif latest["content"] == "空闲压缩探针":
+            assert not cls.summaries
+            reply["content"] = "这段回执将越过水位线。" * 300
         elif latest["content"] == "回读原始编号。":
             reply.update(content="", tool_calls=[{
                 "id": "read-exact", "type": "function", "function": {
@@ -150,6 +155,14 @@ def run(path, port):
         receipt_obj = json.loads(receipt)
         assert receipt_obj["run_id"] == run and receipt_obj["final_state"] == "failed"
         assert run in receipt_obj["s0_transcript_pointer"]
+        idle_conv = "/v1/conversations/idle-only/messages"
+        for i in range(8):
+            node.api(idle_conv, {"text": "测量", "source_msg_id": f"idle-{i}"})
+        node.api(idle_conv, {"text": "空闲压缩探针", "source_msg_id":"idle-pressure"})
+        def folded_after_reply():
+            with sqlite3.connect(endpoint) as db:
+                return db.execute("SELECT count(*) FROM context_dag_nodes WHERE conversation_id='idle-only'").fetchone()[0] > 0
+        until(folded_after_reply, "idle compaction without another user turn")
         print(f"PASS {TURNS} real-daemon turns; {len(LONG.encode())}-byte Chinese original, "
               f"DAG depth {depth}, {LocalModel.count} loopback model requests, maximum wire "
               f"body {LocalModel.peak}/{WINDOW} bytes; mission {len(packet.encode())}/{MISSION}, "

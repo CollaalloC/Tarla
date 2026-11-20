@@ -1,5 +1,7 @@
 """Exercise a single local executor. Set TARLA_TEST_HC to include real PTY restart."""
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
+import hmac
 import fcntl
 import json
 import os
@@ -74,6 +76,53 @@ def backlog_and_cancel(root):
             ).fetchone()
         assert queued == len(backlog) - 1, queued
         print("PASS cancelled and independent jobs progress beyond 128 queued claims on a busy profile")
+
+
+def approval_race(root):
+    node = Node(root, "chief", "supervisor_and_executor")
+    add_slot(node, "account", root, [sys.executable, "-c", "pass"])
+    with occupied_profile(node, "account"), contextlib.ExitStack() as cleanup:
+        cleanup.callback(node.stop)
+        node.start("")
+        run = dispatch(node, "account", "approval reconciliation")
+        db_path = node.dir / "state.db"
+        token = hmac.digest((node.dir / "runtime/attach.key").read_text().strip().encode(),
+                            b"tarla/run-hook/v1\0" + run.encode(), "sha256").hex()
+
+        def approval(key):
+            return node.api(f"/hooks/v1/{run}/approval", {
+                "request_id": key, "tool_or_cmd": "change file", "risk_reason": "owner decision"
+            }, token)
+
+        def attempt(call):
+            try:
+                return call()
+            except HTTPError as error:
+                assert error.code in (400, 409, 422), (error.code, error.read())
+                return None
+
+        assert attempt(lambda: approval("before-start")) is None
+        # Simulate a pre-upgrade active holder; the profile guard prevents a new
+        # command from being launched while requests race against the owner API.
+        with sqlite3.connect(db_path) as db:
+            db.execute("UPDATE service_claims SET phase='active' WHERE run_id=?", (run,))
+            db.execute("UPDATE runs SET observed_state='running' WHERE run_id=?", (run,))
+        first = approval("first")["approval_id"]
+        pending = approval("pending")["approval_id"]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            def resolve(choice):
+                return attempt(lambda: node.api(f"/v1/actions/{first}", {"resolution": choice}))
+            decisions = list(pool.map(resolve, ["approved", "rejected"]))
+        winner, = [d["resolution"] for d in decisions if d]
+        assert approval("first")["resolution"] == winner
+        assert node.api(f"/v1/runs/{run}")["observed_state"] == "blocked"
+
+        node.api(f"/v1/runs/{run}/cancel", {})
+        assert attempt(lambda: node.api(f"/v1/actions/{pending}", {"resolution": "approved"})) is None
+        assert attempt(lambda: approval("after-stop")) is None
+        with sqlite3.connect(db_path) as db:
+            assert db.execute("SELECT count(*) FROM approvals WHERE run_id=?", (run,)).fetchone() == (2,)
+    print("PASS concurrent decisions choose one outcome; cancelled or unstarted runs cannot obtain approval")
 
 
 def one_shot_launch(root):
@@ -214,5 +263,6 @@ if __name__ == "__main__":
         root = Path(folder)
         backlog_and_cancel(root / "backlog")
         one_shot_launch(root / "permit")
+        approval_race(root / "approvals")
         if hc := os.environ.get("TARLA_TEST_HC"):
             recover_holder(root / "restart", hc)

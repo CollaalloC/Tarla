@@ -19,8 +19,11 @@ pub fn token(s: &Service, id: &str) -> Result<String> {
 }
 pub(super) fn active(c: &Connection, id: &str, node: &str) -> Result<bool> {
     Ok(c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id=? AND target_node_id=?
-         AND desired_state='running' AND observed_state NOT IN ('failed','succeeded','cancelled'))",
+        "SELECT EXISTS(SELECT 1 FROM runs r JOIN service_claims c USING(run_id)
+         LEFT JOIN service_launch_permits p USING(run_id)
+         WHERE r.run_id=? AND r.target_node_id=? AND r.desired_state='running'
+         AND r.observed_state NOT IN ('failed','succeeded','cancelled')
+         AND c.phase IN ('launching','active') AND (p.state IS NULL OR p.state='admitted'))",
         params![id, node],
         |r| r.get(0),
     )?)

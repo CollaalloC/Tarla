@@ -179,17 +179,8 @@ pub fn dispatch_selected(
     let mut c = s.db()?;
     control::ensure_conversation(&c, s, conv)?;
     let rid = run_id.unwrap_or_else(uid);
-    if let Some(existing) = list(
-        &c,
-        "SELECT r.run_id,r.conversation_id,r.target_node_id,r.target_slot_id,q.request_json FROM runs r LEFT JOIN service_requirements q USING(run_id) WHERE run_id=?",
-        &[&rid],
-    )?
-    .first()
-    {
-        if existing["conversation_id"] != conv || existing["request_json"].as_str().is_some_and(|old|old!=arg.to_string()) {
-            bail!("run identity conflict")
-        }
-        return Ok(json!({"run_id":rid,"target_node_id":existing["target_node_id"],"target_slot_id":existing["target_slot_id"]}));
+    if let Some(result) = existing_dispatch(&c, conv, &rid, arg)? {
+        return Ok(result);
     }
     let mut slots = snapshots(s)?;
     if let Some(n) = arg["node_id"].as_str() {
@@ -305,6 +296,10 @@ pub fn dispatch_selected(
         }
     }
     let dbtx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Concurrent API requests may compile the same stable identity before either commits.
+    if let Some(result) = existing_dispatch(&dbtx, conv, &rid, arg)? {
+        return Ok(result);
+    }
     insert_run(
         &dbtx,
         s,
@@ -346,6 +341,38 @@ pub fn dispatch_selected(
     s.notify.notify_waiters();
     Ok(result)
 }
+fn existing_dispatch(
+    db: &Connection,
+    conversation: &str,
+    run_id: &str,
+    args: &Value,
+) -> Result<Option<Value>> {
+    let saved = db
+        .query_row(
+            "SELECT r.conversation_id,r.target_node_id,r.target_slot_id,q.request_json
+         FROM runs r LEFT JOIN service_requirements q USING(run_id) WHERE r.run_id=?",
+            [run_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((owner, node, slot, request)) = saved else {
+        return Ok(None);
+    };
+    if owner != conversation || request.is_some_and(|old| old != args.to_string()) {
+        bail!("run identity conflict")
+    }
+    Ok(Some(
+        json!({"run_id":run_id, "target_node_id":node, "target_slot_id":slot}),
+    ))
+}
+
 // A caller's optional family exclusion is an additional preference. The
 // persisted slot that authored the work always determines reviewer independence.
 fn author_family(db: &Connection, conversation: &str, run: Option<&str>) -> Result<String> {

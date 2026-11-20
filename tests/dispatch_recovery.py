@@ -1,11 +1,13 @@
 """Crash consistency of model dispatch, author-bound reviews and isolated receipt delivery."""
 import contextlib
+import hashlib
 import http.client
 import json
 import sqlite3
 import tempfile
 import threading
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -26,6 +28,8 @@ class Model(BaseHTTPRequestHandler):
         assert "scope" in properties and "author_run_id" in properties
         prompt = request["messages"][-1]["content"]
         self.server.calls[prompt] += 1
+        if prompt == "legacy-dispatch":
+            return self.send_error(503)
         args = {"objective": prompt, "acceptance_criteria": ["report the result"],
                 "scope": "project:alpha", "required_caps": ["author-a"],
                 "required_fact_keys": ["missing-preflight-fact"]}
@@ -127,10 +131,18 @@ def exercise(root, model):
         assert "alpha-setting" in memory and "global-setting" in memory and "other-setting" not in memory
 
         # Simulate a database upgraded from the older two-commit dispatch implementation.
-        sql("DELETE FROM messages WHERE source_msg_id='in:cli:atomic'")
-        assert chat("primary", "dispatch-once", "atomic")["reply"] == reply
-        assert model.calls["dispatch-once"] == 2
-        assert sql("SELECT count(*) FROM messages WHERE source_msg_id='in:cli:atomic'") == [(1,)]
+        # Stage the old on-disk state without mutating an immutable history row.
+        rejected(lambda: chat("legacy", "legacy-dispatch"), "unavailable")
+        legacy = hashlib.sha256(b"in:cli:legacy-dispatch\ndispatch").hexdigest()
+        sql("""INSERT INTO runs(run_id,workspace_id,conversation_id,supervisor_term,
+               target_node_id,target_slot_id,desired_state,observed_state,mission_packet_json,created_at,updated_at)
+               SELECT ?,workspace_id,'legacy',supervisor_term,target_node_id,target_slot_id,desired_state,
+               'dispatch_pending',json_set(mission_packet_json,'$.run_id',?),created_at,updated_at
+               FROM runs WHERE run_id=?""", (legacy, legacy, first))
+        recovered = chat("legacy", "legacy-dispatch")
+        assert recovered["reply"] == f"已提交任务 {legacy}。" and recovered["run_id"] == legacy
+        assert model.calls["legacy-dispatch"] == 1
+        assert sql("SELECT count(*) FROM messages WHERE source_msg_id='in:cli:legacy-dispatch'") == [(1,)]
 
         model.overrides["second-author"] = {"required_caps": ["author-b"]}
         second = chat("primary", "second-author")["run_id"]
@@ -142,6 +154,15 @@ def exercise(root, model):
         rejected(lambda: chat("primary", "unspecified-review"), "specify author_run_id")
         model.overrides["foreign-review"] = {"role": "reviewer", "required_caps": [], "author_run_id": second}
         rejected(lambda: chat("foreign", "foreign-review"), "author run in this conversation")
+
+        # Direct API retries may race independently of the serialized conversation handler.
+        direct = {"conversation_id": "concurrent", "request_id": "once", "goal": "race",
+                  "required_fact_keys": ["missing-preflight-fact"]}
+        with ThreadPoolExecutor(max_workers=8) as callers:
+            results = list(callers.map(lambda _: chief.api("/v1/runs", direct), range(8)))
+        assert all(result == results[0] for result in results)
+        assert sql("SELECT count(*) FROM runs WHERE conversation_id='concurrent'") == [(1,)]
+        rejected(lambda: chief.api("/v1/runs", {**direct, "goal": "changed"}), "identity conflict")
 
         # A stalled receipt model in one conversation cannot hold up another user's report.
         slow = chat("left", "slow-receipt")["run_id"]

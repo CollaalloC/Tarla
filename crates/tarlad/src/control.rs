@@ -291,11 +291,6 @@ pub fn record_run_reply(
 }
 
 fn message_result(id: &str, reply: String, run: Option<String>) -> Value {
-    let run = run.or_else(|| {
-        serde_json::from_str::<Value>(&reply)
-            .ok()
-            .and_then(|value| value["run_id"].as_str().map(String::from))
-    });
     let mut out = json!({"conversation_id":id, "reply":reply});
     if let Some(run) = run {
         out["run_id"] = json!(run);
@@ -340,6 +335,17 @@ pub async fn message(s: &Service, id: &str, payload: &Value) -> Result<Value> {
             )
             .optional()?;
         if let Some((reply, run)) = replay {
+            let run = match run {
+                // Older acknowledgements did not populate messages.run_id.
+                None => c
+                    .query_row(
+                        "SELECT run_id FROM runs WHERE conversation_id=? AND run_id=?",
+                        params![id, effect_key(&key, "dispatch")],
+                        |row| row.get(0),
+                    )
+                    .optional()?,
+                saved => saved,
+            };
             return Ok(message_result(id, reply, run));
         }
         // Older databases could commit the mission before archiving its answer.

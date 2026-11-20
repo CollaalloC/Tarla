@@ -254,10 +254,17 @@ fn assemble_window(
     } else {
         raw_cost
     };
+    // Reserve a history pointer even in the narrow case where the raw tail fits by
+    // itself but leaves too little room to identify its preceding archive.
+    let history_floor = if roots.is_empty() {
+        0
+    } else {
+        (available / 8).min(96)
+    };
     let raw_budget = if raw_cost > available && !roots.is_empty() {
         available - (available / 8).min(320)
     } else {
-        available
+        available - history_floor
     };
     let raw = raw_messages(&tx, conversation, raw_budget)?;
     let summary_budget = available
