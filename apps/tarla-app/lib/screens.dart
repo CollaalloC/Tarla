@@ -530,21 +530,34 @@ class _RunPageState extends State<RunPage> {
                 for (final mode in ['observe', 'interactive'])
                   OutlinedButton.icon(
                     icon: const Icon(Icons.terminal),
-                    onPressed: () {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => TerminalPage(
-                            api: source,
-                            id: widget.id,
-                            mode: mode,
-                          ),
-                        ),
-                      );
-                    },
+                    onPressed:
+                        row!['terminal_modes'] is List &&
+                            !(row!['terminal_modes'] as List).contains(mode)
+                        ? null
+                        : () {
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => TerminalPage(
+                                  api: source,
+                                  offlineExecutor: identical(source, widget.api)
+                                      ? widget.executor
+                                      : null,
+                                  id: widget.id,
+                                  mode: mode,
+                                ),
+                              ),
+                            );
+                          },
                     label: Text(mode == 'observe' ? '旁观终端' : '接管终端'),
                   ),
               ],
+            ),
+          if (row!['terminal_input_hint'] is String &&
+              (row!['terminal_input_hint'] as String).trim().isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(row!['terminal_input_hint'] as String),
             ),
         ],
       ],
@@ -625,11 +638,13 @@ class _LogPageState extends State<LogPage> {
 
 class TerminalPage extends StatefulWidget {
   final core.TarlaApi api;
+  final core.TarlaApi? offlineExecutor;
   final String id, mode;
   const TerminalPage({
     required this.api,
     required this.id,
     required this.mode,
+    this.offlineExecutor,
     super.key,
   });
   @override
@@ -649,7 +664,11 @@ class _TerminalPageState extends State<TerminalPage> {
 
   Future<void> connect() async {
     try {
-      final ws = await widget.api.terminal(widget.id, widget.mode);
+      final ws = await widget.api.terminal(
+        widget.id,
+        widget.mode,
+        offlineExecutor: widget.offlineExecutor,
+      );
       if (!mounted) {
         await ws.close();
         return;

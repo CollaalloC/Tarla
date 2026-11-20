@@ -101,6 +101,7 @@ void main() {
         expect(req.headers.value('Authorization'), 'Bearer workspace');
         expect(jsonDecode(await utf8.decoder.bind(req).join()), {
           'mode': 'observe',
+          'route': 'auto',
         });
         req.response.write(
           jsonEncode({
@@ -125,6 +126,145 @@ void main() {
         client.close();
         await executor.close(force: true);
         await supervisor.close(force: true);
+      }
+    },
+  );
+
+  test('direct failure obtains a fresh supervisor-scoped lease', () async {
+    final supervisor = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final direct = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final client = TarlaApi(
+      Endpoint('http://127.0.0.1:${supervisor.port}', 'work-token'),
+    );
+    final routes = <String>[];
+    direct.listen((r) async {
+      expect(r.headers.value('Authorization'), 'Bearer direct-only');
+      r.response.statusCode = 503;
+      await r.response.close();
+    });
+    supervisor.listen((r) async {
+      if (r.uri.path.endsWith('/attach')) {
+        expect(r.headers.value('Authorization'), 'Bearer work-token');
+        final route =
+            jsonDecode(await utf8.decoder.bind(r).join())['route'] as String;
+        routes.add(route);
+        r.response.write(
+          jsonEncode({
+            'run_id': 'run',
+            'mode': 'interactive',
+            'ticket': route == 'auto' ? 'direct-only' : 'fresh-relay',
+            if (route == 'auto') 'node_url': 'http://127.0.0.1:${direct.port}',
+          }),
+        );
+        await r.response.close();
+      } else {
+        expect(r.headers.value('Authorization'), 'Bearer fresh-relay');
+        final ws = await WebSocketTransformer.upgrade(r);
+        ws.add([42]);
+        await ws.close();
+      }
+    });
+    try {
+      final ws = await client.terminal('run', 'interactive');
+      expect(await ws.first, [42]);
+      expect(routes, ['auto', 'supervisor']);
+      await ws.close();
+    } finally {
+      client.close();
+      await supervisor.close(force: true);
+      await direct.close(force: true);
+    }
+  });
+
+  test(
+    'redirected terminal cannot receive either credential and is not retried',
+    () async {
+      final chief = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final trap = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      var attach = 0, received = 0;
+      final client = TarlaApi(
+        Endpoint('http://127.0.0.1:${chief.port}', 'space'),
+      );
+      trap.listen((r) async {
+        received++;
+        await r.response.close();
+      });
+      chief.listen((r) async {
+        if (r.uri.path.endsWith('/attach')) {
+          attach++;
+          r.response.write(jsonEncode({'ticket': 'scoped'}));
+        } else {
+          expect(r.headers.value('Authorization'), 'Bearer scoped');
+          r.response.statusCode = 307;
+          r.response.headers.set(
+            'Location',
+            'http://127.0.0.1:${trap.port}/stolen',
+          );
+        }
+        await r.response.close();
+      });
+      try {
+        await expectLater(
+          client.terminal('run', 'observe'),
+          throwsA(isA<ApiError>().having((e) => e.status, 'status', 307)),
+        );
+        expect(attach, 1);
+        expect(received, 0);
+      } finally {
+        client.close();
+        await chief.close(force: true);
+        await trap.close(force: true);
+      }
+    },
+  );
+
+  test(
+    'offline supervisor falls back to the prepaired executor credential and workspace',
+    () async {
+      final down = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final worker = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final chief = TarlaApi(
+        Endpoint('http://127.0.0.1:${down.port}', 'chief-only'),
+        workspaceId: 'w',
+      );
+      final paired = TarlaApi(
+        Endpoint('http://127.0.0.1:${worker.port}', 'worker-only'),
+        workspaceId: 'w',
+      );
+      await down.close(force: true);
+      worker.listen((r) async {
+        if (r.uri.path == '/health') {
+          expect(r.headers.value('Authorization'), isNull);
+          r.response.write('{"workspace_id":"w"}');
+        } else if (r.uri.path.endsWith('/attach')) {
+          expect(r.headers.value('Authorization'), 'Bearer worker-only');
+          expect(r.headers.value('X-Tarla-Workspace'), 'w');
+          expect(
+            jsonDecode(await utf8.decoder.bind(r).join())['route'],
+            'auto',
+          );
+          r.response.write('{"ticket":"executor-lease"}');
+        } else {
+          expect(r.headers.value('Authorization'), 'Bearer executor-lease');
+          final ws = await WebSocketTransformer.upgrade(r);
+          ws.add([7]);
+          await ws.close();
+          return;
+        }
+        await r.response.close();
+      });
+      try {
+        final ws = await chief.terminal(
+          'run',
+          'observe',
+          offlineExecutor: paired,
+        );
+        expect(await ws.first, [7]);
+        await ws.close();
+      } finally {
+        chief.close();
+        paired.close();
+        await worker.close(force: true);
       }
     },
   );

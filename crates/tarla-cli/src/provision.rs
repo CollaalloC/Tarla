@@ -55,7 +55,14 @@ fn save(path: &Path, data: &[u8]) -> Result<()> {
     File::open(parent)?.sync_all()?;
     Ok(())
 }
-pub fn pair(home: &Path, id: &str, node: &str, origin: &Url, token_env: &str) -> Result<()> {
+pub fn pair(
+    home: &Path,
+    id: &str,
+    node: &str,
+    origin: &Url,
+    token_env: &str,
+    client_url: Option<&Url>,
+) -> Result<()> {
     tarla_workspace::validate_name(node)?;
     ensure!(
         !token_env.is_empty()
@@ -89,11 +96,27 @@ pub fn pair(home: &Path, id: &str, node: &str, origin: &Url, token_env: &str) ->
         .or_insert_with(|| toml::Value::Array(vec![]))
         .as_array_mut()
         .context("expected peer array")?;
-    let candidate = toml::Table::from_iter([
+    let mut candidate = toml::Table::from_iter([
         ("node_id".into(), node.into()),
         ("url".into(), origin.as_str().trim_end_matches('/').into()),
         ("token_env".into(), token_env.into()),
     ]);
+    if let Some(client) = client_url {
+        ensure!(
+            client.scheme() == "https"
+                && client.host().is_some()
+                && client.username().is_empty()
+                && client.password().is_none()
+                && client.query().is_none()
+                && client.fragment().is_none()
+                && client.path() == "/",
+            "client URL must be a bare HTTPS origin"
+        );
+        candidate.insert(
+            "client_url".into(),
+            client.as_str().trim_end_matches('/').into(),
+        );
+    }
     if let Some(existing) = peers
         .iter()
         .find(|p| p.get("node_id").and_then(toml::Value::as_str) == Some(node))

@@ -2,32 +2,43 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'api.dart' as api;
 import 'screens.dart';
+import 'profiles.dart';
 import 'local_core.dart';
 
 void main() => runApp(const TarlaApp());
 
 class TarlaApp extends StatelessWidget {
-  const TarlaApp({super.key});
+  final ProfileStore? profileStore;
+  const TarlaApp({this.profileStore, super.key});
   @override
   Widget build(BuildContext context) => MaterialApp(
     title: 'Tarla',
     theme: ThemeData(
       colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xff176756)),
     ),
-    home: const WorkspaceHome(),
+    home: WorkspaceHome(store: profileStore),
     debugShowCheckedModeBanner: false,
   );
 }
 
-Future<api.Profile?> connectProfile(BuildContext context) async {
-  final fields = List.filled(5, '');
+Future<api.Profile?> connectProfile(
+  BuildContext context, [
+  api.Profile? existing,
+]) async {
+  final fields = [
+    existing?.name ?? '',
+    existing?.supervisor.uri.toString() ?? '',
+    existing?.supervisor.token ?? '',
+    existing?.executor?.uri.toString() ?? '',
+    existing?.executor?.token ?? '',
+  ];
   String? error;
-  bool addExecutor = false;
+  bool addExecutor = existing?.executor != null;
   final result = await showDialog<api.Profile>(
     context: context,
     builder: (ctx) => StatefulBuilder(
       builder: (ctx, update) => AlertDialog(
-        title: const Text('连接工作空间'),
+        title: Text(existing == null ? '连接工作空间' : '编辑连接'),
         content: SizedBox(
           width: 420,
           child: SingleChildScrollView(
@@ -39,7 +50,9 @@ Future<api.Profile?> connectProfile(BuildContext context) async {
                   (1, '主管服务地址', 'https://core.example.com', false),
                   (2, '主管访问令牌', '', true),
                 ])
-                  TextField(
+                  TextFormField(
+                    initialValue: fields[entry.$1],
+                    readOnly: existing != null && entry.$1 == 0,
                     onChanged: (v) => fields[entry.$1] = v,
                     decoration: InputDecoration(
                       labelText: entry.$2,
@@ -56,11 +69,17 @@ Future<api.Profile?> connectProfile(BuildContext context) async {
                   onChanged: (v) => update(() => addExecutor = v),
                 ),
                 if (addExecutor) ...[
-                  TextField(
+                  TextFormField(
+                    initialValue: fields[3],
+                    autocorrect: false,
+                    enableSuggestions: false,
                     onChanged: (v) => fields[3] = v,
                     decoration: const InputDecoration(labelText: '已配对执行节点地址'),
                   ),
-                  TextField(
+                  TextFormField(
+                    initialValue: fields[4],
+                    autocorrect: false,
+                    enableSuggestions: false,
                     onChanged: (v) => fields[4] = v,
                     obscureText: true,
                     decoration: const InputDecoration(labelText: '执行节点访问令牌'),
@@ -84,7 +103,7 @@ Future<api.Profile?> connectProfile(BuildContext context) async {
             onPressed: () {
               try {
                 final name = fields[0].trim();
-                if (!RegExp(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$').hasMatch(name))
+                if (!api.Profile.validId(name))
                   throw const FormatException('请输入服务端配置的工作空间 ID');
                 Navigator.pop(
                   ctx,
@@ -100,7 +119,7 @@ Future<api.Profile?> connectProfile(BuildContext context) async {
                 update(() => error = e.message);
               }
             },
-            child: const Text('连接'),
+            child: Text(existing == null ? '连接' : '保存'),
           ),
         ],
       ),
@@ -110,40 +129,135 @@ Future<api.Profile?> connectProfile(BuildContext context) async {
 }
 
 class WorkspaceHome extends StatefulWidget {
-  const WorkspaceHome({super.key});
+  final ProfileStore? store;
+  const WorkspaceHome({this.store, super.key});
   @override
   State<WorkspaceHome> createState() => _WorkspaceHomeState();
 }
 
 class _WorkspaceHomeState extends State<WorkspaceHome> {
-  final profiles = <api.Profile>[];
-  api.Profile? selected;
-  Future<void> add() async {
-    final profile = await connectProfile(context);
-    if (mounted && profile != null) selectProfile(profile);
+  late final ProfileStore? store =
+      widget.store ?? DeviceProfileStore.forPlatform();
+  ProfileBook book = const ProfileBook();
+  bool loading = false, saving = false;
+  bool loadFailed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (store != null) restore();
   }
 
-  void selectProfile(api.Profile profile) {
+  Future<void> restore() async {
     setState(() {
-      profiles.removeWhere((p) => p.name == profile.name);
-      profiles.add(profile);
-      selected = profile;
+      loading = true;
+      loadFailed = false;
     });
+    try {
+      final restored = await store!.load();
+      if (mounted) setState(() => book = restored);
+    } catch (_) {
+      if (mounted) setState(() => loadFailed = true);
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  Future<void> persist(ProfileBook next) async {
+    if (saving) return;
+    setState(() => saving = true);
+    try {
+      await store?.save(next);
+      if (mounted)
+        setState(() {
+          book = next;
+          loadFailed = false;
+        });
+    } catch (_) {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('无法保存本机连接，请解锁设备后重试。')));
+    } finally {
+      if (mounted) setState(() => saving = false);
+    }
+  }
+
+  Future<void> add([api.Profile? existing]) async {
+    final profile = await connectProfile(context, existing);
+    if (mounted && profile != null) await selectProfile(profile);
+  }
+
+  Future<void> selectProfile(api.Profile profile) =>
+      persist(book.select(profile));
+
+  Future<void> forget({bool all = false}) async {
+    final id = book.activeId;
+    if (!all && id == null) return;
+    final yes = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(all ? '清除本机连接？' : '移除 $id 的本机配对？'),
+        content: const Text('本机保存的服务地址和访问令牌将被删除。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('移除'),
+          ),
+        ],
+      ),
+    );
+    if (mounted && yes == true)
+      await persist(all ? const ProfileBook() : book.remove(id!));
   }
 
   @override
   Widget build(BuildContext context) {
+    final selected = book.selected;
+    final profiles = book.entries;
+    if (loading || loadFailed) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Tarla')),
+        body: Center(
+          child: loading
+              ? const CircularProgressIndicator()
+              : Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text('无法读取本机配对信息，请解锁设备后重试。'),
+                    TextButton(
+                      onPressed: saving ? null : restore,
+                      child: const Text('重试'),
+                    ),
+                    TextButton(
+                      onPressed: saving ? null : () => forget(all: true),
+                      child: const Text('清除本机连接'),
+                    ),
+                  ],
+                ),
+        ),
+      );
+    }
     final header = AppBar(
       title: const Text('Tarla'),
       actions: [
         LocalCoreButton(onConnect: selectProfile),
         PopupMenuButton<int>(
           tooltip: '切换工作空间',
+          enabled: !saving,
           onSelected: (i) {
-            if (i < 0) {
+            if (i == -1) {
               add();
+            } else if (i == -2) {
+              add(selected);
+            } else if (i == -3) {
+              forget();
             } else {
-              setState(() => selected = profiles[i]);
+              persist(ProfileBook(profiles, profiles[i].name));
             }
           },
           itemBuilder: (_) => [
@@ -154,6 +268,10 @@ class _WorkspaceHomeState extends State<WorkspaceHome> {
                 child: Text(profiles[i].name),
               ),
             const PopupMenuItem(value: -1, child: Text('连接工作空间…')),
+            if (selected != null) ...[
+              const PopupMenuItem(value: -2, child: Text('编辑当前连接…')),
+              const PopupMenuItem(value: -3, child: Text('移除当前配对…')),
+            ],
           ],
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -173,17 +291,13 @@ class _WorkspaceHomeState extends State<WorkspaceHome> {
         body: Center(
           child: FilledButton.icon(
             icon: const Icon(Icons.add_link),
-            onPressed: add,
+            onPressed: saving ? null : () => add(),
             label: const Text('连接工作空间'),
           ),
         ),
       );
     }
-    return Session(
-      key: ObjectKey(selected),
-      profile: selected!,
-      header: header,
-    );
+    return Session(key: ObjectKey(selected), profile: selected, header: header);
   }
 }
 

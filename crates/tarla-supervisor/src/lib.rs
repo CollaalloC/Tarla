@@ -170,10 +170,11 @@ impl SupervisorEngine {
                 Err(error) => return Err(error.into()),
             }
         }
-        bail!(
+        Err(BrainError::Unavailable(format!(
             "all configured supervisor backends are unavailable ({})",
             errors.join(", ")
-        )
+        ))
+        .into())
     }
 
     pub async fn handle_trigger(

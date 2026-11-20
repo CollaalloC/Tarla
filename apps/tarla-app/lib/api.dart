@@ -19,6 +19,7 @@ class Endpoint {
     final u = Uri.tryParse(value.trim());
     if (u == null ||
         !u.hasAuthority ||
+        u.host.isEmpty ||
         u.userInfo.isNotEmpty ||
         u.hasQuery ||
         u.hasFragment ||
@@ -45,6 +46,8 @@ class Profile {
   final Endpoint supervisor;
   final Endpoint? executor;
   Profile(this.name, this.supervisor, [this.executor]);
+  static bool validId(String id) =>
+      RegExp(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$').hasMatch(id);
 }
 
 class ApiError implements Exception {
@@ -162,18 +165,57 @@ class TarlaApi {
   Future<dynamic> post(List<String> path, Row data) =>
       request('POST', path, data);
 
-  Future<WebSocket> terminal(String id, String mode) async {
-    final lease = await post(['runs', id, 'attach'], {'mode': mode}) as Row;
-    final target = lease['node_url'] as String?;
-    final base = target == null || target.isEmpty
-        ? endpoint.uri
-        : Endpoint.parse(target);
+  Future<Row> _grant(String id, String mode, String route) async =>
+      await post(['runs', id, 'attach'], {'mode': mode, 'route': route}) as Row;
+
+  Future<WebSocket> terminal(
+    String id,
+    String mode, {
+    TarlaApi? offlineExecutor,
+  }) async {
+    try {
+      final lease = await _grant(id, mode, 'auto');
+      final target = lease['node_url'] as String?;
+      if (target == null || target.isEmpty) {
+        return await _upgrade(id, mode, lease, endpoint.uri);
+      }
+      final direct = Endpoint.parse(target);
+      if (endpoint.uri.scheme == 'https' && direct.scheme != 'https') {
+        throw const FormatException('执行节点地址需要受信任的 HTTPS 连接');
+      }
+      try {
+        return await _upgrade(id, mode, lease, direct);
+      } catch (error) {
+        if (!unavailable(error)) rethrow;
+        final fresh = await _grant(id, mode, 'supervisor');
+        if (fresh['node_url'] != null && fresh['node_url'] != '') {
+          throw const FormatException('主管未返回本站中转票据');
+        }
+        return await _upgrade(id, mode, fresh, endpoint.uri);
+      }
+    } catch (error) {
+      if (offlineExecutor == null || !unavailable(error)) rethrow;
+      return offlineExecutor.terminal(id, mode);
+    }
+  }
+
+  Future<WebSocket> _upgrade(
+    String id,
+    String mode,
+    Row lease,
+    Uri base,
+  ) async {
+    if ((lease['run_id'] != null && lease['run_id'] != id) ||
+        (lease['mode'] != null && lease['mode'] != mode)) {
+      throw const FormatException('接管票据与本次任务或权限不一致');
+    }
     final url = base.replace(
       scheme: base.scheme == 'https' ? 'wss' : 'ws',
       pathSegments: ['v1', 'terminal', id],
     );
-    final ticket = lease['ticket'] as String;
-    if (ticket.isEmpty) throw const FormatException('接管票据为空');
+    final ticket = lease['ticket'];
+    if (ticket is! String || ticket.isEmpty)
+      throw const FormatException('接管票据为空');
     // Open the upgrade ourselves, so the ticket cannot follow HTTP redirects.
     final key = base64.encode(
       List.generate(16, (_) => Random.secure().nextInt(256)),
@@ -186,7 +228,13 @@ class TarlaApi {
       ..set('Sec-WebSocket-Key', key)
       ..set('Sec-WebSocket-Version', '13')
       ..set('Authorization', 'Bearer $ticket');
-    final res = await req.close().timeout(const Duration(seconds: 10));
+    final res = await req.close().timeout(
+      const Duration(seconds: 10),
+      onTimeout: () {
+        req.abort();
+        throw TimeoutException('终端握手超时');
+      },
+    );
     if (res.statusCode != HttpStatus.switchingProtocols ||
         res.headers.value('upgrade')?.toLowerCase() != 'websocket' ||
         res.headers.value('sec-websocket-accept') !=
@@ -197,7 +245,7 @@ class TarlaApi {
                   )
                   .bytes,
             )) {
-      await res.drain<void>();
+      req.abort();
       throw ApiError(res.statusCode, '终端接管失败');
     }
     return WebSocket.fromUpgradedSocket(

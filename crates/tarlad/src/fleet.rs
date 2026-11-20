@@ -848,7 +848,8 @@ fn update(
         c,
         id,
         "state_changed",
-        &json!({"run_id":id,"node_id":s.node(),"state":next,"terminal":t,"approval":approval}),
+        &json!({"run_id":id,"node_id":s.node(),"state":next,"terminal":t,"approval":approval,
+            "terminal_interactive": t.map(|_|terminal::owner_input(s,id)).transpose()?}),
     )?;
     Ok(())
 }

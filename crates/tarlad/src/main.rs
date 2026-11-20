@@ -16,6 +16,7 @@ mod s1;
 mod skills;
 mod slot_reports;
 mod terminal;
+mod terminal_relay;
 mod transcript;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -182,7 +183,15 @@ type Api<T = Json<Value>> = std::result::Result<T, ApiError>;
 struct ApiError(StatusCode, String);
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
-        Self(StatusCode::BAD_REQUEST, e.to_string())
+        let status = if matches!(
+            e.downcast_ref::<tarla_supervisor::BrainError>(),
+            Some(tarla_supervisor::BrainError::Unavailable(_))
+        ) {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        Self(status, e.to_string())
     }
 }
 impl From<rusqlite::Error> for ApiError {

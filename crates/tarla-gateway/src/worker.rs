@@ -237,7 +237,9 @@ struct Item {
     conv: String,
     job: String,
     tries: i64,
+    lease: String,
 }
+const LEASE_SECONDS: i64 = 12;
 #[derive(Copy, Clone)]
 enum Work {
     In,
@@ -253,8 +255,17 @@ impl Work {
     fn claim(self, g: &Gateway) -> Result<Option<Item>> {
         let mut db = g.db()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (table,pending)=match self{Self::In=>("inbox","AND i.done=0 AND NOT EXISTS(SELECT 1 FROM inbox p WHERE p.route=i.route AND p.n<i.n AND p.done=0)"),
-            Self::Out=>("outgoing","AND NOT EXISTS(SELECT 1 FROM outgoing p WHERE p.route=i.route AND p.n<i.n)")};
+        let table = self.table();
+        let pending = match self {
+            Self::In => {
+                "AND i.done=0 AND NOT EXISTS (
+                SELECT 1 FROM routes earlier_route JOIN inbox p ON p.route=earlier_route.id
+                WHERE earlier_route.conv=r.conv AND p.done=0 AND p.n<i.n)"
+            }
+            Self::Out => {
+                "AND NOT EXISTS(SELECT 1 FROM outgoing p WHERE p.route=i.route AND p.n<i.n)"
+            }
+        };
         let sql=format!("SELECT i.n, r.dest,r.id,r.conv,i.job,i.tries FROM {table} i JOIN routes r ON r.id=i.route WHERE i.retry<=? {pending} ORDER BY i.n LIMIT 1");
         let row = tx
             .query_row(&sql, [store::now()], |r| {
@@ -269,9 +280,10 @@ impl Work {
             })
             .optional()?;
         if let Some((n, dest, rid, conv, job, tries)) = row {
+            let lease = uuid::Uuid::new_v4().to_string();
             tx.execute(
-                &format!("UPDATE {table} SET retry=? WHERE n=?"),
-                params![store::now() + 180, n],
+                &format!("UPDATE {table} SET retry=?, lease=? WHERE n=?"),
+                params![store::now() + LEASE_SECONDS, lease, n],
             )?;
             tx.commit()?;
             Ok(Some(Item {
@@ -281,15 +293,13 @@ impl Work {
                 conv,
                 job,
                 tries,
+                lease,
             }))
         } else {
             Ok(None)
         }
     }
-    async fn one(self, g: &Gateway) -> Result<bool> {
-        let Some(i) = self.claim(g)? else {
-            return Ok(false);
-        };
+    async fn perform(self, g: &Gateway, i: &Item) -> Result<Option<String>> {
         let mut callback = None;
         let result: Result<()> = match self {
             Self::In => match serde_json::from_str(&i.job)? {
@@ -316,10 +326,38 @@ impl Work {
                 crate::drafts::send(g, &i.rid, &i.route, i.n, serde_json::from_str(&i.job)?).await
             }
         };
+        result?;
+        Ok(callback)
+    }
+
+    async fn one(self, g: &Gateway) -> Result<bool> {
+        let Some(i) = self.claim(g)? else {
+            return Ok(false);
+        };
         let table = self.table();
+        let pending = self.perform(g, &i);
+        tokio::pin!(pending);
+        let result = loop {
+            tokio::select! {
+                biased;
+                outcome = &mut pending => break outcome,
+                _ = sleep(Duration::from_secs(4)) => {
+                    let renewed = g.db()?.execute(&format!("UPDATE {table} SET retry=? WHERE n=? AND lease=?"),
+                        params![store::now() + LEASE_SECONDS, i.n, i.lease])?;
+                    if renewed == 0 { return Ok(true); }
+                }
+            }
+        };
         let mut db = g.db()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Err(e) = result {
+        if tx.execute(
+            &format!("UPDATE {table} SET lease=NULL WHERE n=? AND lease=?"),
+            params![i.n, i.lease],
+        )? != 1
+        {
+            return Ok(true);
+        }
+        if let Err(ref e) = result {
             let status = e.downcast_ref::<reqwest::Error>().and_then(|e| e.status());
             let final_reply = matches!(self, Self::Out)
                 && matches!(
@@ -366,12 +404,11 @@ impl Work {
                     )?;
                 }
             }
-            callback = None;
         }
         match self {
             Self::In => {
                 tx.execute("UPDATE inbox SET done=1,job='' WHERE n=?", [i.n])?;
-                if let Some(id) = callback {
+                if let Some(id) = result.ok().flatten() {
                     tx.execute(
                         "INSERT INTO outgoing(route,job) VALUES(?,?)",
                         params![i.rid, serde_json::to_string(&Delivery::Callback(id))?],
@@ -419,27 +456,57 @@ async fn poll(g: &Gateway) -> Result<()> {
             continue;
         }
         for a in &approvals {
-            if a["kind"] != "approval" || a["resolution"].as_str().is_some_and(|r| r != "pending") {
+            let terminal = a["kind"] == "terminal_input";
+            if (!terminal && a["kind"] != "approval")
+                || a["resolution"].as_str().is_some_and(|r| r != "pending")
+            {
                 continue;
             }
             let Some(action) = a["id"].as_str() else {
                 continue;
             };
-            let conv = if let Some(c) = a["conversation_id"].as_str() {
-                c.to_owned()
-            } else {
+            let run = if terminal || a["conversation_id"].as_str().is_none() {
                 let Some(id) = a["run_id"].as_str() else {
                     continue;
                 };
                 let Ok(run) = g.core(Method::GET, &["runs", id], &[], None).await else {
                     continue;
                 };
-                let Some(c) = run["conversation_id"].as_str() else {
+                Some(run)
+            } else {
+                None
+            };
+            let conv = run
+                .as_ref()
+                .and_then(|r| r["conversation_id"].as_str())
+                .or(a["conversation_id"].as_str());
+            if conv != Some(b.conversation_id.as_str()) {
+                continue;
+            }
+            if terminal {
+                let Some(run) = run else {
                     continue;
                 };
-                c.into()
-            };
-            if conv == b.conversation_id {
+                let (Some(workspace), Some(id)) =
+                    (run["workspace_id"].as_str(), run["run_id"].as_str())
+                else {
+                    continue;
+                };
+                let title: String = a["title"]
+                    .as_str()
+                    .unwrap_or("Terminal input needed")
+                    .chars()
+                    .take(400)
+                    .collect();
+                let detail: String = a["risk_reason"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(600)
+                    .collect();
+                let text = format!("{title}\n{detail}\nOpen this run on a paired CLI to respond.\ntarla --workspace {workspace} attach {id} --interactive");
+                store::queue_terminal_notice(&mut *g.db()?, &b, action, text)?;
+            } else {
                 store::queue_card(
                     &mut *g.db()?,
                     &b,
@@ -452,7 +519,7 @@ async fn poll(g: &Gateway) -> Result<()> {
     Ok(())
 }
 pub fn start(g: &Arc<Gateway>) {
-    for work in [Work::In, Work::Out] {
+    for work in std::iter::repeat_n(Work::In, 4).chain(std::iter::repeat_n(Work::Out, 4)) {
         let w = Arc::downgrade(g);
         tokio::spawn(async move {
             while let Some(g) = w.upgrade() {
@@ -483,6 +550,96 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::{path::Path, sync::Mutex};
 
+    fn gateway(core: Url, db: rusqlite::Connection) -> Gateway {
+        Gateway {
+            cfg: GatewayConfig {
+                database: ":memory:".into(),
+                core,
+                token: "owner-token".into(),
+                telegram: None,
+                feishu: None,
+                slack: None,
+                discord: None,
+            },
+            connection: Mutex::new(db),
+            client: reqwest::Client::new(),
+            feishu_token: Default::default(),
+            instance: "test".into(),
+            test_platform_origin: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_notice_is_scoped_and_never_issues_a_decision_token() {
+        use axum::routing::get;
+        let app = Router::new()
+            .route("/v1/actions", get(|| async { Json(json!([
+                {"id":"osc","kind":"terminal_input","run_id":"run17","title":"Choice required","risk_reason":"Choose a path"},
+                {"id":"tool","kind":"approval","conversation_id":"main","title":"Review tool"}
+            ])) }))
+            .route("/v1/runs/run17", get(|| async { Json(json!({"run_id":"run17","workspace_id":"work","conversation_id":"main"})) }))
+            .route("/v1/conversations/{id}/messages", get(|| async { Json(json!([])) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let core = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let g = gateway(core, store::open(Path::new(":memory:")).unwrap());
+        for (thread, conv, approvals) in [
+            ("on", "main", true),
+            ("off", "main", false),
+            ("other", "other", true),
+        ] {
+            let mut db = g.db().unwrap();
+            let code = store::issue(&db, "telegram", "actor", conv, approvals, 0).unwrap();
+            store::ingest(
+                &mut db,
+                Event {
+                    event_id: thread.into(),
+                    route: Route {
+                        platform: "telegram".into(),
+                        chat: "chat".into(),
+                        thread: thread.into(),
+                        actor: "actor".into(),
+                        reply_to: None,
+                    },
+                    input: Input::Message(format!("/pair {code}")),
+                },
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            poll(&g).await.unwrap();
+        }
+        let db = g.db().unwrap();
+        let notices: (i64, String, String) = db.query_row(
+            "SELECT count(*),r.thread,json_extract(o.job,'$.Text') FROM outgoing o JOIN routes r ON o.route=r.id WHERE o.job LIKE '%--interactive%'", [],
+            |r| Ok((r.get(0)?, r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!((notices.0, notices.1.as_str()), (1, "on"));
+        assert!(
+            notices.2.contains("Choose a path")
+                && notices
+                    .2
+                    .contains("tarla --workspace work attach run17 --interactive")
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM cards WHERE action='osc'", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM cards WHERE action='tool'", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn retried_platform_event_is_forwarded_to_core_once() {
         let count = Arc::new(AtomicUsize::new(0));
@@ -509,22 +666,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let db = store::open(Path::new(":memory:")).unwrap();
         let code = store::issue(&db, "telegram", "actor", "main", false, 0).unwrap();
-        let g = Gateway {
-            cfg: GatewayConfig {
-                database: ":memory:".into(),
-                core,
-                token: "owner-token".into(),
-                telegram: None,
-                feishu: None,
-                slack: None,
-                discord: None,
-            },
-            connection: Mutex::new(db),
-            client: reqwest::Client::new(),
-            feishu_token: Default::default(),
-            instance: "test".into(),
-            test_platform_origin: None,
-        };
+        let g = gateway(core, db);
         let route = Route {
             platform: "telegram".into(),
             chat: "chat".into(),

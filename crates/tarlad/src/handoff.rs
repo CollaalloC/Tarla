@@ -330,6 +330,13 @@ struct Launch {
 fn metadata_path(root: &Path, id: &str) -> PathBuf {
     root.join("runtime/pinned").join(format!("{id}.result"))
 }
+pub fn structured_turn(root: &Path, id: &str) -> Result<bool> {
+    validate_id(id)?;
+    Ok(metadata_path(root, id)
+        .with_extension("launch")
+        .try_exists()?)
+}
+
 fn argv_for(slot: &fleet::Slot, prompt: String, session: Option<&str>) -> Result<Vec<String>> {
     let mut args = slot.argv.clone();
     for opt in args.iter().skip(1) {

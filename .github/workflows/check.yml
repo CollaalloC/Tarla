@@ -66,6 +66,9 @@ jobs:
       - name: Executor recovery, cancellation and account ownership
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: python3 tests/executor_recovery.py
+      - name: Direct and supervisor-routed terminal sessions
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: python3 tests/stage3_terminal.py
       - name: Framed terminal observer
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: cargo test --locked -p tarlad private_observer_streams -- --ignored
@@ -112,6 +115,7 @@ jobs:
         run: |
           python3 tests/draft_stream.py
           python3 tests/gateway_stream.py
+          python3 tests/gateway_recovery.py
       - name: S2 visibility and completion receipt latency
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: python3 tests/replication_latency.py --samples 5 --warmup 2 --jitter-ms 50 --receipt-samples 2 --successful-receipts
