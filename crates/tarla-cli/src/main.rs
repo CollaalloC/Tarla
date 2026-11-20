@@ -384,7 +384,8 @@ async fn main() -> Result<()> {
 
 async fn attach(c: &Client, id: &str, interactive: bool, via_supervisor: bool) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
-    use tokio::{io::AsyncReadExt, time::interval};
+    use std::io::Read;
+    use tokio::{sync::mpsc, time::interval};
     use tokio_tungstenite::{
         connect_async,
         tungstenite::{client::IntoClientRequest, Message},
@@ -443,24 +444,67 @@ async fn attach(c: &Client, id: &str, interactive: bool, via_supervisor: bool) -
         crossterm::terminal::enable_raw_mode()?;
     }
     let _guard = Raw(raw);
-    let mut input = tokio::io::stdin();
-    let mut chunk = [0; 4096];
+    let (sender, mut input) = mpsc::channel::<std::io::Result<Vec<u8>>>(1);
+    if interactive {
+        // The CLI exits after this attachment. An idle console read must not
+        // keep the Tokio runtime alive after the remote terminal closes.
+        std::thread::Builder::new()
+            .name("terminal-stdin".into())
+            .spawn(move || {
+                let mut stdin = std::io::stdin().lock();
+                let mut buf = [0; 4096];
+                loop {
+                    match stdin.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if sender.blocking_send(Ok(buf[..n].to_vec())).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => {
+                            let _ = sender.blocking_send(Err(error));
+                            break;
+                        }
+                    }
+                }
+            })?;
+    }
     let mut resize = interval(Duration::from_millis(350));
     let mut last_size = None;
     loop {
         tokio::select! {
-            remote=socket.next()=>match remote.transpose()?{
-                None|Some(Message::Close(_))=>break,Some(Message::Binary(bytes))=>{let mut o=std::io::stdout().lock();o.write_all(&bytes)?;o.flush()?;},
-                Some(Message::Text(s))=>eprintln!("{s}"),Some(Message::Ping(p))=>socket.send(Message::Pong(p)).await?,_=>{}
+            remote = socket.next() => match remote.transpose()? {
+                None | Some(Message::Close(_)) => break,
+                Some(Message::Binary(bytes)) => {
+                    let mut out = std::io::stdout().lock();
+                    out.write_all(&bytes)?;
+                    out.flush()?;
+                }
+                Some(Message::Text(text)) => eprintln!("{text}"),
+                Some(Message::Ping(payload)) => socket.send(Message::Pong(payload)).await?,
+                _ => {}
             },
-            n=input.read(&mut chunk), if interactive=>{let n=n?;if n==0{break}
-                if let Some(pos)=chunk[..n].iter().position(|b|*b==29){if pos>0{socket.send(Message::Binary(chunk[..pos].to_vec().into())).await?;}break}
-                socket.send(Message::Binary(chunk[..n].to_vec().into())).await?;
-            },
-            _=resize.tick(), if raw=>{if let Ok((cols,rows))=crossterm::terminal::size(){if last_size!=Some((cols,rows)){
-                socket.send(Message::Text(json!({"cols":cols,"rows":rows}).to_string().into())).await?;
-                last_size=Some((cols,rows));
-            }}},
+            next = input.recv(), if interactive => {
+                let Some(mut bytes) = next.transpose()? else { break };
+                if let Some(pos) = bytes.iter().position(|b| *b == 29) {
+                    bytes.truncate(pos);
+                    if !bytes.is_empty() {
+                        socket.send(Message::Binary(bytes.into())).await?;
+                    }
+                    break;
+                }
+                socket.send(Message::Binary(bytes.into())).await?;
+            }
+            _ = resize.tick(), if raw => {
+                if let Ok(size @ (cols, rows)) = crossterm::terminal::size() {
+                    if last_size != Some(size) {
+                        let message = json!({"cols":cols,"rows":rows}).to_string();
+                        socket.send(Message::Text(message.into())).await?;
+                        last_size = Some(size);
+                    }
+                }
+            }
         }
     }
     let _ = socket.close(None).await;

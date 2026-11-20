@@ -132,8 +132,8 @@ def send(p, message, log):
     until(observed, "terminal delivered " + message)
 
 
-class LegacyExecutor(BaseHTTPRequestHandler):
-    """The previous executor returns the terminal address only inside its signed ticket."""
+class ExecutorFixture(BaseHTTPRequestHandler):
+    """Emulate the previous and current ticket response formats on a loopback WebSocket."""
     protocol_version = "HTTP/1.1"
 
     def do_POST(self):
@@ -149,8 +149,11 @@ class LegacyExecutor(BaseHTTPRequestHandler):
         signature = hmac.digest(self.server.signing_key, b"tarla/attach/v1\0" + payload, "sha256")
         token = (payload + b"." + base64.urlsafe_b64encode(signature).rstrip(b"=")).decode()
         self.server.issued.add(token)
-        response = json.dumps({"run_id": grant["run_id"], "node_id": "worker", "mode": grant["mode"],
-                               "expires_in": 60, "ticket": token}).encode()
+        response = {"run_id": grant["run_id"], "node_id": "worker", "mode": grant["mode"],
+                    "expires_in": 60, "ticket": token}
+        if self.server.current_protocol:
+            response["hc_terminal_id"] = grant["hc_terminal_id"]
+        response = json.dumps(response).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(response)))
@@ -169,12 +172,36 @@ class LegacyExecutor(BaseHTTPRequestHandler):
         self.send_header("Upgrade", "websocket")
         self.send_header("Sec-WebSocket-Accept", base64.b64encode(hashlib.sha1(key.encode()).digest()).decode())
         self.end_headers()
-        payload = self.server.repaint
-        self.wfile.write(b"\x82\x7f" + len(payload).to_bytes(8, "big") + payload + b"\x88\x00")
+        if self.server.current_protocol:
+            # The CLI sends one masked binary keystroke. Echo it and end the session.
+            self.connection.settimeout(5)
+            assert self.rfile.read(2) == b"\x82\x81"
+            mask = self.rfile.read(4)
+            key = self.rfile.read(1)[0] ^ mask[0]
+            self.wfile.write(b"\x82\x01" + bytes([key]))
+        else:
+            payload = self.server.repaint
+            self.wfile.write(b"\x82\x7f" + len(payload).to_bytes(8, "big") + payload)
+        self.wfile.write(b"\x88\x00")
         self.close_connection = True
 
     def log_message(self, *_):
         pass
+
+
+def check_idle_cli_close(chief, rid):
+    args = [BIN / "tarla", "--home", chief.home, "--workspace", chief.workspace, "--url", chief.url,
+            "attach", rid, "--interactive", "--via-supervisor"]
+    with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+        try:
+            proc.stdin.write(b"x")
+            proc.stdin.flush()
+            # Keep stdin open after the keystroke. Only the peer initiates closure.
+            assert proc.wait(timeout=5) == 0, proc.stderr.read().decode()
+            assert proc.stdout.read() == b"x"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
 
 
 def check_routes(root):
@@ -182,8 +209,9 @@ def check_routes(root):
     rid = "legacy-run"
     public = "https://worker.example.invalid"
     with contextlib.ExitStack() as stack:
-        peer = stack.enter_context(ThreadingHTTPServer(("127.0.0.1", 0), LegacyExecutor))
+        peer = stack.enter_context(ThreadingHTTPServer(("127.0.0.1", 0), ExecutorFixture))
         peer.terminal, peer.issued = "t1b", set()
+        peer.current_protocol = False
         peer.repaint = b"screen repaint\r\n" * 8192  # one valid output frame larger than the input limit
         peer.pair_secret, peer.signing_key = secrets.token_hex(32), secrets.token_bytes(32)
         threading.Thread(target=peer.serve_forever, daemon=True).start()
@@ -215,6 +243,8 @@ def check_routes(root):
         assert ws_status(chief, rid, grant["ticket"]) == 401
         peer.terminal = "t2"
         assert ws_status(chief, rid, ticket(chief, rid, route="supervisor")["ticket"]) == 409
+        peer.current_protocol, peer.terminal = True, "t1b"
+        check_idle_cli_close(chief, rid)
         chief.stop()
         # This peer is private HTTPS, with no public origin and no reachable transport.
         offline = f"https://127.0.0.1:{free_port()}"
@@ -224,7 +254,7 @@ def check_routes(root):
         assert grant["route"] == "supervisor" and "node_url" not in grant
         denied(lambda: ticket(chief, rid, route="direct"), 502)
         assert ws_status(chief, rid, grant["ticket"]) == 502
-    print("PASS private HTTPS relay selection, explicit client origin, legacy observer, scoped ticket and offline errors")
+    print("PASS private HTTPS relay selection, explicit client origin, legacy observer, scoped ticket, remote CLI close with idle stdin and offline errors")
 
 
 def run(root):
