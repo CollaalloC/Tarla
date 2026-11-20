@@ -7,12 +7,12 @@ import 'package:tarla_app/profiles.dart';
 import 'package:tarla_app/screens.dart';
 
 api.Profile profile(String id, [String? fallback]) => api.Profile(
-  id,
-  api.Endpoint('https://$id.example.test', '$id-token'),
-  fallback == null
-      ? null
-      : api.Endpoint('https://worker.example.test', fallback),
-);
+      id,
+      api.Endpoint('https://$id.example.test', '$id-token'),
+      fallback == null
+          ? null
+          : api.Endpoint('https://worker.example.test', fallback),
+    );
 
 class MemoryStore implements ProfileStore {
   String? raw;
@@ -91,7 +91,12 @@ void main() {
       Future<void> menu(String item) async {
         await tester.tap(find.byTooltip('切换工作空间'));
         await tester.pumpAndSettle();
-        await tester.tap(find.text(item).last);
+        final choice = find.ancestor(
+          of: find.text(item),
+          matching:
+              find.byWidgetPredicate((widget) => widget is PopupMenuItem<int>),
+        );
+        await tester.tap(choice);
         await tester.pumpAndSettle();
       }
 
