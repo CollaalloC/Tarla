@@ -112,11 +112,53 @@ impl AttachLease {
         );
         Ok(lease)
     }
+
+    /// Compare scope only. The paired executor still authenticates and consumes
+    /// its own ticket when the relay opens the executor WebSocket.
+    pub fn matches_peer_ticket_scope(&self, ticket: &str) -> bool {
+        if ticket.len() > 8192 {
+            return false;
+        }
+        let Some((body, _)) = ticket.split_once('.') else {
+            return false;
+        };
+        let Some(peer) = B64
+            .decode(body)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
+        else {
+            return false;
+        };
+        self.workspace_id == peer.workspace_id
+            && self.node_id == peer.node_id
+            && self.run_id == peer.run_id
+            && self.hc_terminal_id == peer.hc_terminal_id
+            && self.mode == peer.mode
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_peer_ticket_must_name_the_same_terminal_and_mode() {
+        let key = [73; 32];
+        let issued = |w, n, r, t, m| AttachLease::issue(&key, w, n, r, t, m, 5).unwrap();
+        let mode = AttachMode::Observe;
+        let t = issued("w", "n", "r", "t1", mode);
+        let relay = AttachLease::verify(&t, &key, "w", "n", 5).unwrap();
+        assert!(relay.matches_peer_ticket_scope(&issued("w", "n", "r", "t1", mode)));
+        for other in [
+            issued("v", "n", "r", "t1", mode),
+            issued("w", "m", "r", "t1", mode),
+            issued("w", "n", "s", "t1", mode),
+            issued("w", "n", "r", "t2", mode),
+            issued("w", "n", "r", "t1", AttachMode::Interactive),
+            "invalid".into(),
+        ] {
+            assert!(!relay.matches_peer_ticket_scope(&other));
+        }
+    }
     #[test]
     fn ticket_is_bound_to_audience_key_and_time() {
         let key = [73; 32];

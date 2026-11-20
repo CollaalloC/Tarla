@@ -104,6 +104,7 @@ pub(crate) async fn post(
     tokio::pin!(pending);
     let key = source(&r.platform, event);
     let previews = async {
+        let mut caught_up = false;
         loop {
             tokio::time::sleep(Duration::from_millis(650)).await;
             let query = [
@@ -115,6 +116,17 @@ pub(crate) async fn post(
             if let Ok(Ok(v)) = tokio::time::timeout(Duration::from_secs(2), req).await {
                 if v["status"] == "streaming" {
                     if let Some(t) = v["text"].as_str() {
+                        // A prior turn may have finished since the last poll.
+                        // Queue its answer before displaying this turn's preview.
+                        if !caught_up {
+                            caught_up = g
+                                .queue_history_page(rid, &r.platform, conv)
+                                .await
+                                .unwrap_or(false);
+                            if !caught_up {
+                                continue;
+                            }
+                        }
                         let now_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -363,7 +375,7 @@ mod tests {
         // Restart after the edit. The permanent final must edit this same remote ID.
         drop(g);
         let g = gw(&file, api);
-        store::queue_messages(&mut *g.db().unwrap(),&b,&[json!({"seq_no":2,"source_msg_id":key,"sender_role":"assistant","content":"Final answer."})]).unwrap();
+        store::queue_messages(&mut *g.db().unwrap(),&b.id,&b.route.platform,&[json!({"seq_no":2,"source_msg_id":key,"sender_role":"assistant","content":"Final answer."})]).unwrap();
         sample(&g, "late partial", 15000);
         drain(&g, &b).await;
         let transcript: Vec<_> = calls
@@ -428,7 +440,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetches_only_the_inflight_origin_before_the_post_completes() {
+    async fn prior_committed_reply_is_queued_before_the_next_turns_live_preview() {
         use axum::{
             extract::Query,
             http::HeaderMap,
@@ -444,6 +456,13 @@ mod tests {
                 assert_eq!(body["source_msg_id"],"E");
                 done.notified().await;
                 Json(json!({"reply":"done"}))
+            }).get(|Query(q):Query<HashMap<String,String>>| async move {
+                assert_eq!(q["after_seq"],"0");
+                Json(json!([
+                    {"seq_no":1,"channel_type":"feishu","source_msg_id":"older","sender_role":"user","content":"first question"},
+                    {"seq_no":2,"channel_type":"supervisor","source_msg_id":"in:feishu:older","sender_role":"assistant","content":"first answer"},
+                    {"seq_no":3,"channel_type":"telegram","source_msg_id":"E","sender_role":"user","content":"question"}
+                ]))
             }))
             .route("/v1/conversations/C/draft",get(|headers:HeaderMap,Query(q):Query<HashMap<String,String>>|async move{
                 assert_eq!(headers["authorization"],"Bearer owner");
@@ -477,6 +496,22 @@ mod tests {
             if n==1{break}tokio::time::sleep(Duration::from_millis(25)).await;
         }}).await.unwrap();
         assert!(!msg.is_finished());
+        {
+            let db = g.db().unwrap();
+            let mut query = db.prepare("SELECT job FROM outgoing ORDER BY n").unwrap();
+            let queue: Vec<Value> = query
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(|raw| serde_json::from_str(&raw.unwrap()).unwrap())
+                .collect();
+            assert_eq!(
+                queue,
+                [
+                    json!({"Text":"first answer"}),
+                    json!({"Draft":{"source":"in:telegram:E"}})
+                ]
+            );
+        }
         finished.notify_one();
         msg.await.unwrap().unwrap();
         server.abort();

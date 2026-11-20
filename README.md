@@ -105,6 +105,7 @@ python3 tests/acceptance.py
 | 二 · 配对与同步 | 在独立进程间同步 S2 记忆，断线补传和重启对账，验证限时终端票据及工位交接 | [双机使用与验收](docs/stage2.md) · [双网配置](docs/managed-networks.md) · [双节点延迟实测](docs/replication-latency.md) · [工位验收](tests/pinned.py) |
 | 三 · 网关与客户端 | 对话、任务、审批和记忆的客户端接口，四个 IM 平台的入站和出站协议，以及原生应用构建和模拟器启动 | [客户端对真实守护进程的测试](apps/tarla-app/test/daemon_contract_test.dart) · [网关配置](crates/tarla-gateway/README.md) · [客户端构建与下载](https://github.com/CollaalloC/Tarla/actions/workflows/flutter-platforms.yml) |
 
+- [从 CLI 或网关接管任务终端](docs/stage3.md)
 - [Flutter 客户端及真机/模拟器连接](apps/tarla-app/README.md)
 - [飞书、Telegram、Slack、Discord 网关的配置与配对](crates/tarla-gateway/README.md)
 - [记忆后端、外部索引与离线行为](crates/tarla-memory/README.md)

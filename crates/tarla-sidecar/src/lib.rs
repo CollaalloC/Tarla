@@ -3,7 +3,10 @@ mod herdr;
 mod managed;
 mod network;
 mod secrets;
-pub use herdr::{Herdr, TerminalEvent, TerminalReader, TerminalStatus, TerminalWriter};
+pub use herdr::{
+    Herdr, TerminalEvent, TerminalReader, TerminalStatus, TerminalWriter, MAX_HERDR_FRAME_BYTES,
+    MAX_TERMINAL_INPUT_BYTES,
+};
 pub use managed::{credential_environment, try_lock_slot, Toolchain};
 pub use network::{start_network, start_network_for, ManagedNetwork, NetworkPorts, NetworkSpec};
 
