@@ -718,25 +718,43 @@ class _TerminalPageState extends State<TerminalPage> {
   }
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: Text(widget.mode == 'observe' ? '旁观终端' : '接管终端')),
-    body: SafeArea(
-      child: Column(
-        children: [
-          if (status.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.all(8),
-              child: SelectableText(status),
+  Widget build(BuildContext context) {
+    final platform = Theme.of(context).platform;
+    final mobileInput = widget.mode == 'interactive' &&
+        (platform == TargetPlatform.android || platform == TargetPlatform.iOS);
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.mode == 'observe' ? '旁观终端' : '接管终端'),
+        actions: [
+          if (mobileInput)
+            IconButton(
+              tooltip: '发送回车',
+              icon: const Icon(Icons.keyboard_return),
+              onPressed: socket == null
+                  ? null
+                  : () => terminal.keyInput(TerminalKey.enter),
             ),
-          Expanded(
-            child: TerminalView(
-              terminal,
-              readOnly: socket == null || widget.mode == 'observe',
-              autofocus: socket != null && widget.mode == 'interactive',
-            ),
-          ),
         ],
       ),
-    ),
-  );
+      body: SafeArea(
+        child: Column(
+          children: [
+            if (status.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.all(8),
+                child: SelectableText(status),
+              ),
+            Expanded(
+              child: TerminalView(
+                terminal,
+                deleteDetection: mobileInput,
+                readOnly: socket == null || widget.mode == 'observe',
+                autofocus: socket != null && widget.mode == 'interactive',
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }

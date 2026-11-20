@@ -731,8 +731,7 @@ async fn step(s: &Service, job: &Value) -> Result<()> {
             hc.cancel(rid, &t).await?;
             return Ok(());
         }
-        let status = st.status.unwrap_or(Value::Null);
-        if status["state"] == "blocked" || st.state == "blocked" {
+        if let Some((record_id, status)) = st.blocked_prompt() {
             let reason = status["msg"]
                 .as_str()
                 .or(status["title"].as_str())
@@ -742,7 +741,11 @@ async fn step(s: &Service, job: &Value) -> Result<()> {
             if !hooks::active(&tx, rid, s.node())? {
                 return Ok(());
             }
-            let fingerprint = format!("{:x}", Sha256::digest(status.to_string()));
+            let prompt_key = match record_id {
+                Some(id) => json!([id, status]).to_string(),
+                None => status.to_string(),
+            };
+            let fingerprint = format!("{:x}", Sha256::digest(prompt_key));
             let existing = tx
                 .query_row(
                     "SELECT fingerprint FROM service_osc WHERE run_id=?",

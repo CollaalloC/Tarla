@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -65,7 +66,7 @@ def run(root, hc):
             chief.peer(peer,variable)
             peer.peer(chief,variable)
         project=install_test_slot(worker,hc)
-        fact="The fixture drift was caused by an inverted calibration offset."
+        fact="The fixture drift was caused by an inverted calibration offset"
         private="stage-two-private-transcript-marker"
         (project/"job.py").write_text(
             "import json,sys,time\nfrom pathlib import Path\n"
@@ -76,13 +77,13 @@ def run(root, hc):
             "    if Path('finish').exists(): break\n"
             "    time.sleep(.05)\n"
             "else: raise SystemExit(1)\n"
-            f"print({fact!r},flush=True)\n")
+            f"print({(fact + '.')!r},flush=True)\n")
         for node in (chief,worker,mirror):
             cleanup.callback(node.stop)
             node.start(keys)
         until(lambda:any(s["node_id"]=="worker" for s in chief.api("/v1/slots")),"remote slot registered")
         req={"conversation_id":"calibration","objective":"Explain the calibration drift",
-             "request_id":"network-host-probe","target_node_id":"worker","target_slot_id":"fixture"}
+             "request_id":"network-host-probe","node_id":"worker","slot_id":"fixture"}
         rid=chief.api("/v1/runs",req)["run_id"]
         until(lambda:(project/"launches").exists() and rid in (project/"launches").read_text(),"worker executing")
         # An actual link partition hides the mirror from both other network stacks.
@@ -94,7 +95,18 @@ def run(root, hc):
         lookup="/v1/memories?query="+quote("calibration")
         def learned(peer):
             return next((m for m in peer.api(lookup) if fact in m["content"]),None)
-        lesson=until(lambda:learned(chief),"supervisor accepted automatic lesson")
+        try:
+            lesson=until(lambda:learned(chief),"supervisor accepted automatic lesson")
+        except AssertionError:
+            # Distinguish a missed receipt, failed extraction and rejected proposal.
+            with sqlite3.connect(worker.dir/"state.db") as db:
+                print("worker receipt:",db.execute("SELECT event_type,acked_at FROM outbox_events WHERE run_id=?", (rid,)).fetchall(),flush=True)
+                print("worker extraction:",db.execute("SELECT state,attempts FROM service_distillations WHERE run_id=?", (rid,)).fetchall(),flush=True)
+                print("worker proposal:",db.execute("SELECT result FROM service_proposals WHERE json_extract(proposal,'$.source_run_id')=?", (rid,)).fetchall(),flush=True)
+            receipt=chief.api("/v1/runs/"+rid)
+            print("chief receipt:",receipt["observed_state"],receipt["receipt_summary"],flush=True)
+            print("chief matching memories:",chief.api(lookup),flush=True)
+            raise
         assert chief.api("/v1/runs",req)["run_id"]==rid
         before=time.monotonic()
         ip("link","set",mirror.link,"up")

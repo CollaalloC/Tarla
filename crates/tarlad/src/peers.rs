@@ -479,16 +479,17 @@ pub(super) fn accept_events(
 }
 pub async fn replicate(s: S) {
     loop {
-        if let Err(e) = round(&s).await {
+        let mut confirmed_through = None;
+        if let Err(e) = round(&s, &mut confirmed_through).await {
             eprintln!("replication deferred: {e}")
         }
-        if let Err(e) = hooks::flush_memory(&s).await {
+        if let Err(e) = hooks::flush_memory(&s, confirmed_through).await {
             eprintln!("memory proposal deferred: {e}")
         }
         tokio::select! {_=s.sync_wake.notified()=>(),_=s.notify.notified()=>(),_=tokio::time::sleep(Duration::from_millis(900))=>()}
     }
 }
-async fn round(s: &Service) -> Result<()> {
+async fn round(s: &Service, confirmed_through: &mut Option<i64>) -> Result<()> {
     if s.is_supervisor() {
         let mut c = s.db()?;
         let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -502,6 +503,12 @@ async fn round(s: &Service) -> Result<()> {
         }
         tx.execute("UPDATE runs SET observed_state='unconfirmed',updated_at=? WHERE observed_state IN ('running','blocked','dispatch_pending') AND target_node_id IN (SELECT node_id FROM service_peers WHERE seen<?)",params![now(),now()-15])?;
         tx.commit()?;
+        // Local receipt application and acknowledgement share this transaction.
+        // The per-event ack still gates concurrently created local proposals.
+        *confirmed_through = Some(i64::MAX);
+        if batch.len() == 24 {
+            s.sync_wake.notify_one();
+        }
         if batch.iter().any(|e| e["event_type"] == "run_receipt") {
             s.receipt_wake.notify_one();
         }
@@ -683,7 +690,9 @@ async fn round(s: &Service) -> Result<()> {
             s.sync_wake.notify_one();
         }
     }
+    let committed_frontier = s1::sent(&tx, s.supervisor())?;
     tx.commit()?;
+    *confirmed_through = Some(committed_frontier);
     let mut memory = SqliteMemory::new(&mut c, s.id(), s.node());
     let more = if !response["s2"].is_null() {
         memory.consume_replica_reply(

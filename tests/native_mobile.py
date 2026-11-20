@@ -1,7 +1,7 @@
-"""Run the installed Flutter client twice on a supplied emulator against three real host daemons.
+"""Exercise the Flutter client across three process launches against three real host daemons.
 
-Set TARLA_TEST_HC to the matching host's herdr-core. This fixture publishes only two
-supervisor URLs and their workspace bearer tokens to the first disposable app process.
+Set TARLA_TEST_HC to the matching host's herdr-core. Only the first disposable app process receives the two supervisor pairings and the independent
+executor pairing. The other app processes must restore all credentials from native secure storage.
 """
 import argparse
 import contextlib
@@ -21,6 +21,7 @@ from acceptance import BIN, Model, Node, ROOT, install_test_slot, until
 
 APP = ROOT / "apps/tarla-app"
 OBJECTIVE = "Mobile terminal relay verification"
+DIRECT_OBJECTIVE = "Mobile offline executor verification"
 FIRST = "Original mobile archive entry"
 LIFE = "Personal archive from the life workspace"
 
@@ -51,10 +52,13 @@ def seed(root, stack, hc):
     pair(worker,work)
     project = install_test_slot(worker,hc)
     (project/"job.py").write_text(
-        "import sys,time\nfrom pathlib import Path\n"
-        "print('MOBILE-PTY-READY',flush=True)\n"
-        "line=input().strip()\nPath('mobile-input').write_text(line)\n"
-        "print('MOBILE-INPUT-ACCEPTED' if line=='mobile-input-proof' else 'BAD-INPUT',flush=True)\n"
+        "import json,sys,time\nfrom pathlib import Path\n"
+        f"direct=json.loads(sys.argv[1])['objective']=={DIRECT_OBJECTIVE!r}\n"
+        "print('MOBILE-DIRECT-READY' if direct else 'MOBILE-PTY-READY',flush=True)\n"
+        "line=input().strip()\nPath('direct-input' if direct else 'mobile-input').write_text(line)\n"
+        "expected='offline-input-proof' if direct else 'mobile-input-proof'\n"
+        "ack='MOBILE-DIRECT-ACCEPTED' if direct else 'MOBILE-INPUT-ACCEPTED'\n"
+        "print(ack if line==expected else 'BAD-INPUT',flush=True)\n"
         "time.sleep(4)\n"
     )
     pairing = secrets.token_hex(32)
@@ -70,6 +74,9 @@ def seed(root, stack, hc):
     run = work.api("/v1/runs", {"conversation_id":"mobile-task","objective":OBJECTIVE,
         "node_id":"desk","slot_id":"fixture","acceptance_criteria":["Record the terminal input."]})["run_id"]
     until(lambda: work.api("/v1/runs/"+run).get("hc_terminal_id"), "real waiting PTY",timeout=45)
+    visible_runs = work.api("/v1/runs")
+    assert any(row["run_id"]==run and row["objective"]==OBJECTIVE and row["target_node_id"]=="desk"
+               for row in visible_runs), "remote task absent from supervisor run list"
     # Preserve proof after the short-lived replay-protection table's normal expiry.
     for node in (work,worker):
         with sqlite3.connect(node.dir/"state.db") as db:
@@ -100,31 +107,50 @@ def main():
     with tempfile.TemporaryDirectory(prefix="tm-",dir="/tmp") as tmp, contextlib.ExitStack() as cleanup:
         root=Path(tmp)
         work,worker,life,project=seed(root,cleanup,hc)
-        if args.platform=="android":
-            for node in (work,life):
+        def forward_android(node):
+            if args.platform=="android":
                 port=f"tcp:{node.port}"
                 subprocess.run(["adb","-s",args.device,"reverse",port,port],check=True)
                 cleanup.callback(subprocess.run,["adb","-s",args.device,"reverse","--remove",port],check=False)
+        def stop_app():
+            if args.platform=="android":
+                subprocess.run(["adb","-s",args.device,"shell","am","force-stop","dev.tarla.client"],check=True)
+            else:
+                # Flutter may already have closed the process after reporting results.
+                subprocess.run(["xcrun","simctl","terminate",args.device,"dev.tarla.client"],check=False)
+        def used_leases(node):
+            with sqlite3.connect(node.dir/"state.db") as db:
+                return db.execute("SELECT count(*) FROM mobile_used_leases").fetchone()[0]
+        forward_android(work)
+        forward_android(life)
         config=root/"ephemeral.json"
         config.write_text(json.dumps({"WORK_URL":work.url,"WORK_TOKEN":work.token,
-            "LIFE_URL":life.url,"LIFE_TOKEN":life.token}))
+            "LIFE_URL":life.url,"LIFE_TOKEN":life.token,"WORKER_URL":worker.url,"WORKER_TOKEN":worker.token}))
         config.chmod(0o600)
         flutter(args.device,"native_pairing_test.dart",config)
         until(lambda:(project/"mobile-input").is_file(), "input recorded in real executor")
         assert (project/"mobile-input").read_text()=="mobile-input-proof"
         for node in (work,worker):
-            with sqlite3.connect(node.dir/"state.db") as db:
-                (used,)=db.execute("SELECT count(*) FROM mobile_used_leases").fetchone()
-                assert used>=2, f"{node.name} consumed {used} leases for two UI sessions"
+            assert used_leases(node)>=2, f"{node.name} did not consume both relay leases"
         config.unlink()
-        if args.platform=="android":
-            subprocess.run(["adb","-s",args.device,"shell","am","force-stop","dev.tarla.client"],check=True)
-        else:
-            # Flutter may have terminated the first process after reporting its result.
-            subprocess.run(["xcrun","simctl","terminate",args.device,"dev.tarla.client"],check=False)
+        stop_app()
         flutter(args.device,"native_restore_test.dart")
-        print(f"PASS {args.platform} fresh-process secure restore, two real workspace archives, "
-              "supervisor-relayed observe/input and two executor leases")
+        # The restore phase selected work; only that profile pairs the executor. Stage
+        # another real input-waiting job before taking down the sole authority process.
+        direct = work.api("/v1/runs", {"conversation_id":"offline-mobile","objective":DIRECT_OBJECTIVE,
+            "node_id":"desk","slot_id":"fixture","acceptance_criteria":["Record offline input."]})["run_id"]
+        until(lambda: work.api("/v1/runs/"+direct).get("hc_terminal_id"), "offline PTY started",timeout=45)
+        relay_before, worker_before = used_leases(work), used_leases(worker)
+        stop_app()
+        work.stop()
+        forward_android(worker)
+        flutter(args.device,"native_offline_test.dart")
+        until(lambda:(project/"direct-input").is_file(),"offline input recorded by the isolated executor")
+        assert (project/"direct-input").read_text()=="offline-input-proof"
+        assert used_leases(work)==relay_before and used_leases(worker)>=worker_before+2
+        print(f"PASS {args.platform} secure cold restore, both workspace archives, online relay, "
+              "offline paired-executor observe/input and new scoped leases")
+
 
 
 if __name__=="__main__":

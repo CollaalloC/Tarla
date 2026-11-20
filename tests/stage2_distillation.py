@@ -4,15 +4,18 @@ import json
 import os
 import secrets
 import sqlite3
+import statistics
 import sys
 import tempfile
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request
 
 from acceptance import HTTP, Model, Node, install_test_slot, until
+from s1_reconciliation import Link
 
 
 SCOPE = "project:tidal-index"
@@ -48,9 +51,73 @@ class ExtractionModel(Model):
         self.wfile.write(body)
 
 
+class ReceiptGate(Link):
+    """Hold receipt sync at the existing S1 proxy; record real proposal attempts and ACKs."""
+    def __init__(self, chief, source, secret):
+        super().__init__(chief, source.name, secret)
+        self.release_claim.set()
+        self.sent = {}
+        self.acked = {}
+
+    def send(self, path, payload):
+        if path == "/peer/v1/propose":
+            self.sent.setdefault(payload["proposal"]["proposal_id"], time.monotonic())
+        code, body = super().send(path, payload)
+        if path == "/peer/v1/sync" and code == 200:
+            accepted = json.loads(body)["ack"]
+            for event in payload["events"]:
+                if event["event_type"] == "run_receipt" and event["event_id"] in accepted:
+                    self.acked.setdefault(event["run_id"], time.monotonic())
+        return code, body
+
+
 def rows(node, statement, bindings=()):
     with sqlite3.connect(node.dir / "state.db", timeout=2) as db:
         return db.execute(statement, bindings).fetchall()
+
+
+def measure_visibility(source_db, mirror_db, run_id, scope, release):
+    """Bracket the two commits using one reader process and its monotonic clock."""
+    receipt = "SELECT ms FROM measure WHERE id=?"
+    mirror = """SELECT m.memory_id, m.content, t.ms FROM memories m JOIN measure t ON t.id=m.memory_id
+                WHERE m.scope=? AND m.version=1 AND m.is_deleted=0 AND instr(m.content,?)>0"""
+    endpoints = [(source_db, receipt, (run_id,)), (mirror_db, mirror, (scope, run_id))]
+    # No read transaction spans polls. An AFTER INSERT marker becomes visible
+    # here only when the corresponding daemon transaction actually commits.
+    absent = []
+    for db, query, args in endpoints:
+        absent.append(time.monotonic_ns())
+        assert db.execute(query, args).fetchone() is None, run_id
+    release()
+    found = [None, None]
+    deadline = time.monotonic() + 25
+    while time.monotonic() < deadline:
+        for i, (db, query, args) in enumerate(endpoints):
+            if found[i] is not None:
+                continue
+            before = time.monotonic_ns()
+            row = db.execute(query, args).fetchone()
+            if row is None:
+                # The statement took its SQLite snapshot at or after "before".
+                absent[i] = before
+            else:
+                found[i] = (time.monotonic_ns(), row)
+        if all(found):
+            break
+        time.sleep(.002)
+    else:
+        raise AssertionError(f"receipt or independent durable mirror missing for {run_id}: {found}")
+    (receipt_seen, (receipt_ms,)), (mirror_seen, (key, content, mirror_ms)) = found
+    # The commits can fall in the same poll interval. Causality sets the lower
+    # bound to zero in that case. Wall timestamps remain a diagnostic only.
+    low = max(0, absent[1] - receipt_seen) / 1e6
+    high = (mirror_seen - absent[0]) / 1e6
+    assert low <= high, (run_id, low, high)
+    return key, content, {
+        "monotonic_midpoint_ms": round((low + high) / 2, 3),
+        "monotonic_bounds_ms": [round(low, 3), round(high, 3)],
+        "sqlite_insert_wall_delta_ms": mirror_ms - receipt_ms,
+    }
 
 
 def run_test(root, hc, model):
@@ -109,15 +176,30 @@ sys.exit(control.get('exit',0))
                 db.executescript(f"CREATE TABLE measure(id TEXT PRIMARY KEY, ms INTEGER); "
                     f"CREATE TRIGGER measure_change AFTER INSERT ON {table} WHEN {condition} BEGIN "
                     f"INSERT OR IGNORE INTO measure VALUES({key},{clock}); END;")
-        output(project, SECRET, FACT + ".")
-        first=launch(source,GOAL)
+        samples = []
+        def measured_run(goal, observation, *extra):
+            gate = project / "hold"
+            gate.touch(exist_ok=False)
+            try:
+                output(project, *extra, observation + ".")
+                run_id = launch(source, goal)
+                with contextlib.closing(sqlite3.connect(source.dir/"state.db", isolation_level=None)) as src_db, \
+                     contextlib.closing(sqlite3.connect(reader.dir/"state.db", isolation_level=None)) as mirror_db:
+                    memory_id, content, timing = measure_visibility(src_db, mirror_db, run_id, SCOPE, gate.unlink)
+            finally:
+                gate.unlink(missing_ok=True)
+            assert observation in content and run_id in content and SECRET not in content, content
+            terminal(run_id)
+            samples.append({"objective": goal, "observation": observation, "run_id": run_id,
+                            "memory_id": memory_id, **timing})
+            return run_id
+
+        first=measured_run(GOAL, FACT, SECRET)
         note=until(lambda: next((m for m in notes(reader).values() if FACT in m['content']),None),"automatic A to B observation")
         key=note["memory_id"]
         assert note["scope"] == SCOPE and note["version"]==1 and first in note["content"],note
         assert SECRET not in note["content"] and "source" in note["content"]
-        start,=rows(source,"SELECT ms FROM measure WHERE id=?",(first,))[0]
-        end,=rows(reader,"SELECT ms FROM measure WHERE id=?",(key,))[0]
-        print(f"Receipt to independent mirror (local loopback): {end-start} ms")
+        assert samples[0]["memory_id"] == key
         output(destination,"Saved the requested report.")
         read=launch(reader,"Check the next tide sample")
         until(lambda:(destination/(read+".packet")).exists(),"downstream real CLI")
@@ -185,6 +267,54 @@ sys.exit(control.get('exit',0))
         until(lambda:rows(reader,"SELECT state FROM service_distillations WHERE run_id=?",(invented,))==[("no_finding",)],
               "ungrounded classifier response rejected")
         assert len(notes(chief))==2
+        # Keep the original restart/conflict and model-assisted checks intact
+        # before adding independent, successful default-extractor runs.
+        for objective, observation in [
+            ("Inspect the tide gauge parser", "The gauge parser fails when the sample header is missing"),
+            ("Check the coastal tile reader", "The coastal tile reader uses a little endian index"),
+            ("Trace the buoy decoder", "The buoy decoder depends on the station dictionary"),
+            ("Inspect the estuary checksum", "The checksum mismatch was caused by trailing padding"),
+        ]:
+            measured_run(objective, observation)
+        assert len({sample["memory_id"] for sample in samples}) == len(samples) == 5
+        estimates = [sample["monotonic_midpoint_ms"] for sample in samples]
+        print("Receipt to independent durable mirror (same-host loopback): " + json.dumps({
+            "n": len(samples), "samples": samples, "poll_interval_ms": 2,
+            "p50_ms": statistics.median(estimates), "range_ms": [min(estimates), max(estimates)],
+        }), flush=True)
+        # Delay just the final S1 receipt while other authenticated traffic remains live.
+        gate = ReceiptGate(chief, source, secret)
+        thread = threading.Thread(target=gate.serve_forever)
+        thread.start()
+        cleanup.callback(gate.server_close)
+        cleanup.callback(thread.join)
+        cleanup.callback(gate.shutdown)
+        source.stop()
+        config = source.dir / "workspace.toml"
+        config.write_text(config.read_text().replace(f'url="{chief.url}"', f'url="{gate.url}"'))
+        source.start(secret)
+        output(project, FACT+".")
+        gated = launch(source, "Record a lesson after acknowledgement", "project:ack")
+        until(lambda: gate.receipt and any(e["run_id"]==gated for e in gate.receipt["events"]),
+              "receipt held before supervisor acknowledgement")
+        (auto,), = until(lambda: rows(source,
+            "SELECT id FROM service_proposals WHERE result IS NULL AND json_extract(proposal,'$.source_run_id')=?",
+            (gated,)), "automatic proposal durably queued")
+        manual = "manual-during-receipt"
+        source.api("/v1/memories", {"memory_id":manual, "proposal_id":manual, "scope":"global",
+                                   "base_version":0, "content":"Manual probe reached the authority."})
+        until(lambda: manual in notes(chief), "independent manual proposal bypasses held automatic proposal")
+        (manual_id,), = rows(source, "SELECT id FROM service_proposals WHERE json_extract(proposal,'$.memory_id')=?",
+                             (manual,))
+        assert manual_id in gate.sent and auto not in gate.sent
+        assert not rows(source, "SELECT 1 FROM service_proposal_retries WHERE id=?", (auto,))
+        assert rows(source, "SELECT acked_at FROM outbox_events WHERE event_type='run_receipt' AND run_id=?",
+                    (gated,)) == [(None,)]
+        gate.set_mode("pass")
+        until(lambda: any(gated in m["content"] for m in notes(chief).values()), "acknowledged lesson delivered")
+        elapsed = gate.sent[auto] - gate.acked[gated]
+        assert 0 <= elapsed < 4, f"automatic proposal waited {elapsed:.3f}s after its receipt acknowledgement"
+        print(f"PASS manual proposal during withheld S1 receipt, automatic proposal sent {elapsed:.3f}s after ACK")
         print("PASS automatic project-scoped lesson from a real CLI without a memory hook, captured baseline, "
               "offline/restarted executor, stale candidate, evidence validation and next-run reuse")
 

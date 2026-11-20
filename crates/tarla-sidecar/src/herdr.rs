@@ -35,6 +35,23 @@ pub struct TerminalStatus {
     pub reason: Option<String>,
     pub exit_code: Option<i32>,
     pub status: Option<Value>,
+    #[serde(default)]
+    records: BTreeMap<String, Value>,
+}
+
+impl TerminalStatus {
+    /// Herdr puts an unqualified OSC 7501 report in `status`. Reports with an
+    /// id independently update or clear entries in `records` on the same terminal.
+    pub fn blocked_prompt(&self) -> Option<(Option<&str>, &Value)> {
+        let root = self.status.as_ref().unwrap_or(&Value::Null);
+        if root["state"] == "blocked" || self.state == "blocked" {
+            return Some((None, root));
+        }
+        self.records
+            .iter()
+            .find(|(_, report)| report["state"] == "blocked")
+            .map(|(id, report)| (Some(id.as_str()), report))
+    }
 }
 
 fn local_terminal(id: &str) -> io::Result<()> {
@@ -457,6 +474,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> TerminalWriter<S> {
 mod protocol_tests {
     use super::*;
     use tokio::io::{duplex, DuplexStream};
+
+    #[test]
+    fn scoped_blocked_reports_survive_an_idle_or_absent_root() {
+        let report = json!({"state":"blocked","kind":"permission","msg":"Apply?"});
+        let mut terminal: TerminalStatus = serde_json::from_value(json!({
+            "state":"live", "status":null, "records":{"a/b":report, "a/c":report}
+        }))
+        .unwrap();
+        assert_eq!(terminal.blocked_prompt(), Some((Some("a/b"), &report)));
+        terminal.status = Some(json!({"state":"working"}));
+        terminal.records.remove("a/b");
+        assert_eq!(terminal.blocked_prompt(), Some((Some("a/c"), &report)));
+        terminal.status = Some(report.clone());
+        assert_eq!(terminal.blocked_prompt(), Some((None, &report)));
+        terminal.status = None;
+        terminal.records.clear();
+        assert_eq!(terminal.blocked_prompt(), None);
+    }
 
     #[test]
     fn upstream_local_addresses_exclude_names_and_remote_targets() {

@@ -181,12 +181,34 @@ jobs:
       - name: Resolve mobile integration dependencies
         working-directory: apps/tarla-app
         run: flutter pub get --enforce-lockfile
+      - name: Reserve disk for the Android image, userdata and Gradle
+        if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h "$HOME"
+          bin_dir="$RUNNER_TEMP/tarla-mobile-bin"
+          mkdir -p "$bin_dir"
+          install -s -m 755 target/debug/tarla target/debug/tarlad "$bin_dir/"
+          install -s -m 755 "$TARLA_TEST_HC" "$bin_dir/herdr-core"
+          echo "TARLA_BIN_DIR=$bin_dir" >> "$GITHUB_ENV"
+          echo "TARLA_TEST_HC=$bin_dir/herdr-core" >> "$GITHUB_ENV"
+          rm -rf -- "$GITHUB_WORKSPACE/target/debug" "$GITHUB_WORKSPACE/.upstream-herdr/target/debug"
+          # API 35 needs 7.2 GiB for userdata alone after downloading its image.
+          # These preinstalled toolchains have no role in the Android native job.
+          available_kib() { df -Pk "$HOME" | awk 'END {print $4}'; }
+          target_kib=$((16 * 1024 * 1024))
+          for unused in /usr/share/dotnet /usr/local/.ghcup /opt/ghc /opt/hostedtoolcache/CodeQL; do
+            if (( $(available_kib) >= target_kib )); then break; fi
+            sudo rm -rf -- "$unused"
+          done
+          df -h "$HOME"
       - name: Enable Android emulator acceleration
         if: matrix.platform == 'android'
         run: |
           sudo chgrp "$(id -gn)" /dev/kvm
           sudo chmod g+rw /dev/kvm
-      - name: Exercise both app processes on Android
+      - name: Exercise pairing, cold restore and offline takeover on Android
         if: matrix.platform == 'android'
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -195,7 +217,7 @@ jobs:
           disk-size: 4096M
           ram-size: 2048M
           script: python3 tests/native_mobile.py android "$(adb get-serialno)"
-      - name: Exercise both app processes on iOS
+      - name: Exercise pairing, cold restore and offline takeover on iOS
         if: matrix.platform == 'ios'
         shell: bash
         run: |
