@@ -395,6 +395,7 @@ pub async fn message(s: &Service, id: &str, payload: &Value) -> Result<Value> {
 pub async fn deliver_receipts(s: S) {
     use futures_util::{stream::FuturesUnordered, StreamExt};
     use std::collections::BTreeSet;
+    const MAX_WORKERS: usize = 16;
 
     if !s.is_supervisor() {
         return;
@@ -403,13 +404,13 @@ pub async fn deliver_receipts(s: S) {
     let mut workers = FuturesUnordered::new();
     let mut cursor = String::new();
     loop {
-        if active.len() < 16 {
+        if active.len() < MAX_WORKERS {
             let pending = s.db().and_then(|db| {
                 list(
                     &db,
                     "SELECT DISTINCT conversation_id FROM service_wakes WHERE delivered=0
-                 ORDER BY conversation_id<=?,conversation_id",
-                    &[&cursor],
+                 ORDER BY conversation_id<=?,conversation_id LIMIT ?",
+                    &[&cursor, &MAX_WORKERS],
                 )
             });
             match pending {
@@ -432,7 +433,7 @@ pub async fn deliver_receipts(s: S) {
                                 }
                                 conversation
                             });
-                            if active.len() == 16 {
+                            if active.len() == MAX_WORKERS {
                                 break;
                             }
                         }
