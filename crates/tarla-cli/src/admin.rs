@@ -139,6 +139,7 @@ pub fn run(home: &Path, id: &str, op: &Operation) -> Result<()> {
                 "service_s1_delivery",
                 "service_assignment_pages",
                 "service_s1_sequence",
+                "service_s1_journal",
                 "service_launch_permits",
                 "service_receipt_drafts",
                 "service_proposals",

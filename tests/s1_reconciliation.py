@@ -275,6 +275,10 @@ def check(root, hc):
                 else:
                     raise AssertionError("forgotten prior dispatch slipped through the restore fence")
                 assert not rows(chief, "SELECT 1 FROM runs WHERE run_id=?", run)
+                reset = {**link.earlier, "s1_stream":"0"*32, "s1_cursor":0, "s1_head":0, "events":[]}
+                code, body = link.send("/peer/v1/sync", reset)
+                assert code in (400, 409, 422), (code, body)
+                assert chief.api("/v1/recovery")["phase"]=="reconciling"
                 altered = deepcopy(link.earlier)
                 altered["claims"][run]["assignment"]["target_slot_id"] = "different-slot"
                 code, body = link.send("/peer/v1/sync", altered)

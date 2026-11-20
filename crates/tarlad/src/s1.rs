@@ -31,6 +31,11 @@ pub fn sent(db: &Connection, supervisor: &str) -> Result<i64> {
 
 pub fn batch(db: &Connection, after: i64) -> Result<Value> {
     ensure!(after >= 0, "invalid S1 cursor");
+    let stream: String = db.query_row(
+        "SELECT stream FROM service_s1_journal WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
     let head: i64 = db.query_row(
         "SELECT coalesce(max(seq),0) FROM service_s1_sequence",
         [],
@@ -68,7 +73,7 @@ pub fn batch(db: &Connection, after: i64) -> Result<Value> {
         }
         events.push(ev);
     }
-    Ok(json!({"s1_cursor":after,"s1_head":head,"events":events,"claims":claims}))
+    Ok(json!({"s1_stream":stream,"s1_cursor":after,"s1_head":head,"events":events,"claims":claims}))
 }
 
 fn assignment_mac(db: &Connection, metadata: &Value) -> Result<Hmac<Sha256>> {
@@ -240,6 +245,29 @@ pub fn accept(
     node: &str,
     request: &Value,
 ) -> Result<(i64, Vec<String>)> {
+    let stream = request["s1_stream"].as_str();
+    let pinned: Option<String> = db
+        .query_row(
+            "SELECT stream FROM service_s1_streams WHERE node=?",
+            [node],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(expected) = pinned {
+        ensure!(
+            stream == Some(expected.as_str()),
+            "the paired executor's S1 journal identity changed; restore its original database"
+        );
+    } else if let Some(id) = stream {
+        ensure!(
+            id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid S1 journal identity"
+        );
+        db.execute(
+            "INSERT INTO service_s1_streams VALUES(?,?)",
+            params![node, id],
+        )?;
+    }
     let mut frontier = cursor(db, node)?;
     let start = request["s1_cursor"]
         .as_i64()
@@ -295,7 +323,7 @@ pub fn accept(
         ack.push(eid.to_owned());
     }
     db.execute("INSERT INTO service_s1_frontier VALUES(?,?) ON CONFLICT(node) DO UPDATE SET seq=excluded.seq",params![node,frontier])?;
-    if request["s1_head"].as_i64() == Some(frontier) {
+    if stream.is_some() && request["s1_head"].as_i64() == Some(frontier) {
         db.execute("DELETE FROM service_restore_pending WHERE node=?", [node])?;
     }
     Ok((frontier, ack))

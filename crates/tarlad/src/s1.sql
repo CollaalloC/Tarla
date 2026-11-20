@@ -22,3 +22,6 @@ CREATE TABLE IF NOT EXISTS service_restore_barrier(singleton INTEGER PRIMARY KEY
 CREATE TABLE IF NOT EXISTS service_restore_pending(node TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS service_restore_sources(node TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS service_restore_nonexecutors(node TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS service_s1_journal(singleton INTEGER PRIMARY KEY CHECK(singleton=1),stream TEXT NOT NULL);
+INSERT INTO service_s1_journal SELECT 1,lower(hex(randomblob(16))) WHERE NOT EXISTS(SELECT 1 FROM service_s1_journal);
+CREATE TABLE IF NOT EXISTS service_s1_streams(node TEXT PRIMARY KEY,stream TEXT NOT NULL);
