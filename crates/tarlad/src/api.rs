@@ -100,9 +100,9 @@ pub fn one(s: &Service, id: &str) -> Result<Value> {
         LEFT JOIN service_turn_transfers t USING(run_id) LEFT JOIN service_resume_origins o USING(run_id) WHERE r.run_id=?",&[&id])?.pop().context("unknown run")
 }
 pub async fn get_run(State(s): State<S>, Route(id): Route<String>) -> Api {
-    Ok(Json(one(&s, &id).map_err(|e| {
-        ApiError(StatusCode::NOT_FOUND, e.to_string())
-    })?))
+    let mut run = one(&s, &id).map_err(|e| ApiError(StatusCode::NOT_FOUND, e.to_string()))?;
+    terminal::describe(&s, &mut run).await?;
+    Ok(Json(run))
 }
 pub async fn cancel(State(s): State<S>, Route(id): Route<String>) -> Api {
     ensure_supervisor(&s)?;

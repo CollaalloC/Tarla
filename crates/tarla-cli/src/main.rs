@@ -60,6 +60,9 @@ enum Command {
     Pair {
         node: String,
         origin: Url,
+        /// HTTPS origin reachable by clients for direct terminal access.
+        #[arg(long)]
+        client_url: Option<Url>,
         #[arg(long)]
         token_env: String,
     },
@@ -159,6 +162,9 @@ enum Command {
         id: String,
         #[arg(long)]
         interactive: bool,
+        /// Relay the WebSocket over the supervisor's private route to the executor.
+        #[arg(long)]
+        via_supervisor: bool,
     },
 }
 #[derive(Copy, Clone, ValueEnum)]
@@ -267,10 +273,18 @@ async fn main() -> Result<()> {
     if let Command::Pair {
         node,
         origin,
+        client_url,
         token_env,
     } = &cli.command
     {
-        return provision::pair(&home, &cli.workspace, node, origin, token_env);
+        return provision::pair(
+            &home,
+            &cli.workspace,
+            node,
+            origin,
+            token_env,
+            client_url.as_ref(),
+        );
     }
     if let Command::Supervisor { action } = &cli.command {
         return admin::run(&home, &cli.workspace, action);
@@ -360,7 +374,7 @@ async fn main() -> Result<()> {
         }
         Command::Unbind { conversation } => c.api(Method::PUT,
             &["v1", "conversations", &conversation, "binding"], Some(json!({"mode":"orchestrator"})), &[]).await?,
-        Command::Attach { id, interactive } => return attach(&c, &id, interactive).await,
+        Command::Attach { id, interactive, via_supervisor } => return attach(&c, &id, interactive, via_supervisor).await,
         Command::Init { .. } | Command::Skills | Command::Supervisor { .. } |
         Command::InstallTool { .. } | Command::Pair { .. } => unreachable!(),
     };
@@ -368,7 +382,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn attach(c: &Client, id: &str, interactive: bool) -> Result<()> {
+async fn attach(c: &Client, id: &str, interactive: bool, via_supervisor: bool) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio::{io::AsyncReadExt, time::interval};
     use tokio_tungstenite::{
@@ -380,13 +394,24 @@ async fn attach(c: &Client, id: &str, interactive: bool) -> Result<()> {
     } else {
         "observe"
     };
+    let route = if via_supervisor {
+        "supervisor"
+    } else {
+        "direct"
+    };
     let grant = c
-        .post(&["v1", "runs", id, "attach"], json!({"mode":mode}))
+        .post(
+            &["v1", "runs", id, "attach"],
+            json!({"mode":mode,"route":route}),
+        )
         .await?;
     let ticket = grant["ticket"]
         .as_str()
         .context("missing terminal ticket")?;
     let mut url = c.url(&["v1", "terminal", id])?;
+    if via_supervisor && grant.get("node_url").is_some() {
+        bail!("supervisor did not provide a same-origin terminal route");
+    }
     if let Some(endpoint) = grant.get("node_url").and_then(Value::as_str) {
         url = Url::parse(endpoint)?;
         url.path_segments_mut()
