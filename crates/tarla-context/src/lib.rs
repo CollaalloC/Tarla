@@ -866,19 +866,24 @@ fn match_offset(db: &Connection, message: &ArchivedMessage, query: &str) -> Resu
     {
         return Ok(offset);
     }
-    let run = message
-        .content
-        .as_bytes()
-        .split(|&b| b != 0x1f)
-        .map(<[u8]>::len)
-        .max()
-        .unwrap_or(0);
-    let marker = "\u{1f}".repeat(run + 1);
-    let marked: Option<String> = db.query_row(
-        "SELECT highlight(message_search,0,?1,'') FROM message_search WHERE rowid=?2 AND message_search MATCH ?3",
-        params![marker, message.seq_no, fts_match_expression(query)], |r| r.get(0)
-    ).optional()?;
-    Ok(marked.and_then(|text| text.find(&marker)).unwrap_or(0))
+    // The two projections first differ at the inserted opening marker, even if
+    // either marker already appears in the archived text. Both markers are one byte.
+    let offset = db
+        .query_row(
+            "SELECT highlight(message_search,0,'[',''), highlight(message_search,0,'{','')
+         FROM message_search WHERE rowid=?1 AND message_search MATCH ?2",
+            params![message.seq_no, fts_match_expression(query)],
+            |row| {
+                let a: String = row.get(0)?;
+                let b: String = row.get(1)?;
+                Ok(a.bytes()
+                    .zip(b.bytes())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(0))
+            },
+        )
+        .optional()?;
+    Ok(offset.unwrap_or(0))
 }
 
 /// The model can search for handles, then read arbitrary original spans with bounded output.
