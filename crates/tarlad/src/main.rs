@@ -157,11 +157,7 @@ fn string<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
 }
 fn list(c: &Connection, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<Value>> {
     let mut s = c.prepare(sql)?;
-    let names = s
-        .column_names()
-        .iter()
-        .map(|x| x.to_string())
-        .collect::<Vec<_>>();
+    let names: Vec<String> = s.column_names().map(str::to_owned).collect();
     let rows = s.query_map(params_from_iter(args.iter()), |row| {
         use rusqlite::types::ValueRef::*;
         let mut m = serde_json::Map::new();
