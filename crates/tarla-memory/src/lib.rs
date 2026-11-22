@@ -511,11 +511,14 @@ fn valid_id_token(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
+fn valid_memory_id(id: &str) -> bool {
+    valid_id_token(id) && !id.contains(['[', ']'])
+}
+
 /// Validate proposed content before queueing or authoritative version assignment.
 pub fn validate_mutation(p: &Mutation) -> Result<()> {
     ensure!(
-        valid_id_token(&p.memory_id)
-            && !p.memory_id.contains(['[', ']'])
+        valid_memory_id(&p.memory_id)
             && valid_id_token(&p.proposal_id)
             && valid_id_token(&p.source_node_id),
         "invalid proposal or memory identifier"

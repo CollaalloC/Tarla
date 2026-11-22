@@ -392,8 +392,6 @@ pub async fn abandon(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::process::CommandExt;
-
     struct RestoreSignals([(libc::c_int, libc::sigaction); 3]);
     impl Drop for RestoreSignals {
         fn drop(&mut self) {
@@ -423,9 +421,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ready = dir.path().join("ready");
         let cleaned = dir.path().join("cleaned");
-        let mut child = Command::new("/bin/sh")
-            .process_group(0)
-            .args([
+        let mut command = Command::new("/bin/sh");
+        let lock = tarla_sidecar::try_lock_slot(dir.path(), "test").unwrap();
+        let _foreground = Foreground::configure(&mut command, &lock);
+        let mut child = command.args([
                 "-c",
                 "trap 'sleep 0.12; : > \"$2\"; exit 0' TERM; : > \"$1\"; while :; do sleep 0.05; done",
                 "sh",
@@ -434,7 +433,12 @@ mod tests {
             .arg(&cleaned)
             .spawn()
             .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not become ready"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);

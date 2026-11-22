@@ -258,8 +258,10 @@ def check_routes(root):
         with upgrade(chief, rid, denied_obs["ticket"]) as (status, conn, stream):
             assert status == 101
             send_masked(conn, 0x82, b"denied\r")
-            head = stream.read(2)
-            assert not head or (head[0] & 15) == 8
+            # The legacy executor still paints a full screen after ignored input.
+            assert stream.read(2) == b"\x82\x7f"
+            assert int.from_bytes(stream.read(8), "big") == len(peer.repaint)
+            assert stream.read(len(peer.repaint)) == peer.repaint
         peer.terminal = "t2"
         assert ws_status(chief, rid, ticket(chief, rid, route="supervisor")["ticket"]) == 409
         peer.current_protocol, peer.terminal = True, "t1b"
