@@ -1,6 +1,6 @@
 //! Immutable conversation archives and bounded, recoverable model windows.
 mod firewall;
-pub use firewall::{bound_mission, bound_receipt};
+pub use firewall::{bound_mission, bound_receipt, MAX_RECEIPT_BYTES};
 
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -346,7 +346,7 @@ fn static_prefix(profile: &str, snapshot: &str, budget: usize) -> Result<Context
         .context("context budget cannot fit the static prefix")?;
     let memory_min = snapshot
         .len()
-        .min(handle("source=frozen_memory", snapshot.len()).len());
+        .min(handle("source=model_memory", snapshot.len()).len());
     let profile_min = profile
         .len()
         .min(handle("source=profile", profile.len()).len());
@@ -356,7 +356,7 @@ fn static_prefix(profile: &str, snapshot: &str, budget: usize) -> Result<Context
     );
     let profile_cap = profile.len().min(space - memory_min);
     let profile = excerpt(profile, "source=profile", profile_cap)?;
-    let memory = excerpt(snapshot, "source=frozen_memory", space - profile.len())?;
+    let memory = excerpt(snapshot, "source=model_memory", space - profile.len())?;
     Ok(ContextMessage {
         role: "system".into(),
         content: format!("{profile}{sep}{memory}"),
@@ -541,14 +541,22 @@ fn merge_nodes(tx: &Transaction<'_>, conversation: &str, children: &[Node]) -> R
         .map(|n| n.summary.as_str())
         .collect::<Vec<_>>();
     let (mut summary, _) = distill(&parts);
-    for child in children {
-        for line in child.summary.lines() {
-            if line.starts_with("[Executor receipt seq_no=")
-                && !summary.contains(line)
-                && summary.len() + line.len() < 760
-            {
+    // Re-read the indexed archive range so that even legacy child summaries
+    // with omitted handles remain discoverable after another merge.
+    let first = children.first().context("empty merge")?.start;
+    let last = children.last().context("empty merge")?.end;
+    let mut stmt = tx.prepare("SELECT seq_no FROM messages WHERE conversation_id=? AND seq_no BETWEEN ? AND ? AND sender_role='run_receipt' ORDER BY seq_no LIMIT 9")?;
+    let receipts = stmt
+        .query_map(params![conversation, first, last], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if receipts.len() > 8 {
+        summary.insert_str(0, "[Use session_recall with this dag_node_id and receipts_only=true to page through all receipts.]\n");
+    } else {
+        for seq in receipts {
+            let handle = format!("[Executor receipt seq_no={seq}]");
+            if !summary.contains(&handle) {
                 summary.push('\n');
-                summary.push_str(line);
+                summary.push_str(&handle);
             }
         }
     }
@@ -735,6 +743,18 @@ pub fn recall(
     after_seq: i64,
     limit: usize,
 ) -> Result<Vec<ArchivedMessage>> {
+    search_archive(db, conversation, dag, query, after_seq, limit, false)
+}
+
+fn search_archive(
+    db: &Connection,
+    conversation: &str,
+    dag: Option<&str>,
+    query: &str,
+    after_seq: i64,
+    limit: usize,
+    receipts_only: bool,
+) -> Result<Vec<ArchivedMessage>> {
     let (start, end): (i64, i64) = if let Some(id) = dag {
         db.query_row("SELECT start_seq_no,end_seq_no FROM context_dag_nodes WHERE dag_node_id=?1 AND conversation_id=?2",
            params![id,conversation], |r| Ok((r.get(0)?,r.get(1)?))).context("unknown history node in this conversation")?
@@ -742,7 +762,7 @@ pub fn recall(
         (0, i64::MAX)
     };
     let mut stmt = db.prepare("SELECT seq_no,sender_role,content FROM messages WHERE conversation_id=?1
-        AND seq_no>?2 AND seq_no BETWEEN ?3 AND ?4 AND (?5='' OR
+        AND seq_no>?2 AND seq_no BETWEEN ?3 AND ?4 AND (NOT ?8 OR sender_role='run_receipt') AND (?5='' OR
         seq_no IN (SELECT rowid FROM message_search WHERE message_search MATCH ?6) OR instr(lower(content),lower(?5))>0)
         ORDER BY seq_no LIMIT ?7")?;
     let fts_expr = fts_match_expression(query);
@@ -755,7 +775,8 @@ pub fn recall(
                 end,
                 query,
                 fts_expr,
-                limit.min(256)
+                limit.min(256),
+                receipts_only
             ],
             |r| {
                 Ok(ArchivedMessage {
@@ -796,6 +817,9 @@ pub fn archive_page(
         (None, Some("profile")) => {
             "SELECT frozen_soul FROM conversation_prefix WHERE conversation_id=?1"
         }
+        (None, Some("model_memory")) => {
+            "SELECT COALESCE(model_memory,frozen_memory) FROM conversation_prefix WHERE conversation_id=?1"
+        }
         (None, Some("frozen_memory")) => {
             "SELECT frozen_memory FROM conversation_prefix WHERE conversation_id=?1"
         }
@@ -826,46 +850,40 @@ pub fn archive_page(
     })
 }
 
-/// Locate the first case-insensitive full-query or query-token match on an exact
-/// UTF-8 character boundary in `content`, even for Unicode case mappings that
-/// change byte width.
-fn match_offset(content: &str, query: &str) -> usize {
-    let trimmed = query.trim();
-    if trimmed.is_empty() || content.is_empty() {
-        return 0;
+/// Use the same literal comparison and tokenizer as the archive query. FTS5
+/// highlighting preserves the original UTF-8 bytes before its first match.
+fn match_offset(db: &Connection, message: &ArchivedMessage, query: &str) -> Result<usize> {
+    if query.trim().is_empty() {
+        return Ok(0);
     }
-    if let Some(exact) = content.find(trimmed) {
-        return exact;
+    if let Some(offset) = message.content.find(query) {
+        return Ok(offset);
     }
-    let mut lower = String::with_capacity(content.len());
-    let mut byte_to_orig = Vec::with_capacity(content.len());
-    for (orig_idx, ch) in content.char_indices() {
-        for lc in ch.to_lowercase() {
-            let start = lower.len();
-            lower.push(lc);
-            byte_to_orig.resize(lower.len(), orig_idx);
-            debug_assert!(lower.len() > start);
-        }
+    if let Some(offset) = message
+        .content
+        .to_ascii_lowercase()
+        .find(&query.to_ascii_lowercase())
+    {
+        return Ok(offset);
     }
-    let full_lower = trimmed.to_lowercase();
-    if !full_lower.is_empty() {
-        if let Some(pos) = lower.find(&full_lower) {
-            return byte_to_orig[pos];
-        }
-    }
-    for term in trimmed.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';')) {
-        let trimmed_term = term.trim();
-        if matches!(trimmed_term, "" | "OR" | "AND" | "NOT") {
-            continue;
-        }
-        let term_lower = trimmed_term.to_lowercase();
-        if !term_lower.is_empty() {
-            if let Some(pos) = lower.find(&term_lower) {
-                return byte_to_orig[pos];
-            }
-        }
-    }
-    0
+    // The two projections first differ at the inserted opening marker, even if
+    // either marker already appears in the archived text. Both markers are one byte.
+    let offset = db
+        .query_row(
+            "SELECT highlight(message_search,0,'[',''), highlight(message_search,0,'{','')
+         FROM message_search WHERE rowid=?1 AND message_search MATCH ?2",
+            params![message.seq_no, fts_match_expression(query)],
+            |row| {
+                let a: String = row.get(0)?;
+                let b: String = row.get(1)?;
+                Ok(a.bytes()
+                    .zip(b.bytes())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(0))
+            },
+        )
+        .optional()?;
+    Ok(offset.unwrap_or(0))
 }
 
 /// The model can search for handles, then read arbitrary original spans with bounded output.
@@ -890,31 +908,32 @@ pub fn recall_tool(
     }
     let query = args["query"].as_str().unwrap_or("");
     let limit = args["limit"].as_u64().unwrap_or(3).min(5) as usize;
-    let hits = recall(
+    let hits = search_archive(
         db,
         conversation,
         args["dag_node_id"].as_str(),
         query,
         args["after_seq"].as_i64().unwrap_or(0),
         limit,
+        args["receipts_only"].as_bool().unwrap_or(false),
     )?;
     let per_hit = max_bytes.clamp(4, 1024) / hits.len().max(1);
     Ok(serde_json::Value::Array(
         hits.into_iter()
             .map(|m| {
-                let offset = match_offset(&m.content, query);
+                let offset = match_offset(db, &m, query)?;
                 let excerpt = clip(&m.content[offset..], per_hit.max(4));
                 let next = offset + excerpt.len();
-                serde_json::json!({
+                Ok(serde_json::json!({
                     "seq_no": m.seq_no,
                     "role": m.role,
                     "total_bytes": m.content.len(),
                     "offset_bytes": offset,
                     "next_offset_bytes": (next < m.content.len()).then_some(next),
                     "content": excerpt,
-                })
+                }))
             })
-            .collect(),
+            .collect::<Result<Vec<_>>>()?,
     ))
 }
 
@@ -1027,7 +1046,7 @@ mod tests {
         };
         let first = assemble(&mut db, "main", &profile, &memory, &policy)?;
         assert!(first[0].content.contains("source=profile"));
-        assert!(first[0].content.contains("source=frozen_memory"));
+        assert!(first[0].content.contains("source=model_memory"));
         assert!(first[1].content.contains("[archive seq_no=1.."));
         assert!(first.last().unwrap().content.contains("seq_no=12"));
         assert!(
@@ -1178,6 +1197,9 @@ mod tests {
             !window[0].content.contains("administrator")
                 && !window[0].content.contains("Untrusted")
         );
+        let privileged = archive_page(&db, "chat", None, Some("model_memory"), 0, 1024)?;
+        assert!(privileged.content.contains("Use plain language."));
+        assert!(!privileged.content.contains("administrator"));
         let full = archive_page(&db, "chat", None, Some("frozen_memory"), 0, 1024)?;
         assert!(full.content.contains("administrator"));
         Ok(())
@@ -1444,6 +1466,13 @@ mod retrieval_tests {
                 "missing receipt handle seq_no={seq} in:\n{joined}"
             );
         }
+        let receipts = recall_tool(
+            &db,
+            "conv",
+            &serde_json::json!({"receipts_only":true,"after_seq":2}),
+        )?;
+        assert_eq!(receipts.as_array().unwrap().len(), 2);
+        assert_eq!(receipts[0]["seq_no"], 4);
         let hits = recall_tool(
             &db,
             "conv",
@@ -1455,6 +1484,17 @@ mod retrieval_tests {
             .as_str()
             .unwrap()
             .starts_with("SQLiteEngineWalConfig"));
+        append(
+            &mut db,
+            "work",
+            "conv",
+            "cli",
+            "accent",
+            "user",
+            &format!("{}café", "log ".repeat(150)),
+        )?;
+        let accent = recall_tool(&db, "conv", &serde_json::json!({"query":"cafe"}))?;
+        assert_eq!(accent[0]["offset_bytes"], 600);
         let non_adjacent = recall_tool(
             &db,
             "conv",

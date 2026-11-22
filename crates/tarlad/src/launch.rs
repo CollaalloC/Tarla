@@ -108,14 +108,94 @@ fn install_signal_forwarder() -> io::Result<()> {
     Ok(())
 }
 
+// This helper is the PTY job when Herdr launches it. Give its command a
+// dedicated process group while preserving foreground terminal input.
 #[cfg(unix)]
-fn signal_child_tree(pid: libc::pid_t, sig: libc::c_int) {
+fn set_foreground(group: libc::pid_t) -> io::Result<()> {
     unsafe {
-        if libc::getpgid(pid) == pid {
-            let _ = libc::kill(-pid, sig);
-        } else {
-            let _ = libc::kill(pid, sig);
+        let mut blocked = std::mem::zeroed();
+        let mut previous = std::mem::zeroed();
+        libc::sigemptyset(&mut blocked);
+        libc::sigaddset(&mut blocked, libc::SIGTTOU);
+        if libc::sigprocmask(libc::SIG_BLOCK, &blocked, &mut previous) == -1 {
+            return Err(io::Error::last_os_error());
         }
+        let result = libc::tcsetpgrp(libc::STDIN_FILENO, group);
+        let error = io::Error::last_os_error();
+        if libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if result == -1 {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(unix)]
+struct Foreground(libc::pid_t);
+
+#[cfg(unix)]
+impl Foreground {
+    fn configure(command: &mut Command, account: &std::fs::File) -> Self {
+        use std::os::{fd::AsRawFd, unix::process::CommandExt};
+        let fd = account.as_raw_fd();
+        let previous = unsafe { libc::getpgrp() };
+        let foreground = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) } == previous;
+        command.process_group(0);
+        // Runs only in the forked child. Keep the borrowed flock alive if the
+        // helper itself is killed abruptly; no extra descriptor in the daemon.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if foreground {
+                    set_foreground(libc::getpgrp())?;
+                }
+                Ok(())
+            });
+        }
+        Self(if foreground { previous } else { 0 })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            let _ = set_foreground(self.0);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_job(pid: libc::pid_t, signal: libc::c_int) {
+    // pid belongs to our unreaped child, so its group id cannot be recycled.
+    unsafe {
+        libc::kill(-pid, signal);
+    }
+}
+
+#[cfg(unix)]
+fn job_leader_exited(pid: libc::pid_t) -> io::Result<bool> {
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        if libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        ) == -1
+        {
+            let error = io::Error::last_os_error();
+            if error.kind() != ErrorKind::Interrupted {
+                return Err(error);
+            }
+            return Ok(false);
+        }
+        Ok(info.si_pid() == pid)
     }
 }
 
@@ -124,42 +204,35 @@ fn wait_for_child(child: &mut std::process::Child) -> io::Result<i32> {
     use std::os::unix::process::ExitStatusExt;
     use std::sync::atomic::Ordering;
     let pid = child.id() as libc::pid_t;
-    let mut forwarded = 0;
-    let mut escalate_at: Option<std::time::Instant> = None;
+    let mut deadline = None;
     loop {
-        if let Some(status) = child.try_wait()? {
+        if job_leader_exited(pid)? {
+            // The leader can finish before its workers. Signal remaining members
+            // while the group id is pinned, even on normal shell exit.
+            signal_job(pid, libc::SIGKILL);
+            let status = child.wait()?;
             return Ok(status
                 .code()
-                .or_else(|| status.signal().map(|s| 128 + s))
-                .unwrap_or(1));
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)));
         }
         let sig = TERMINATION_SIGNAL.swap(0, Ordering::Relaxed);
-        if sig != 0 {
-            if forwarded == 0 {
-                forwarded = sig;
-                signal_child_tree(pid, sig);
-                escalate_at = Some(std::time::Instant::now() + Duration::from_secs(3));
-            } else {
-                signal_child_tree(pid, libc::SIGKILL);
-                let _ = child.kill();
-            }
-        }
-        if escalate_at.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-            signal_child_tree(pid, libc::SIGKILL);
-            let _ = child.kill();
-            escalate_at = None;
+        if sig != 0 && deadline.is_none() {
+            signal_job(pid, sig);
+            deadline = Some(std::time::Instant::now() + Duration::from_secs(3));
+        } else if sig != 0 || deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            signal_job(pid, libc::SIGKILL);
         }
         std::thread::sleep(Duration::from_millis(25));
     }
 }
 
 #[cfg(not(unix))]
-fn install_signal_forwarder() -> std::io::Result<()> {
+fn install_signal_forwarder() -> io::Result<()> {
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn wait_for_child(child: &mut std::process::Child) -> std::io::Result<i32> {
+fn wait_for_child(child: &mut std::process::Child) -> io::Result<i32> {
     Ok(child.wait()?.code().unwrap_or(1))
 }
 
@@ -206,8 +279,14 @@ pub fn helper(mut args: impl Iterator<Item = OsString>) -> Result<i32> {
         return Ok(1);
     }
     install_signal_forwarder()?;
-    let mut child = Command::new(executable).args(args).spawn()?;
+    let mut command = Command::new(executable);
+    command.args(args);
+    #[cfg(unix)]
+    let _foreground = Foreground::configure(&mut command, &_account);
+    let mut child = command.spawn()?;
     if let Err(err) = tx.commit() {
+        #[cfg(unix)]
+        signal_job(child.id() as libc::pid_t, libc::SIGKILL);
         let _ = child.kill();
         let _ = child.wait();
         return Err(err.into());
@@ -313,8 +392,6 @@ pub async fn abandon(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::process::CommandExt;
-
     struct RestoreSignals([(libc::c_int, libc::sigaction); 3]);
     impl Drop for RestoreSignals {
         fn drop(&mut self) {
@@ -344,9 +421,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ready = dir.path().join("ready");
         let cleaned = dir.path().join("cleaned");
-        let mut child = Command::new("/bin/sh")
-            .process_group(0)
-            .args([
+        let mut command = Command::new("/bin/sh");
+        let lock = tarla_sidecar::try_lock_slot(dir.path(), "test").unwrap();
+        let _foreground = Foreground::configure(&mut command, &lock);
+        let mut child = command.args([
                 "-c",
                 "trap 'sleep 0.12; : > \"$2\"; exit 0' TERM; : > \"$1\"; while :; do sleep 0.05; done",
                 "sh",
@@ -355,7 +433,12 @@ mod tests {
             .arg(&cleaned)
             .spawn()
             .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not become ready"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);

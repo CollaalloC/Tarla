@@ -303,6 +303,16 @@ pub async fn worker(s: S) {
     }
 }
 
+fn decode_receipt(run: &str, raw: &str) -> Result<RunReceipt> {
+    anyhow::ensure!(
+        raw.len() <= tarla_context::MAX_RECEIPT_BYTES,
+        "oversized receipt"
+    );
+    let receipt: RunReceipt = serde_json::from_str(raw)?;
+    anyhow::ensure!(receipt.run_id == run, "receipt identity mismatch");
+    Ok(receipt)
+}
+
 async fn process_pending(s: &Service) -> Result<bool> {
     let mut db = s.db()?;
     // No write transaction or frame of S0 is touched on the idle path.
@@ -314,11 +324,14 @@ async fn process_pending(s: &Service) -> Result<bool> {
     };
     let more = pending.len() == 8;
     for (run, raw) in pending {
-        let receipt: RunReceipt = serde_json::from_str(&raw)?;
-        anyhow::ensure!(
-            run == receipt.run_id && raw.len() <= 500,
-            "invalid local receipt for distillation"
-        );
+        let receipt = match decode_receipt(&run, &raw) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                eprintln!("skipping invalid local distillation receipt for {run}: {error}");
+                db.execute("UPDATE service_distillations SET state='no_finding' WHERE run_id=? AND state='pending'", [&run])?;
+                continue;
+            }
+        };
         let fallback = finding(&receipt.executive_summary);
         let quotes = candidates(&receipt.executive_summary);
         let fact = if let Some(model) = s.distiller.as_ref().filter(|_| !quotes.is_empty()) {
@@ -417,6 +430,28 @@ pub fn verify(db: &Connection, node: &str, p: &Mutation) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn distillation_accepts_the_wire_budget_used_by_the_receipt_producer() -> Result<()> {
+        let receipt = tarla_context::bound_receipt(
+            RunReceipt {
+                run_id: "r".into(),
+                final_state: "succeeded".into(),
+                executive_summary: "测量".repeat(400),
+                artifact_refs: vec![],
+                s0_transcript_pointer: "node:n/run:r/transcript.jsonl".into(),
+            },
+            500,
+        )?;
+        let raw = serde_json::to_string(&receipt)?;
+        assert!(raw.len() > 500);
+        assert_eq!(
+            decode_receipt("r", &raw)?.executive_summary,
+            receipt.executive_summary
+        );
+        assert!(decode_receipt("other", &raw).is_err());
+        Ok(())
+    }
+
     #[test]
     fn extracts_natural_observations_and_rejects_untrusted_requests_and_noise() {
         assert_eq!(

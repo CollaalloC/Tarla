@@ -134,7 +134,7 @@ fn format_prefetch_snapshot(
     verify_workspace(db, workspace)?;
     let mut stmt = db.prepare(
         "SELECT m.memory_id,m.version,m.content,
-                (m.updated_by='user_manual' AND json_extract(c.revision_json,'$.source_run_id') IS NULL)
+                (m.updated_by='user_manual' AND c.sync_seq IS NOT NULL AND json_extract(c.revision_json,'$.source_run_id') IS NULL)
          FROM memories m
          LEFT JOIN memory_changes c ON c.sync_seq=m.sync_seq
          WHERE m.is_deleted=0 AND m.scope IN ('global',?1)
@@ -151,13 +151,13 @@ fn format_prefetch_snapshot(
             row.get::<_, String>(2)?
         );
         let owner_verified: bool = row.get(3)?;
+        if owner_verified && text.len() <= budget.saturating_sub(trusted.len()) {
+            trusted.push_str(&text);
+        }
         if text.len() <= budget.saturating_sub(snapshot.len()) {
-            if owner_verified {
-                trusted.push_str(&text);
-            }
             snapshot.push_str(&text);
         }
-        if snapshot.len() == budget {
+        if snapshot.len() == budget && trusted.len() == budget {
             break;
         }
     }
@@ -511,11 +511,14 @@ fn valid_id_token(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
+fn valid_memory_id(id: &str) -> bool {
+    valid_id_token(id) && !id.contains(['[', ']'])
+}
+
 /// Validate proposed content before queueing or authoritative version assignment.
 pub fn validate_mutation(p: &Mutation) -> Result<()> {
     ensure!(
-        valid_id_token(&p.memory_id)
-            && !p.memory_id.contains(['[', ']'])
+        valid_memory_id(&p.memory_id)
             && valid_id_token(&p.proposal_id)
             && valid_id_token(&p.source_node_id),
         "invalid proposal or memory identifier"
@@ -869,6 +872,11 @@ mod concurrent_tests {
         )?;
         assert!(frozen.contains("lesson- v1"));
         assert!(frozen.contains("owner-rule"));
+        let executor_entry = frozen.lines().next().unwrap();
+        let (full, privileged) =
+            format_prefetch_snapshot(&db, "work", "global", executor_entry.len() + 1)?;
+        assert!(!full.contains("owner-rule"));
+        assert_eq!(privileged, model);
         assert_eq!(model, "[owner-rule v1] Owner rule stays in model_memory.\n");
         Ok(())
     }

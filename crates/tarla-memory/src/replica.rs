@@ -362,9 +362,21 @@ fn recover(
         return Ok(());
     }
     let id = format!("recovery-{}", hash(&raw));
+    // Older releases admitted identifiers that new mutations cannot address. Keep
+    // the exact revision in memory_recovered and offer a safe key for owner review.
+    // Never publish renamed data (or overwrite a colliding key) automatically.
+    let legacy_key = !valid_memory_id(&m.memory_id);
+    ensure!(
+        !m.memory_id.trim().is_empty(),
+        "missing recovery memory identity"
+    );
     let p = Mutation {
         proposal_id: id.clone(),
-        memory_id: m.memory_id.clone(),
+        memory_id: if legacy_key {
+            format!("legacy-memory-{}", hash(&m.memory_id))
+        } else {
+            m.memory_id.clone()
+        },
         scope: m.scope.clone(),
         content: m.content.clone(),
         base_version: m.version - 1,
@@ -395,13 +407,13 @@ fn recover(
     {
         return Ok(());
     }
-    let current:Option<String>=tx.query_row("SELECT revision_json FROM memory_changes WHERE memory_id=? ORDER BY sync_seq DESC LIMIT 1",[&m.memory_id],|r|r.get(0)).optional()?;
+    let current:Option<String>=tx.query_row("SELECT revision_json FROM memory_changes WHERE memory_id=? ORDER BY sync_seq DESC LIMIT 1",[&p.memory_id],|r|r.get(0)).optional()?;
     let current = current.map(decoded).transpose()?;
     if current.is_none() && m.is_deleted {
         return Ok(());
     }
     let ver = current.as_ref().map_or(0, |r| r.version);
-    if ver == p.base_version && current.as_ref().map(meaning) == record.before {
+    if !legacy_key && ver == p.base_version && current.as_ref().map(meaning) == record.before {
         apply_proposal(tx, workspace, node, &p, ver, &format!("recovery:{peer}"))?;
     } else {
         // A restored authority may no longer have this key. The details retain its
@@ -466,6 +478,38 @@ mod tests {
         })?;
         Ok(())
     }
+    #[test]
+    fn legacy_key_is_archived_and_reviewable_without_blocking_recovery() -> Result<()> {
+        let mut db = open(Path::new(":memory:"), "w")?;
+        let mut store = SqliteMemory::new(&mut db, "w", "chief");
+        add(&mut store, 1, "preserved")?;
+        let mut old = store.pull_delta_since(0, 1)?.remove(0);
+        old.memory_id = "legacy] name".into();
+        let record = RecoveryRevision {
+            revision: old,
+            before: None,
+        };
+        let tx = db.transaction()?;
+        recover(&tx, "w", "chief", "peer", &record)?;
+        recover(&tx, "w", "chief", "peer", &record)?;
+        let original: String =
+            tx.query_row("SELECT revision_json FROM memory_recovered", [], |r| {
+                r.get(0)
+            })?;
+        assert_eq!(decoded(original)?.memory_id, "legacy] name");
+        let request: String = tx.query_row(
+            "SELECT request_json FROM memory_candidate_details",
+            [],
+            |r| r.get(0),
+        )?;
+        let pending: Mutation = serde_json::from_str(&request)?;
+        validate_mutation(&pending)?;
+        assert_eq!(version(&tx, &pending.memory_id)?, 0);
+        assert_eq!(pending.content, "preserved");
+        tx.commit()?;
+        Ok(())
+    }
+
     #[test]
     fn interrupted_repair_is_idempotent_and_keeps_the_entire_old_mirror_visible() -> Result<()> {
         let tmp = tempfile::tempdir()?;
