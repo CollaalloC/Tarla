@@ -2,7 +2,11 @@
 //! delayed Herdr request after the executor has reconciled or cancelled its claim.
 use super::*;
 use rusqlite::{params, OpenFlags, OptionalExtension, TransactionBehavior};
-use std::{ffi::OsString, io::ErrorKind, process::Command};
+use std::{
+    ffi::OsString,
+    io::{self, ErrorKind},
+    process::Command,
+};
 
 pub const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS service_launch_permits (
@@ -77,6 +81,88 @@ fn allowed(db: &Connection, id: &str, required: &str) -> Result<Option<String>> 
         .optional()?)
 }
 
+#[cfg(unix)]
+static TERMINATION_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn record_termination_signal(sig: libc::c_int) {
+    TERMINATION_SIGNAL.store(sig, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+fn install_signal_forwarder() -> io::Result<()> {
+    TERMINATION_SIGNAL.store(0, std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        if libc::sigemptyset(&mut action.sa_mask) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        action.sa_sigaction = record_termination_signal as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+            if libc::sigaction(sig, &action, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn signal_child_tree(pid: libc::pid_t, sig: libc::c_int) {
+    unsafe {
+        if libc::getpgid(pid) == pid {
+            let _ = libc::kill(-pid, sig);
+        } else {
+            let _ = libc::kill(pid, sig);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_child(child: &mut std::process::Child) -> io::Result<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::atomic::Ordering;
+    let pid = child.id() as libc::pid_t;
+    let mut forwarded = 0;
+    let mut escalate_at: Option<std::time::Instant> = None;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status
+                .code()
+                .or_else(|| status.signal().map(|s| 128 + s))
+                .unwrap_or(1));
+        }
+        let sig = TERMINATION_SIGNAL.swap(0, Ordering::Relaxed);
+        if sig != 0 {
+            if forwarded == 0 {
+                forwarded = sig;
+                signal_child_tree(pid, sig);
+                escalate_at = Some(std::time::Instant::now() + Duration::from_secs(3));
+            } else {
+                signal_child_tree(pid, libc::SIGKILL);
+                let _ = child.kill();
+            }
+        }
+        if escalate_at.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            signal_child_tree(pid, libc::SIGKILL);
+            let _ = child.kill();
+            escalate_at = None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(not(unix))]
+fn install_signal_forwarder() -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn wait_for_child(child: &mut std::process::Child) -> std::io::Result<i32> {
+    Ok(child.wait()?.code().unwrap_or(1))
+}
+
 pub fn helper(mut args: impl Iterator<Item = OsString>) -> Result<i32> {
     let home = PathBuf::from(args.next().context("missing private home")?);
     let path = PathBuf::from(args.next().context("missing executor database")?);
@@ -119,12 +205,15 @@ pub fn helper(mut args: impl Iterator<Item = OsString>) -> Result<i32> {
         tx.commit()?;
         return Ok(1);
     }
+    install_signal_forwarder()?;
     let mut child = Command::new(executable).args(args).spawn()?;
-    let committed = tx.commit();
+    if let Err(err) = tx.commit() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err.into());
+    }
     drop(db);
-    let exit = child.wait()?;
-    committed?;
-    Ok(exit.code().unwrap_or(1))
+    Ok(wait_for_child(&mut child)?)
 }
 
 /// A legacy or already-admitted command can have made writes even when the
@@ -219,4 +308,62 @@ pub async fn abandon(
     Ok(Json(
         json!({"run_id":id,"observed_state":"cancelled","reason":reason}),
     ))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+
+    struct RestoreSignals([(libc::c_int, libc::sigaction); 3]);
+    impl Drop for RestoreSignals {
+        fn drop(&mut self) {
+            for (sig, old) in &self.0 {
+                unsafe {
+                    let _ = libc::sigaction(*sig, old, std::ptr::null_mut());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn signal_forwarder_retains_child_until_graceful_exit() {
+        let saved = unsafe {
+            let mut prev: [(libc::c_int, libc::sigaction); 3] = std::mem::zeroed();
+            for (slot, sig) in prev
+                .iter_mut()
+                .zip([libc::SIGTERM, libc::SIGHUP, libc::SIGINT])
+            {
+                slot.0 = sig;
+                assert_eq!(libc::sigaction(sig, std::ptr::null(), &mut slot.1), 0);
+            }
+            prev
+        };
+        let _restore = RestoreSignals(saved);
+        install_signal_forwarder().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let cleaned = dir.path().join("cleaned");
+        let mut child = Command::new("/bin/sh")
+            .process_group(0)
+            .args([
+                "-c",
+                "trap 'sleep 0.12; : > \"$2\"; exit 0' TERM; : > \"$1\"; while :; do sleep 0.05; done",
+                "sh",
+            ])
+            .arg(&ready)
+            .arg(&cleaned)
+            .spawn()
+            .unwrap();
+        while !ready.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        let code = wait_for_child(&mut child).unwrap();
+        assert_eq!(code, 0);
+        assert!(
+            cleaned.exists(),
+            "wait_for_child returned before child finished TERM cleanup"
+        );
+    }
 }

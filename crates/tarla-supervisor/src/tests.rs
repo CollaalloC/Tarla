@@ -390,3 +390,89 @@ async fn executor_receipt_cannot_authorize_another_dispatch() {
     assert!(engine.handle_trigger(&plane, &event).await.is_err());
     assert!(plane.calls.lock().unwrap().is_empty());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn subscription_slot_falls_back_without_safe_mode_and_reports_stderr() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let cred_ok = dir.path().join("compat");
+    let cred_err = dir.path().join("broken");
+    fs::create_dir(&cred_ok).unwrap();
+    fs::create_dir(&cred_err).unwrap();
+
+    let compat_exe = dir.path().join("claude-no-safe-mode");
+    fs::write(
+        &compat_exe,
+        r#"#!/bin/sh
+set -eu
+for arg in "$@"; do
+  if [ "$arg" = "--safe-mode" ]; then
+    echo "error: unknown option '--safe-mode'" >&2
+    exit 2
+  fi
+done
+cat >/dev/null
+printf '%s\n' '{"result":"{\"text\":\"recovered without safe-mode\",\"tool_calls\":[]}"}'
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&compat_exe, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let broken_exe = dir.path().join("claude-expired");
+    fs::write(
+        &broken_exe,
+        r#"#!/bin/sh
+cat >/dev/null
+echo "OAuth session expired for work profile" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&broken_exe, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut configs = BTreeMap::new();
+    configs.insert(
+        "broken".into(),
+        BackendConfig::ClaudeSlot {
+            executable: broken_exe,
+            credential_dir: cred_err,
+            model: None,
+        },
+    );
+    let err_engine = SupervisorEngine::new(
+        backends_from_config(&["slot_borrow:broken".into()], &configs).unwrap(),
+        5,
+    );
+    let err_msg = err_engine
+        .handle_trigger(&Plane::default(), &user())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err_msg.contains("OAuth session expired for work profile"),
+        "{err_msg}"
+    );
+
+    configs.insert(
+        "compat".into(),
+        BackendConfig::ClaudeSlot {
+            executable: compat_exe,
+            credential_dir: cred_ok,
+            model: None,
+        },
+    );
+    let engine = SupervisorEngine::new(
+        backends_from_config(
+            &["slot_borrow:broken".into(), "slot_borrow:compat".into()],
+            &configs,
+        )
+        .unwrap(),
+        5,
+    );
+    let reply = engine
+        .handle_trigger(&Plane::default(), &user())
+        .await
+        .unwrap();
+    assert_eq!(reply, "recovered without safe-mode");
+}

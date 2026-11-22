@@ -82,7 +82,7 @@ def exercise(root, model, hc, host_environment):
     with contextlib.ExitStack() as cleanup:
         # tarlad uses its private socket even when an existing host daemon is selected.
         runtime = work.dir / "runtime"
-        private_core = {**os.environ, "HC_SESSION": "tarla", "HC_SOCKET": str(runtime / "hc.sock"),
+        private_core = {**os.environ, "HC_SESSION": f"tarla-{work.workspace}", "HC_SOCKET": str(runtime / "hc.sock"),
                         "XDG_RUNTIME_DIR": str(runtime / "hc-runtime"), "XDG_STATE_HOME": str(runtime / "hc-state"),
                         "XDG_CONFIG_HOME": str(runtime / "hc-config")}
         cleanup.callback(subprocess.run, [hc, "server", "stop"], env=private_core,

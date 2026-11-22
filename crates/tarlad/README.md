@@ -92,4 +92,4 @@ Only public text deltas are published. Tool arguments, reasoning blocks and prov
 
 ## Local desktop endpoint discovery
 
-A standalone desktop client hosting `tarlad` on loopback may pass `--publish-local-endpoint` (for example with `--listen 127.0.0.1:0`). The daemon writes `{"port":<bound-port>}` to `runtime/desktop-endpoint.json` while running and exposes `GET /local/v1/proof/{nonce}` for a 64-character hexadecimal nonce, returning `{"proof":"<hmac-sha256>"}` keyed by `runtime/api.token` over `tarla-desktop-v1:<nonce>` so the client can verify the listener before sending bearer credentials.
+A standalone desktop client hosting `tarlad` on loopback may pass `--publish-local-endpoint` (for example with `--listen 127.0.0.1:0`). The daemon writes `{"port":<bound-port>,"proof_key":"<ephemeral-secret>"}` to `runtime/desktop-endpoint.json` (`0600`) while running and exposes `GET /local/v1/proof/{nonce}` for a 64-character hexadecimal nonce, returning `{"proof":"<hmac-sha256>"}` keyed by that ephemeral `proof_key` over `tarla-desktop-v1:<nonce>` so the client can verify the listener before sending `runtime/api.token`.

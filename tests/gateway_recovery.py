@@ -153,7 +153,7 @@ def check(root):
         if hc:
             runtime = node.dir / "runtime"
             cleanup.callback(subprocess.run, [hc,"server","stop"], capture_output=True, timeout=10,
-                             env={**os.environ,"HC_SESSION":"tarla","HC_SOCKET":str(runtime/"hc.sock"),
+                             env={**os.environ,"HC_SESSION":f"tarla-{node.workspace}","HC_SOCKET":str(runtime/"hc.sock"),
                                   "XDG_RUNTIME_DIR":str(runtime/"hc-runtime"),"XDG_STATE_HOME":str(runtime/"hc-state"),
                                   "XDG_CONFIG_HOME":str(runtime/"hc-config")})
         cleanup.callback(node.stop)

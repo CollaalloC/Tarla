@@ -479,7 +479,7 @@ fn compact(tx: &Transaction<'_>, conversation: &str, turns: usize) -> Result<()>
             .map(|m| m.content.as_str())
             .collect::<Vec<_>>();
         let (mut summary, entities) = distill(&parts);
-        if let Some(receipt) = block.iter().find(|m| m.role == "run_receipt") {
+        for receipt in block.iter().filter(|m| m.role == "run_receipt") {
             summary.push_str(&format!("\n[Executor receipt seq_no={}]", receipt.seq_no));
         }
         let node = new_node(tx, conversation, start, end, 1, summary, entities)?;
@@ -540,7 +540,18 @@ fn merge_nodes(tx: &Transaction<'_>, conversation: &str, children: &[Node]) -> R
         .iter()
         .map(|n| n.summary.as_str())
         .collect::<Vec<_>>();
-    let (summary, _) = distill(&parts);
+    let (mut summary, _) = distill(&parts);
+    for child in children {
+        for line in child.summary.lines() {
+            if line.starts_with("[Executor receipt seq_no=")
+                && !summary.contains(line)
+                && summary.len() + line.len() < 760
+            {
+                summary.push('\n');
+                summary.push_str(line);
+            }
+        }
+    }
     let mut entities = BTreeSet::new();
     for n in children {
         entities.extend(serde_json::from_str::<Vec<String>>(&n.entities)?);
@@ -688,6 +699,34 @@ fn clip(text: &str, max_bytes: usize) -> &str {
     &text[..end]
 }
 
+fn fts_match_expression(query: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut pending_or = false;
+    for raw in query.split_whitespace() {
+        if raw == "OR" {
+            if !parts.is_empty() {
+                pending_or = true;
+            }
+            continue;
+        }
+        let cleaned = raw.trim_matches('"');
+        if cleaned.is_empty() {
+            continue;
+        }
+        let quoted = format!("\"{}\"", cleaned.replace('"', "\"\""));
+        if pending_or {
+            parts.push("OR".into());
+            pending_or = false;
+        }
+        parts.push(quoted);
+    }
+    if parts.is_empty() {
+        format!("\"{}\"", query.replace('"', "\"\""))
+    } else {
+        parts.join(" ")
+    }
+}
+
 pub fn recall(
     db: &Connection,
     conversation: &str,
@@ -706,7 +745,7 @@ pub fn recall(
         AND seq_no>?2 AND seq_no BETWEEN ?3 AND ?4 AND (?5='' OR
         seq_no IN (SELECT rowid FROM message_search WHERE message_search MATCH ?6) OR instr(lower(content),lower(?5))>0)
         ORDER BY seq_no LIMIT ?7")?;
-    let phrase = format!("\"{}\"", query.replace('"', "\"\""));
+    let fts_expr = fts_match_expression(query);
     let data = stmt
         .query_map(
             params![
@@ -715,7 +754,7 @@ pub fn recall(
                 start,
                 end,
                 query,
-                phrase,
+                fts_expr,
                 limit.min(256)
             ],
             |r| {
@@ -787,6 +826,48 @@ pub fn archive_page(
     })
 }
 
+/// Locate the first case-insensitive full-query or query-token match on an exact
+/// UTF-8 character boundary in `content`, even for Unicode case mappings that
+/// change byte width.
+fn match_offset(content: &str, query: &str) -> usize {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || content.is_empty() {
+        return 0;
+    }
+    if let Some(exact) = content.find(trimmed) {
+        return exact;
+    }
+    let mut lower = String::with_capacity(content.len());
+    let mut byte_to_orig = Vec::with_capacity(content.len());
+    for (orig_idx, ch) in content.char_indices() {
+        for lc in ch.to_lowercase() {
+            let start = lower.len();
+            lower.push(lc);
+            byte_to_orig.resize(lower.len(), orig_idx);
+            debug_assert!(lower.len() > start);
+        }
+    }
+    let full_lower = trimmed.to_lowercase();
+    if !full_lower.is_empty() {
+        if let Some(pos) = lower.find(&full_lower) {
+            return byte_to_orig[pos];
+        }
+    }
+    for term in trimmed.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';')) {
+        let trimmed_term = term.trim();
+        if matches!(trimmed_term, "" | "OR" | "AND" | "NOT") {
+            continue;
+        }
+        let term_lower = trimmed_term.to_lowercase();
+        if !term_lower.is_empty() {
+            if let Some(pos) = lower.find(&term_lower) {
+                return byte_to_orig[pos];
+            }
+        }
+    }
+    0
+}
+
 /// The model can search for handles, then read arbitrary original spans with bounded output.
 pub fn recall_tool(
     db: &Connection,
@@ -818,13 +899,23 @@ pub fn recall_tool(
         limit,
     )?;
     let per_hit = max_bytes.clamp(4, 1024) / hits.len().max(1);
-    Ok(serde_json::Value::Array(hits.into_iter().map(|m| {
-        let offset = m.content.find(query).unwrap_or(0);
-        let excerpt = clip(&m.content[offset..],per_hit.max(4));
-        let next = offset + excerpt.len();
-        serde_json::json!({"seq_no":m.seq_no,"role":m.role,"total_bytes":m.content.len(),
-            "offset_bytes":offset,"next_offset_bytes":(next<m.content.len()).then_some(next),"content":excerpt})
-    }).collect()))
+    Ok(serde_json::Value::Array(
+        hits.into_iter()
+            .map(|m| {
+                let offset = match_offset(&m.content, query);
+                let excerpt = clip(&m.content[offset..], per_hit.max(4));
+                let next = offset + excerpt.len();
+                serde_json::json!({
+                    "seq_no": m.seq_no,
+                    "role": m.role,
+                    "total_bytes": m.content.len(),
+                    "offset_bytes": offset,
+                    "next_offset_bytes": (next < m.content.len()).then_some(next),
+                    "content": excerpt,
+                })
+            })
+            .collect(),
+    ))
 }
 
 #[cfg(test)]
@@ -1277,6 +1368,104 @@ mod retrieval_tests {
             recall(&db, "w", None, "done", 0, 1)?[0].content,
             "{\"result\":\"done\"}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_keeps_all_receipt_handles_and_recall_finds_case_insensitive_offsets() -> Result<()>
+    {
+        let mut db = tarla_memory::open(std::path::Path::new(":memory:"), "work")?;
+        let policy = ContextPolicy {
+            supervisor_active_budget_tokens: 900,
+            compaction_high_watermark_pct: 60,
+            protected_verbatim_turns: 2,
+        };
+        append(
+            &mut db,
+            "work",
+            "conv",
+            "cli",
+            "u0",
+            "user",
+            &format!(
+                "{}Anchor target SQLiteEngineWalConfig here.",
+                "padding ".repeat(60)
+            ),
+        )?;
+        for idx in 1..=3 {
+            append(
+                &mut db,
+                "work",
+                "conv",
+                "receipt",
+                &format!("rcpt-{idx}"),
+                "run_receipt",
+                &format!("{{\"run_id\":\"r{idx}\",\"summary\":\"completed step {idx}\"}}"),
+            )?;
+            append(
+                &mut db,
+                "work",
+                "conv",
+                "supervisor",
+                &format!("a{idx}"),
+                "assistant",
+                &format!("Reviewed receipt {idx}: {}", "detail ".repeat(35)),
+            )?;
+        }
+        for idx in 4..=6 {
+            append(
+                &mut db,
+                "work",
+                "conv",
+                "cli",
+                &format!("u{idx}"),
+                "user",
+                "next turn",
+            )?;
+            append(
+                &mut db,
+                "work",
+                "conv",
+                "supervisor",
+                &format!("a{idx}"),
+                "assistant",
+                "ack",
+            )?;
+        }
+        let window = assemble(&mut db, "conv", "SOUL", "", &policy)?;
+        let joined = window
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for seq in [2, 4, 6] {
+            assert!(
+                joined.contains(&format!("[Executor receipt seq_no={seq}]")),
+                "missing receipt handle seq_no={seq} in:\n{joined}"
+            );
+        }
+        let hits = recall_tool(
+            &db,
+            "conv",
+            &serde_json::json!({"query": "unmatchedtoken OR sqliteenginewalconfig", "max_bytes": 64}),
+        )?;
+        let hit = &hits.as_array().unwrap()[0];
+        assert!(hit["offset_bytes"].as_u64().unwrap() > 400);
+        assert!(hit["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("SQLiteEngineWalConfig"));
+        let non_adjacent = recall_tool(
+            &db,
+            "conv",
+            &serde_json::json!({"query": "anchor sqliteenginewalconfig", "max_bytes": 64}),
+        )?;
+        let hit2 = &non_adjacent.as_array().unwrap()[0];
+        assert!(hit2["offset_bytes"].as_u64().unwrap() > 400);
+        assert!(hit2["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Anchor target SQLiteEngineWalConfig"));
         Ok(())
     }
 }
