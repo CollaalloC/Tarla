@@ -70,47 +70,106 @@ pub fn open(path: &Path, workspace: &str) -> Result<Connection> {
     Ok(db)
 }
 
-/// Reconstruct the privileged part of a frozen prefetch from exact archived revisions.
-/// Parsing a line never grants authority: both the header and the complete multiline
-/// value must match the revision. The full snapshot remains available via session_recall.
+/// Reconstruct the privileged part of a legacy frozen prefetch from archived revisions.
+/// Scans every candidate delimiter so a legacy memory_id containing "] " cannot truncate
+/// subsequent owner entries during a v4 -> v5 schema upgrade.
 fn owner_entries(db: &Connection, snapshot: &str) -> Result<String> {
     let mut remaining = snapshot;
     let mut trusted = String::new();
     while !remaining.is_empty() {
-        let Some((header, _)) = remaining.strip_prefix('[').and_then(|s| s.split_once("] ")) else {
-            break;
+        let Some(body) = remaining.strip_prefix('[') else {
+            let Some((_, rest)) = remaining.split_once('\n') else {
+                break;
+            };
+            remaining = rest;
+            continue;
         };
-        let Some((id, version)) = header.rsplit_once(" v") else {
-            break;
-        };
-        let Ok(version) = version.parse::<i64>() else {
-            break;
-        };
-        let raw:Option<String>=db.query_row("SELECT revision_json FROM memory_changes WHERE memory_id=?1 AND json_extract(revision_json,'$.version')=?2 ORDER BY sync_seq DESC LIMIT 1",
-            params![id,version],|row|row.get(0)).optional()?;
-        let Some(raw) = raw else { break };
-        let revision: Memory = serde_json::from_str(&raw)?;
-        let entry = format!(
-            "[{} v{}] {}\n",
-            revision.memory_id, revision.version, revision.content
-        );
-        let Some(rest) = remaining.strip_prefix(&entry) else {
-            break;
-        };
-        if revision.updated_by == "user_manual" && revision.source_run_id.is_none() {
-            trusted.push_str(&entry);
+        let mut matched = None;
+        for (pos, _) in body.match_indices("] ") {
+            let header = &body[..pos];
+            let Some((id, version)) = header.rsplit_once(" v") else {
+                continue;
+            };
+            let Ok(version) = version.parse::<i64>() else {
+                continue;
+            };
+            let raw: Option<String> = db
+                .query_row(
+                    "SELECT revision_json FROM memory_changes WHERE memory_id=?1 AND json_extract(revision_json,'$.version')=?2 ORDER BY sync_seq DESC LIMIT 1",
+                    params![id, version],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(raw) = raw else { continue };
+            let revision: Memory = serde_json::from_str(&raw)?;
+            let entry = format!(
+                "[{} v{}] {}\n",
+                revision.memory_id, revision.version, revision.content
+            );
+            if let Some(rest) = remaining.strip_prefix(&entry) {
+                matched = Some((revision, entry, rest));
+                break;
+            }
         }
-        remaining = rest;
+        if let Some((revision, entry, rest)) = matched {
+            if revision.updated_by == "user_manual" && revision.source_run_id.is_none() {
+                trusted.push_str(&entry);
+            }
+            remaining = rest;
+        } else if let Some((_, rest)) = remaining.split_once('\n') {
+            remaining = rest;
+        } else {
+            break;
+        }
     }
     Ok(trusted)
 }
 
+fn format_prefetch_snapshot(
+    db: &Connection,
+    workspace: &str,
+    scope: &str,
+    budget: usize,
+) -> Result<(String, String)> {
+    verify_workspace(db, workspace)?;
+    let mut stmt = db.prepare(
+        "SELECT m.memory_id,m.version,m.content,
+                (m.updated_by='user_manual' AND json_extract(c.revision_json,'$.source_run_id') IS NULL)
+         FROM memories m
+         LEFT JOIN memory_changes c ON c.sync_seq=m.sync_seq
+         WHERE m.is_deleted=0 AND m.scope IN ('global',?1)
+         ORDER BY (m.scope=?1) DESC, m.sync_seq DESC",
+    )?;
+    let mut rows = stmt.query([scope])?;
+    let mut snapshot = String::new();
+    let mut trusted = String::new();
+    while let Some(row) = rows.next()? {
+        let text = format!(
+            "[{} v{}] {}\n",
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?
+        );
+        let owner_verified: bool = row.get(3)?;
+        if text.len() <= budget.saturating_sub(snapshot.len()) {
+            if owner_verified {
+                trusted.push_str(&text);
+            }
+            snapshot.push_str(&text);
+        }
+        if snapshot.len() == budget {
+            break;
+        }
+    }
+    Ok((snapshot, trusted))
+}
+
 /// Freeze the full S2 view for exact, tool-level recall and a separate owner-only
-/// projection for the system prompt. An existing conversation keeps its first snapshot.
+/// projection for the system prompt directly from SQL without text re-parsing.
 pub fn freeze_supervisor_snapshot(
     db: &mut Connection,
     workspace: &str,
-    node: &str,
+    _node: &str,
     conversation: &str,
     soul: &str,
     budget: usize,
@@ -122,12 +181,12 @@ pub fn freeze_supervisor_snapshot(
     )? {
         return Ok(());
     }
-    let snapshot =
-        SqliteMemory::new(db, workspace, node).prefetch_frozen_snapshot("global", budget)?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let trusted = owner_entries(&tx, &snapshot)?;
-    tx.execute("INSERT OR IGNORE INTO conversation_prefix(conversation_id,frozen_soul,frozen_memory,model_memory) VALUES(?,?,?,?)",
-        params![conversation,soul,snapshot,trusted])?;
+    let (snapshot, trusted) = format_prefetch_snapshot(&tx, workspace, "global", budget)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO conversation_prefix(conversation_id,frozen_soul,frozen_memory,model_memory) VALUES(?,?,?,?)",
+        params![conversation, soul, snapshot, trusted],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -445,19 +504,29 @@ fn apply_proposal(
     Ok(item)
 }
 
+fn valid_id_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
 /// Validate proposed content before queueing or authoritative version assignment.
 pub fn validate_mutation(p: &Mutation) -> Result<()> {
     ensure!(
-        !p.memory_id.trim().is_empty()
-            && !p.proposal_id.trim().is_empty()
-            && !p.source_node_id.trim().is_empty(),
-        "missing proposal identity"
+        valid_id_token(&p.memory_id)
+            && !p.memory_id.contains(['[', ']'])
+            && valid_id_token(&p.proposal_id)
+            && valid_id_token(&p.source_node_id),
+        "invalid proposal or memory identifier"
     );
     ensure!(
-        p.scope == "global"
-            || p.scope
-                .strip_prefix("project:")
-                .is_some_and(|s| !s.trim().is_empty()),
+        p.scope.len() <= 256
+            && !p.scope.chars().any(char::is_control)
+            && (p.scope == "global"
+                || p.scope
+                    .strip_prefix("project:")
+                    .is_some_and(|s| !s.trim().is_empty() && s.trim() == s)),
         "invalid memory scope"
     );
     ensure!(
@@ -743,6 +812,64 @@ mod concurrent_tests {
             )?,
             1
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_bracketed_memory_ids_and_builds_frozen_model_memory_via_sql() -> Result<()> {
+        let mut db = open(Path::new(":memory:"), "work")?;
+        db.execute(
+            "INSERT INTO conversations(conversation_id,workspace_id,title,created_at,updated_at) VALUES('c1','work','c1',1,1)",
+            [],
+        )?;
+        for bad_id in ["bad] id", "[bad", "line\nbreak", " padded "] {
+            let bad = Mutation {
+                proposal_id: format!("prop-{bad_id}"),
+                memory_id: bad_id.into(),
+                scope: "global".into(),
+                content: "text".into(),
+                base_version: 0,
+                source_node_id: "chief".into(),
+                source_run_id: None,
+                is_deleted: false,
+                hlc_timestamp: None,
+            };
+            assert!(validate_mutation(&bad).is_err(), "{bad_id:?}");
+        }
+        {
+            let mut store = SqliteMemory::new(&mut db, "work", "chief");
+            store.propose_mutation(&Mutation {
+                proposal_id: "owner-1".into(),
+                memory_id: "owner-rule".into(),
+                scope: "global".into(),
+                content: "Owner rule stays in model_memory.".into(),
+                base_version: 0,
+                source_node_id: "chief".into(),
+                source_run_id: None,
+                is_deleted: false,
+                hlc_timestamp: None,
+            })?;
+            store.propose_mutation(&Mutation {
+                proposal_id: "run-1".into(),
+                memory_id: "lesson- v1".into(),
+                scope: "global".into(),
+                content: "Executor observation stays out of model_memory.".into(),
+                base_version: 0,
+                source_node_id: "worker".into(),
+                source_run_id: Some("run-99".into()),
+                is_deleted: false,
+                hlc_timestamp: None,
+            })?;
+        }
+        freeze_supervisor_snapshot(&mut db, "work", "chief", "c1", "SOUL", 1200)?;
+        let (frozen, model): (String, String) = db.query_row(
+            "SELECT frozen_memory, model_memory FROM conversation_prefix WHERE conversation_id='c1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert!(frozen.contains("lesson- v1"));
+        assert!(frozen.contains("owner-rule"));
+        assert_eq!(model, "[owner-rule v1] Owner rule stays in model_memory.\n");
         Ok(())
     }
 }

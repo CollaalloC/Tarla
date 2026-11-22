@@ -20,7 +20,7 @@ sha2 = "0.10"
 subtle = "2"
 tokio = {version="1",features=["full"]}
 toml = "0.8"
-uuid = {version="1",features=["v7","serde"]}
+uuid.workspace = true
 tarla-workspace = {path="../tarla-workspace"}
 tarla-protocol = {path="../tarla-protocol"}
 tarla-context = {path="../tarla-context"}
@@ -30,3 +30,6 @@ tarla-scheduler = {path="../tarla-scheduler"}
 tarla-sidecar = {path="../tarla-sidecar"}
 tarla-gateway = {path="../tarla-gateway"}
 tokio-tungstenite = {version="0.28", default-features=false, features=["handshake"]}
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

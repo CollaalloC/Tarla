@@ -129,6 +129,37 @@ pub(crate) struct ClaudeSlot {
     credentials: PathBuf,
     model: Option<String>,
 }
+const MAX_STDERR: u64 = 16 * 1024;
+
+fn format_stderr_tail(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let clean: String = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if clean.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = clean.chars().collect();
+    let tail: String = if chars.len() > 220 {
+        format!("…{}", chars[chars.len() - 220..].iter().collect::<String>())
+    } else {
+        clean
+    };
+    format!(": {tail}")
+}
+
+fn unsupported_safe_mode(stderr: &[u8]) -> bool {
+    let lower = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    lower.contains("--safe-mode")
+        && (lower.contains("unknown option")
+            || lower.contains("unrecognized")
+            || lower.contains("unexpected argument")
+            || lower.contains("invalid option"))
+}
+
 impl ClaudeSlot {
     pub(crate) fn new(
         executable: &Path,
@@ -144,6 +175,95 @@ impl ClaudeSlot {
             credentials: credentials.to_owned(),
             model,
         })
+    }
+
+    async fn invoke(
+        &self,
+        cwd: &Path,
+        input: &str,
+        include_safe_mode: bool,
+    ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), BrainError> {
+        let mut cmd = Command::new(&self.executable);
+        cmd.current_dir(cwd).env_clear();
+        // Preserve only operating-system launch paths. In particular, never inherit API
+        // keys, alternate account directories, plugin settings or workspace variables.
+        for key in [
+            "HOME",
+            "USERPROFILE",
+            "LOCALAPPDATA",
+            "APPDATA",
+            "SystemRoot",
+            "PATH",
+            "TMP",
+            "TEMP",
+            "TMPDIR",
+            "LANG",
+        ] {
+            if let Some(v) = std::env::var_os(key) {
+                cmd.env(key, v);
+            }
+        }
+        cmd.env("CLAUDE_CONFIG_DIR", &self.credentials)
+            .args(["-p", "--output-format", "json"]);
+        if include_safe_mode {
+            cmd.arg("--safe-mode");
+        }
+        cmd.args([
+            "--tools",
+            "",
+            "--disallowedTools",
+            "mcp__*",
+            "--strict-mcp-config",
+            "--mcp-config",
+            r#"{"mcpServers":{}}"#,
+            "--no-session-persistence",
+            "--disable-slash-commands",
+            "--max-turns",
+            "1",
+            "--system-prompt",
+            SYSTEM,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+        if let Some(model) = &self.model {
+            cmd.arg("--model").arg(model);
+        }
+        let mut child = cmd.spawn().map_err(|_| {
+            BrainError::Unavailable("could not start configured subscription CLI".into())
+        })?;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let run = async {
+            let write = async {
+                stdin.write_all(input.as_bytes()).await?;
+                stdin.shutdown().await?;
+                drop(stdin);
+                Ok::<_, std::io::Error>(())
+            };
+            let read_out = async {
+                let mut output = Vec::new();
+                stdout.take(MAX_OUTPUT + 1).read_to_end(&mut output).await?;
+                if output.len() as u64 > MAX_OUTPUT {
+                    return Err(std::io::Error::other("output limit exceeded"));
+                }
+                Ok(output)
+            };
+            let read_err = async {
+                let mut err_buf = Vec::new();
+                stderr.take(MAX_STDERR).read_to_end(&mut err_buf).await?;
+                Ok(err_buf)
+            };
+            let (_, output, err_buf) = tokio::try_join!(write, read_out, read_err)?;
+            let status = child.wait().await?;
+            Ok::<_, std::io::Error>((status, output, err_buf))
+        };
+        tokio::time::timeout(Duration::from_secs(120), run)
+            .await
+            .map_err(|_| BrainError::Unavailable("subscription CLI timed out".into()))?
+            .map_err(|_| BrainError::Unavailable("subscription CLI I/O failed".into()))
     }
 }
 #[async_trait]
@@ -165,95 +285,29 @@ impl BrainBackend for ClaudeSlot {
         let cwd = tempfile::tempdir().map_err(|_| {
             BrainError::Unavailable("unable to create private slot working directory".into())
         })?;
-        let mut cmd = Command::new(&self.executable);
-        cmd.current_dir(cwd.path()).env_clear();
-        // Preserve only operating-system launch paths. In particular, never inherit API
-        // keys, alternate account directories, plugin settings or workspace variables.
-        for key in [
-            "HOME",
-            "USERPROFILE",
-            "LOCALAPPDATA",
-            "APPDATA",
-            "SystemRoot",
-            "PATH",
-            "TMP",
-            "TEMP",
-            "TMPDIR",
-            "LANG",
-        ] {
-            if let Some(v) = std::env::var_os(key) {
-                cmd.env(key, v);
-            }
-        }
-        cmd.env("CLAUDE_CONFIG_DIR", &self.credentials)
-            .args([
-                "-p",
-                "--output-format",
-                "json",
-                "--safe-mode",
-                "--tools",
-                "",
-                "--disallowedTools",
-                "mcp__*",
-                "--strict-mcp-config",
-                "--mcp-config",
-                r#"{"mcpServers":{}}"#,
-                "--no-session-persistence",
-                "--disable-slash-commands",
-                "--max-turns",
-                "1",
-                "--system-prompt",
-                SYSTEM,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        if let Some(model) = &self.model {
-            cmd.arg("--model").arg(model);
-        }
-        let mut child = cmd.spawn().map_err(|_| {
-            BrainError::Unavailable("could not start configured subscription CLI".into())
-        })?;
-        let mut stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
         let input = json!({"messages":messages,"tools":tools}).to_string();
-        let run = async {
-            let write = async {
-                stdin.write_all(input.as_bytes()).await?;
-                stdin.shutdown().await?;
-                drop(stdin);
-                Ok::<_, std::io::Error>(())
-            };
-            let read = async {
-                let mut output = Vec::new();
-                stdout.take(MAX_OUTPUT + 1).read_to_end(&mut output).await?;
-                if output.len() as u64 > MAX_OUTPUT {
-                    return Err(std::io::Error::other("output limit exceeded"));
-                }
-                Ok(output)
-            };
-            let (_, output) = tokio::try_join!(write, read)?;
-            let status = child.wait().await?;
-            Ok::<_, std::io::Error>((status, output))
-        };
-        let (status, bytes) = tokio::time::timeout(Duration::from_secs(120), run)
-            .await
-            .map_err(|_| BrainError::Unavailable("subscription CLI timed out".into()))?
-            .map_err(|_| BrainError::Unavailable("subscription CLI I/O failed".into()))?;
+        let (mut status, mut bytes, mut err_bytes) = self.invoke(cwd.path(), &input, true).await?;
+        if !status.success() && unsupported_safe_mode(&err_bytes) {
+            (status, bytes, err_bytes) = self.invoke(cwd.path(), &input, false).await?;
+        }
         if !status.success() {
-            return Err(BrainError::Unavailable(
-                "subscription CLI exited unsuccessfully; check account status and CLI version"
-                    .into(),
-            ));
+            return Err(BrainError::Unavailable(format!(
+                "subscription CLI exited unsuccessfully ({status}){}",
+                format_stderr_tail(&err_bytes)
+            )));
         }
         let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| {
             BrainError::Invalid("invalid subscription CLI response envelope".into())
         })?;
         if envelope["is_error"] == true {
-            return Err(BrainError::Unavailable(
-                "subscription CLI reported an error".into(),
-            ));
+            let detail = envelope["result"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| format!(": {}", s.chars().take(200).collect::<String>()))
+                .unwrap_or_else(|| format_stderr_tail(&err_bytes));
+            return Err(BrainError::Unavailable(format!(
+                "subscription CLI reported an error{detail}"
+            )));
         }
         let text = envelope["result"]
             .as_str()

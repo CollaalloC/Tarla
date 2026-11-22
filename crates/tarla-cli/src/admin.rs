@@ -266,7 +266,7 @@ pub fn run(home: &Path, id: &str, op: &Operation) -> Result<()> {
             // If interrupted before installing the ledger a startup must fail closed.
             // Install the copy first, retaining its old epoch until configuration is switched.
             tmp.persist_noclobber(&db)?;
-            if let Err(e) = set_config(&ws, &dest, term, "supervisor_only") {
+            if let Err(e) = set_config(&ws, &dest, term, role(&ws, &dest)) {
                 fs::remove_file(&db)?;
                 return Err(e);
             }
@@ -274,4 +274,85 @@ pub fn run(home: &Path, id: &str, op: &Operation) -> Result<()> {
         }
     };
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_preserves_local_executor_capability_unless_supervisor_only() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let old_home = dir.path().join("old");
+        let old = Workspace::init(&old_home, "work", "chief", "supervisor_only", "chief")?;
+        {
+            let mut db = Connection::open(old.root.join("state.db"))?;
+            db.execute_batch(authority::SCHEMA)?;
+            db.execute_batch(
+                "CREATE TABLE outbox_events(id INTEGER PRIMARY KEY);
+                 CREATE TABLE service_claims(run_id TEXT PRIMARY KEY);
+                 CREATE TABLE service_peers(node_id TEXT PRIMARY KEY);
+                 CREATE TABLE service_leases(nonce TEXT PRIMARY KEY);
+                 CREATE TABLE workspace_facts(key TEXT PRIMARY KEY);
+                 CREATE TABLE runs(run_id TEXT PRIMARY KEY, observed_state TEXT, s0_log_local_path TEXT);
+                 CREATE TABLE service_s1_sequence(seq INTEGER PRIMARY KEY AUTOINCREMENT);
+                 INSERT INTO service_s1_sequence DEFAULT VALUES;",
+            )?;
+            authority::ensure_signer(&mut db, &old.config.workspace)?;
+        }
+        let snap_exec = dir.path().join("to-exec.db");
+        run(
+            &old_home,
+            "work",
+            &Operation::Handover {
+                to: "desk".into(),
+                snapshot: snap_exec.clone(),
+            },
+        )?;
+        let desk_home = dir.path().join("desk");
+        Workspace::init(
+            &desk_home,
+            "work",
+            "desk",
+            "supervisor_and_executor",
+            "desk",
+        )?;
+        run(
+            &desk_home,
+            "work",
+            &Operation::Restore {
+                snapshot: snap_exec,
+                confirm_old_offline: false,
+            },
+        )?;
+        let restored = Workspace::open(&desk_home, "work")?;
+        assert_eq!(
+            restored.config.workspace.role_mode,
+            "supervisor_and_executor"
+        );
+        assert_eq!(restored.config.workspace.supervisor_term, 2);
+
+        let snap_only = dir.path().join("to-only.db");
+        run(
+            &desk_home,
+            "work",
+            &Operation::Backup {
+                to: "pure".into(),
+                snapshot: snap_only.clone(),
+            },
+        )?;
+        let pure_home = dir.path().join("pure");
+        Workspace::init(&pure_home, "work", "pure", "supervisor_only", "pure")?;
+        run(
+            &pure_home,
+            "work",
+            &Operation::Restore {
+                snapshot: snap_only,
+                confirm_old_offline: true,
+            },
+        )?;
+        let pure = Workspace::open(&pure_home, "work")?;
+        assert_eq!(pure.config.workspace.role_mode, "supervisor_only");
+        Ok(())
+    }
 }

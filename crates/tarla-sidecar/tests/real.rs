@@ -31,12 +31,12 @@ async fn real_herdr_holder_and_scoped_stream() -> io::Result<()> {
     let (tmp, tools, binary) = fixture("TARLA_TEST_HERDR", "herdr-core")?;
     let rt = tmp.path().join("rt");
     let core = Herdr::new(&rt)?;
-    struct Stop(PathBuf, PathBuf);
+    struct Stop(PathBuf, PathBuf, PathBuf, String);
     impl Drop for Stop {
         fn drop(&mut self) {
             let _ = Command::new(&self.0)
-                .env("HC_SESSION", "tarla")
-                .env("HC_SOCKET", self.1.join("hc.sock"))
+                .env("HC_SESSION", &self.3)
+                .env("HC_SOCKET", &self.2)
                 .env("XDG_RUNTIME_DIR", self.1.join("hc-runtime"))
                 .env("XDG_STATE_HOME", self.1.join("hc-state"))
                 .env("XDG_CONFIG_HOME", self.1.join("hc-config"))
@@ -46,7 +46,12 @@ async fn real_herdr_holder_and_scoped_stream() -> io::Result<()> {
     }
     // Even a timed-out startup may finish in the background. The cleanup
     // command addresses only this test's socket and state directory.
-    let _cleanup = Stop(binary, rt.clone());
+    let _cleanup = Stop(
+        binary,
+        rt.clone(),
+        core.socket_path().to_path_buf(),
+        core.session_name().to_owned(),
+    );
     tools.ensure_herdr(&core).await?;
     // In the released core the 20th terminal has the first non-decimal
     // address. Create terminals through the real API so allocator changes and

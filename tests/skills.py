@@ -102,7 +102,7 @@ def check(root, model):
         assert chat("/skill calibrate sample", "pin", "pin")["run_id"]
         pinned = packet("pin")
         assert pinned["objective"] == "sample" and "fixture-563" in pinned["distilled_context"][0]
-        install(n,"oversize","x"*2200)
+        install(n,"oversize","x"*8000)
         model.dispatch = True
         rejected(lambda:chat("/skill oversize run", "too-big","over"), "does not fit")
         with sqlite3.connect(n.dir/"state.db") as db:

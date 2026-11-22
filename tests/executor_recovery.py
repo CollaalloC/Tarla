@@ -199,7 +199,7 @@ def recover_holder(root, hc):
         runtime = node.dir / "runtime"
         cleanup.callback(
             subprocess.run, [hc, "server", "stop"], timeout=10, capture_output=True,
-            env={**os.environ, "HC_SESSION": "tarla", "HC_SOCKET": str(runtime / "hc.sock"),
+            env={**os.environ, "HC_SESSION": f"tarla-{node.workspace}", "HC_SOCKET": str(runtime / "hc.sock"),
                  "XDG_CONFIG_HOME": str(runtime / "hc-config"),
                  "XDG_STATE_HOME": str(runtime / "hc-state"),
                  "XDG_RUNTIME_DIR": str(runtime / "hc-runtime")},

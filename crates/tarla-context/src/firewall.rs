@@ -2,14 +2,18 @@ use anyhow::{ensure, Result};
 use serde::Serialize;
 use tarla_protocol::{MissionPacket, RunReceipt};
 
+/// Conservative UTF-8 byte budget per configured token so CJK text (3 bytes/char)
+/// plus JSON framing and escaping fit the specification's 1,800 / 500 token caps.
+pub const BYTES_PER_TOKEN: usize = 4;
+
 fn size(value: &impl Serialize) -> Result<usize> {
     Ok(serde_json::to_vec(value)?.len())
 }
 
 /// Copy whole decisions and whole memory entries while the serialized packet fits.
 /// The objective, acceptance criteria and fact keys must fit in their entirety.
-pub fn bound_mission(mut packet: MissionPacket, budget: usize) -> Result<MissionPacket> {
-    let budget = budget.min(1800);
+pub fn bound_mission(mut packet: MissionPacket, max_tokens: usize) -> Result<MissionPacket> {
+    let budget = max_tokens.min(1800).saturating_mul(BYTES_PER_TOKEN);
     ensure!(
         !packet.run_id.trim().is_empty()
             && !packet.workspace_id.trim().is_empty()
@@ -55,10 +59,10 @@ pub fn bound_mission(mut packet: MissionPacket, budget: usize) -> Result<Mission
     Ok(packet)
 }
 
-/// Preserve identity/state/S0 pointer, fit the executive summary first and add
-/// only complete artifact references. Counts escaped quotes, newlines and UTF-8.
-pub fn bound_receipt(mut receipt: RunReceipt, budget: usize) -> Result<RunReceipt> {
-    let budget = budget.min(500);
+/// Preserve identity/state/S0 pointer, reserve room for up to the first two complete
+/// artifact references, fit the executive summary, and append any remaining artifacts.
+pub fn bound_receipt(mut receipt: RunReceipt, max_tokens: usize) -> Result<RunReceipt> {
+    let budget = max_tokens.min(500).saturating_mul(BYTES_PER_TOKEN);
     ensure!(
         !receipt.run_id.trim().is_empty() && !receipt.s0_transcript_pointer.trim().is_empty(),
         "receipt requires a run id and local transcript pointer"
@@ -72,7 +76,37 @@ pub fn bound_receipt(mut receipt: RunReceipt, budget: usize) -> Result<RunReceip
     );
     let summary = std::mem::take(&mut receipt.executive_summary);
     ensure!(!summary.trim().is_empty(), "receipt requires a summary");
-    let artifacts = std::mem::take(&mut receipt.artifact_refs);
+    let artifacts: Vec<String> = std::mem::take(&mut receipt.artifact_refs)
+        .into_iter()
+        .filter(|a| !a.trim().is_empty())
+        .collect();
+    let base_cost = size(&receipt)?;
+    ensure!(base_cost < budget, "required receipt fields exceed budget");
+    let mark = "…";
+    let first_ch = summary.chars().next().expect("non-empty summary");
+    let min_summary_cost = (size(&first_ch)? - 2) + mark.len();
+    ensure!(
+        budget - base_cost >= min_summary_cost,
+        "no room for bounded receipt summary"
+    );
+
+    // Reserve guaranteed space for up to 2 artifact references so a verbose summary
+    // never drops primary deliverable paths, while keeping room for a readable summary.
+    let summary_floor = min_summary_cost.max((budget - base_cost) / 2);
+    let mut reserved_budget = (budget - base_cost).saturating_sub(summary_floor);
+    let mut deferred = Vec::new();
+    for artifact in artifacts {
+        if receipt.artifact_refs.len() < 2 {
+            let cost = size(&artifact)? + usize::from(!receipt.artifact_refs.is_empty());
+            if cost <= reserved_budget {
+                receipt.artifact_refs.push(artifact);
+                reserved_budget -= cost;
+                continue;
+            }
+        }
+        deferred.push(artifact);
+    }
+
     let space = budget
         .checked_sub(size(&receipt)?)
         .ok_or_else(|| anyhow::anyhow!("required receipt fields exceed budget"))?;
@@ -80,7 +114,6 @@ pub fn bound_receipt(mut receipt: RunReceipt, budget: usize) -> Result<RunReceip
     if prefix.len() == summary.len() && size(&prefix)? - 2 <= space {
         receipt.executive_summary = summary;
     } else {
-        let mark = "…";
         ensure!(space > mark.len(), "no room for bounded receipt summary");
         let mut remaining = space - mark.len();
         for ch in prefix.chars() {
@@ -98,8 +131,8 @@ pub fn bound_receipt(mut receipt: RunReceipt, budget: usize) -> Result<RunReceip
         receipt.executive_summary.push_str(mark);
     }
     let mut remaining = budget - size(&receipt)?;
-    for artifact in artifacts {
-        if artifact.trim().is_empty() || artifact.len() > remaining {
+    for artifact in deferred {
+        if artifact.len() > remaining {
             continue;
         }
         let cost = size(&artifact)? + usize::from(!receipt.artifact_refs.is_empty());
@@ -133,25 +166,56 @@ mod tests {
             project_memory_snapshot: "\nquoted \"keys\"\n".repeat(80),
             required_fact_keys: vec!["checkout".into()],
         };
-        let bounded = bound_mission(packet.clone(), 240)?;
-        assert!(size(&bounded)? <= 240);
+        let bounded = bound_mission(packet.clone(), 60)?;
+        assert!(size(&bounded)? <= 60 * BYTES_PER_TOKEN);
         assert_eq!(bounded.acceptance_criteria, packet.acceptance_criteria);
         assert!(bounded.distilled_context.len() <= 5);
-        assert!(bound_mission(packet, 20).is_err());
+        assert!(bound_mission(packet, 5).is_err());
         let receipt = RunReceipt {
             run_id: "r".into(),
             final_state: "failed".into(),
             executive_summary: "文件 \"x\"\n".repeat(100),
-            artifact_refs: vec!["https://example.invalid/a".into()],
+            artifact_refs: vec![
+                "results/report.csv".into(),
+                "results/diff.patch".into(),
+                "results/extra.log".into(),
+            ],
             s0_transcript_pointer: "node:n/run:r/transcript.jsonl".into(),
         };
-        let bounded = bound_receipt(receipt, 240)?;
-        assert!(size(&bounded)? <= 240);
+        let bounded = bound_receipt(receipt, 80)?;
+        assert!(size(&bounded)? <= 80 * BYTES_PER_TOKEN);
         assert!(bounded.executive_summary.ends_with('…'));
+        assert_eq!(
+            bounded.artifact_refs,
+            vec!["results/report.csv", "results/diff.patch"]
+        );
         assert_eq!(
             bounded.s0_transcript_pointer,
             "node:n/run:r/transcript.jsonl"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn chinese_receipt_summary_and_primary_artifacts_fit_default_500_token_budget() -> Result<()> {
+        let chinese_summary =
+            "已完成潮汐校准模块编译与回归验证，所有十六项传感器边界测试全部通过。".repeat(8);
+        assert!(chinese_summary.chars().count() >= 250);
+        let receipt = RunReceipt {
+            run_id: "0193a5e0-1234-7000-8000-abcdef012345".into(),
+            final_state: "succeeded".into(),
+            executive_summary: chinese_summary.clone(),
+            artifact_refs: vec![
+                "artifacts/calibration-summary.json".into(),
+                "artifacts/regression.diff".into(),
+            ],
+            s0_transcript_pointer:
+                "node:office-mini/run:0193a5e0-1234-7000-8000-abcdef012345/transcript.jsonl".into(),
+        };
+        let bounded = bound_receipt(receipt, 500)?;
+        assert!(size(&bounded)? <= 500 * BYTES_PER_TOKEN);
+        assert_eq!(bounded.executive_summary, chinese_summary);
+        assert_eq!(bounded.artifact_refs.len(), 2);
         Ok(())
     }
 }

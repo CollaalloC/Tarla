@@ -27,6 +27,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(12);
 pub struct Herdr {
     pub(crate) runtime: PathBuf,
     endpoint: PathBuf,
+    session: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,18 +119,53 @@ async fn plain<S: AsyncRead + AsyncWrite + Unpin>(
     reply_result(serde_json::from_slice(&reply)?, 1)
 }
 
+fn derive_session_name(runtime: &Path) -> String {
+    let workspace = runtime
+        .parent()
+        .filter(|ws| {
+            ws.parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == "workspaces")
+        })
+        .and_then(Path::file_name)
+        .and_then(|s| s.to_str())
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 40
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
+    if let Some(ws) = workspace {
+        format!("tarla-{ws}")
+    } else {
+        let digest = format!("{:x}", Sha256::digest(runtime.to_string_lossy().as_bytes()));
+        format!("tarla-{}", &digest[..12])
+    }
+}
+
 impl Herdr {
     pub fn new(runtime_dir: &Path) -> io::Result<Self> {
         private_dir(runtime_dir)?;
         let runtime = runtime_dir.canonicalize()?;
         #[cfg(unix)]
-        let endpoint = runtime.join("hc.sock");
+        let endpoint = crate::unix_socket_path(&runtime, "hc.sock", "hc")?;
         #[cfg(windows)]
         let endpoint = PathBuf::from(format!(
             r"\\.\pipe\tarla-hc-{:x}",
             Sha256::digest(runtime.to_string_lossy().as_bytes())
         ));
-        Ok(Self { runtime, endpoint })
+        let session = derive_session_name(&runtime);
+        Ok(Self {
+            runtime,
+            endpoint,
+            session,
+        })
+    }
+    pub fn socket_path(&self) -> &Path {
+        &self.endpoint
+    }
+    pub fn session_name(&self) -> &str {
+        &self.session
     }
     pub(crate) fn env(&self) -> io::Result<Vec<(&'static str, OsString)>> {
         let dir = |name| -> io::Result<OsString> {
@@ -139,7 +175,7 @@ impl Herdr {
         };
         Ok(vec![
             ("HC_SOCKET", self.endpoint.clone().into_os_string()),
-            ("HC_SESSION", "tarla".into()),
+            ("HC_SESSION", self.session.clone().into()),
             ("XDG_STATE_HOME", dir("hc-state")?),
             ("XDG_CONFIG_HOME", dir("hc-config")?),
             ("XDG_RUNTIME_DIR", dir("hc-runtime")?),
@@ -606,5 +642,34 @@ mod protocol_tests {
             .is_err());
         server.write_all(&[0, 0, 1, 0, 0, 0, b'x']).await.unwrap();
         assert!(matches!(reader.next().await.unwrap(),TerminalEvent::Output(b) if b == b"x"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deep_unix_runtime_falls_back_under_sun_len_and_scopes_session_per_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_rt = tmp.path().join("workspaces/work/runtime");
+        let life_rt = tmp.path().join("workspaces/life/runtime");
+        let work = Herdr::new(&work_rt).unwrap();
+        let life = Herdr::new(&life_rt).unwrap();
+        assert_eq!(work.session_name(), "tarla-work");
+        assert_eq!(life.session_name(), "tarla-life");
+
+        let deep_rt = tmp
+            .path()
+            .join("very-deep-macos-private-var-folders-segment-0123456789abcdef")
+            .join("workspaces")
+            .join("engineering-production-workspace-alpha")
+            .join("runtime");
+        let deep = Herdr::new(&deep_rt).unwrap();
+        assert!(
+            deep.socket_path().as_os_str().as_encoded_bytes().len() <= 96,
+            "socket path exceeded SUN_LEN budget: {}",
+            deep.socket_path().display()
+        );
+        assert_eq!(
+            deep.session_name(),
+            "tarla-engineering-production-workspace-alpha"
+        );
     }
 }

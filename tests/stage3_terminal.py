@@ -77,13 +77,17 @@ def ticket(node, run, mode="observe", route="direct", token=None):
     return value
 
 
+def send_masked(conn, opcode, payload):
+    mask = secrets.token_bytes(4)
+    conn.sendall(bytes([opcode, 128 | len(payload)]) + mask +
+                 bytes(x ^ mask[i % 4] for i, x in enumerate(payload)))
+
+
 def check_observer(node, run, grant, marker):
     with upgrade(node, run, grant["ticket"]) as (status, conn, stream):
         assert status == 101
-        payload = marker.encode() + b"\r"
-        mask = secrets.token_bytes(4)
-        conn.sendall(bytes([0x82, 128 | len(payload)]) + mask +
-                     bytes(x ^ mask[i % 4] for i, x in enumerate(payload)))
+        send_masked(conn, 0x81, b'{"cols":120,"rows":40}')
+        send_masked(conn, 0x82, marker.encode() + b"\r")
         # Either the initial paint or the close frame may be first. Both WebSocket
         # endpoints close on an observer input attempt, leaving the live job alone.
         while True:
@@ -182,10 +186,13 @@ class ExecutorFixture(BaseHTTPRequestHandler):
             mask = self.rfile.read(4)
             key = self.rfile.read(1)[0] ^ mask[0]
             self.wfile.write(b"\x82\x01" + bytes([key]))
+            self.wfile.write(b"\x88\x00")
         else:
+            time.sleep(0.08)
             payload = self.server.repaint
-            self.wfile.write(b"\x82\x7f" + len(payload).to_bytes(8, "big") + payload)
-        self.wfile.write(b"\x88\x00")
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                self.wfile.write(b"\x82\x7f" + len(payload).to_bytes(8, "big") + payload)
+                self.wfile.write(b"\x88\x00")
         self.close_connection = True
 
     def log_message(self, *_):
@@ -240,11 +247,19 @@ def check_routes(root):
         interactive = ticket(chief, rid, mode="interactive", route="supervisor")
         assert ws_status(chief, rid, interactive["ticket"]) == 409
         grant = ticket(chief, rid, route="supervisor")
-        with upgrade(chief, rid, grant["ticket"]) as (status, _, stream):
-            assert status == 101 and stream.read(2) == b"\x82\x7f"
+        with upgrade(chief, rid, grant["ticket"]) as (status, conn, stream):
+            assert status == 101
+            send_masked(conn, 0x81, b'{"cols":120,"rows":40}')
+            assert stream.read(2) == b"\x82\x7f"
             assert int.from_bytes(stream.read(8), "big") == len(peer.repaint)
             assert stream.read(len(peer.repaint)) == peer.repaint
         assert ws_status(chief, rid, grant["ticket"]) == 401
+        denied_obs = ticket(chief, rid, route="supervisor")
+        with upgrade(chief, rid, denied_obs["ticket"]) as (status, conn, stream):
+            assert status == 101
+            send_masked(conn, 0x82, b"denied\r")
+            head = stream.read(2)
+            assert not head or (head[0] & 15) == 8
         peer.terminal = "t2"
         assert ws_status(chief, rid, ticket(chief, rid, route="supervisor")["ticket"]) == 409
         peer.current_protocol, peer.terminal = True, "t1b"
@@ -280,7 +295,7 @@ def run(root):
     with contextlib.ExitStack() as cleanup:
         for n, folder in [(chief, local), (worker, remote)]:
             rt = n.dir / "runtime"
-            env = {**os.environ, "HC_SESSION": "tarla", "HC_SOCKET": str(rt / "hc.sock"),
+            env = {**os.environ, "HC_SESSION": f"tarla-{n.workspace}", "HC_SOCKET": str(rt / "hc.sock"),
                    "XDG_CONFIG_HOME": str(rt / "hc-config"), "XDG_RUNTIME_DIR": str(rt / "hc-runtime"),
                    "XDG_STATE_HOME": str(rt / "hc-state")}
             cleanup.callback(subprocess.run, [hc, "server", "stop"], env=env, timeout=15, capture_output=True)

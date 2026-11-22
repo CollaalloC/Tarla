@@ -148,10 +148,10 @@ def run(path, port):
         receipt, = until(received, "archived executor receipt")
         with sqlite3.connect(endpoint) as db:
             packet, = db.execute("SELECT mission_packet_json FROM runs WHERE run_id=?", (run,)).fetchone()
-        assert len(packet.encode()) <= MISSION
+        assert len(packet.encode()) <= MISSION * 4
         decisions = json.loads(packet)["distilled_context"]
         assert 1 <= len(decisions) <= 5 and any(DECISION in item for item in decisions), decisions
-        assert len(receipt.encode()) <= RECEIPT
+        assert len(receipt.encode()) <= RECEIPT * 4
         receipt_obj = json.loads(receipt)
         assert receipt_obj["run_id"] == run and receipt_obj["final_state"] == "failed"
         assert run in receipt_obj["s0_transcript_pointer"]
@@ -165,8 +165,8 @@ def run(path, port):
         until(folded_after_reply, "idle compaction without another user turn")
         print(f"PASS {TURNS} real-daemon turns; {len(LONG.encode())}-byte Chinese original, "
               f"DAG depth {depth}, {LocalModel.count} loopback model requests, maximum wire "
-              f"body {LocalModel.peak}/{WINDOW} bytes; mission {len(packet.encode())}/{MISSION}, "
-              f"receipt {len(receipt.encode())}/{RECEIPT}")
+              f"body {LocalModel.peak}/{WINDOW} bytes; mission {len(packet.encode())}/{MISSION * 4}, "
+              f"receipt {len(receipt.encode())}/{RECEIPT * 4}")
     finally:
         node.stop()
 

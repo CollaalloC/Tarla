@@ -328,7 +328,8 @@ async fn start_network_impl(
     }));
     let frontend = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let socks5 = frontend.local_addr()?;
-    let transport = spawn_transport(tools, &runtime, spec, api_port, easytier_listen).await?;
+    let transport =
+        spawn_transport_with_retry(tools, &runtime, spec, api_port, easytier_listen).await?;
     let manager = Supervisor {
         tools: tools.clone(),
         runtime,
@@ -344,6 +345,35 @@ async fn start_network_impl(
         state,
         socks5,
     }))
+}
+
+async fn spawn_transport_with_retry(
+    tools: &Toolchain,
+    runtime: &Path,
+    spec: &NetworkSpec,
+    api_port: Option<u16>,
+    easytier_listen: Option<SocketAddr>,
+) -> io::Result<Transport> {
+    let mut attempt = 0u8;
+    loop {
+        attempt += 1;
+        match spawn_transport(tools, runtime, spec, api_port, easytier_listen).await {
+            Ok(transport) => return Ok(transport),
+            Err(err)
+                if attempt < 3
+                    && !matches!(
+                        err.kind(),
+                        io::ErrorKind::InvalidData
+                            | io::ErrorKind::InvalidInput
+                            | io::ErrorKind::PermissionDenied
+                            | io::ErrorKind::NotFound
+                    ) =>
+            {
+                sleep(Duration::from_millis(25)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 async fn spawn_transport(
@@ -425,8 +455,8 @@ async fn spawn_transport(
                     c.env(key, value);
                 }
             }
-            #[cfg(not(windows))]
-            let socket = runtime.join("ts.sock").into_os_string();
+            #[cfg(unix)]
+            let socket = crate::unix_socket_path(runtime, "ts.sock", "ts")?.into_os_string();
             #[cfg(windows)]
             let socket = std::ffi::OsString::from(format!(
                 r"\\.\pipe\tarla-ts-{:x}",

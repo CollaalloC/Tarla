@@ -496,8 +496,9 @@ async fn serve() -> Result<bool> {
         routes = routes.nest("/gateway", tarla_gateway::router(config).await?);
     }
     let _local_endpoint = if a.publish_local_endpoint {
-        routes = routes.merge(local_endpoint::proof_route(service.clone()));
-        Some(local_endpoint::publish(&service.ws.root, actual)?)
+        let (publication, proof_router) = local_endpoint::enable(&service.ws.root, actual)?;
+        routes = routes.merge(proof_router);
+        Some(publication)
     } else {
         None
     };
