@@ -393,7 +393,7 @@ async fn executor_receipt_cannot_authorize_another_dispatch() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn subscription_slot_falls_back_without_safe_mode_and_reports_stderr() {
+async fn subscription_slot_requires_safe_mode_and_keeps_diagnostics_local() {
     use std::{fs, os::unix::fs::PermissionsExt};
     let dir = tempfile::tempdir().unwrap();
     let cred_ok = dir.path().join("compat");
@@ -408,6 +408,7 @@ async fn subscription_slot_falls_back_without_safe_mode_and_reports_stderr() {
 set -eu
 for arg in "$@"; do
   if [ "$arg" = "--safe-mode" ]; then
+    head -c 20000 /dev/zero >&2
     echo "error: unknown option '--safe-mode'" >&2
     exit 2
   fi
@@ -449,10 +450,8 @@ exit 1
         .await
         .unwrap_err()
         .to_string();
-    assert!(
-        err_msg.contains("OAuth session expired for work profile"),
-        "{err_msg}"
-    );
+    assert!(err_msg.contains("check daemon diagnostics"), "{err_msg}");
+    assert!(!err_msg.contains("OAuth session expired"));
 
     configs.insert(
         "compat".into(),
@@ -470,9 +469,10 @@ exit 1
         .unwrap(),
         5,
     );
-    let reply = engine
+    let err = engine
         .handle_trigger(&Plane::default(), &user())
         .await
-        .unwrap();
-    assert_eq!(reply, "recovered without safe-mode");
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("lacks required --safe-mode"), "{err}");
 }

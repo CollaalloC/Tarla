@@ -289,12 +289,13 @@ pub async fn socket(
                 _=>break
             },
             inbound=source.next()=>match inbound{
-                Some(Ok(Message::Binary(bytes))) if !observe=>if writer.input(&bytes).await.is_err(){break},
+                Some(Ok(Message::Text(_) | Message::Binary(_))) if observe=>continue,
+                Some(Ok(Message::Binary(bytes)))=>if writer.input(&bytes).await.is_err(){break},
                 Some(Ok(Message::Text(txt)))=>{
                     #[derive(serde::Deserialize)]struct Size{cols:u16,rows:u16}
                     let Ok(size)=serde_json::from_str::<Size>(&txt)else{break};
                     if size.cols==0||size.rows==0{break}
-                    if !observe&&writer.resize(size.cols,size.rows).await.is_err(){break}
+                    if writer.resize(size.cols,size.rows).await.is_err(){break}
                 }
                 Some(Ok(Message::Ping(x)))=>if sink.send(Message::Pong(x)).await.is_err(){break},
                 Some(Ok(Message::Pong(_)))=>{},

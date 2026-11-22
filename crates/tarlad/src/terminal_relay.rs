@@ -147,19 +147,7 @@ pub async fn connect(
                     let frame = match incoming {
                         Some(Ok(Message::Binary(bytes))) if interactive => Remote::Binary(bytes),
                         Some(Ok(Message::Text(text))) if interactive => Remote::Text(text.as_str().into()),
-                        Some(Ok(Message::Text(text))) => {
-                            #[derive(serde::Deserialize)]
-                            struct Size {
-                                cols: u16,
-                                rows: u16,
-                            }
-                            if serde_json::from_str::<Size>(&text)
-                                .is_ok_and(|s| s.cols > 0 && s.rows > 0)
-                            {
-                                continue;
-                            }
-                            break;
-                        }
+                        Some(Ok(Message::Text(_) | Message::Binary(_))) => continue,
                         Some(Ok(Message::Ping(_))) => {
                             if client.flush().await.is_err() {
                                 break;

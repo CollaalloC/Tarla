@@ -51,7 +51,7 @@ pub fn control_tools() -> Vec<ToolSpec> {
             "run_id":s(),"offset":n(),"limit":n(),"query":s()
         }), vec!["run_id"]),
         (SessionRecall, "Search this archive or read exact UTF-8 pages using seq_no or source. Continue from next_offset_bytes.", json!({
-            "query":s(),"dag_node_id":s(),"after_seq":n(),"limit":n(),"seq_no":n(),"source":{"type":"string","enum":["profile","frozen_memory"]},"offset_bytes":n(),"max_bytes":n()
+            "query":s(),"dag_node_id":s(),"receipts_only":{"type":"boolean"},"after_seq":n(),"limit":n(),"seq_no":n(),"source":{"type":"string","enum":["profile","frozen_memory","model_memory"]},"offset_bytes":n(),"max_bytes":n()
         }), vec![]),
         (MemoryManage, "Find, propose, update or archive a workspace memory. Updates require the version previously read.", json!({
             "operation":{"type":"string","enum":["create","update","archive","search"]},

@@ -88,20 +88,20 @@ def check_observer(node, run, grant, marker):
         assert status == 101
         send_masked(conn, 0x81, b'{"cols":120,"rows":40}')
         send_masked(conn, 0x82, marker.encode() + b"\r")
-        # Either the initial paint or the close frame may be first. Both WebSocket
-        # endpoints close on an observer input attempt, leaving the live job alone.
+        send_masked(conn, 0x89, b"still-observing")
+        # A pong after the input frame proves the observer stayed connected.
         while True:
             head = stream.read(2)
-            if not head:
-                break
             assert len(head) == 2 and head[1] < 128
             size = head[1] & 0x7f
             if size == 126:
                 size = int.from_bytes(stream.read(2), "big")
             elif size == 127:
                 size = int.from_bytes(stream.read(8), "big")
-            stream.read(size)
-            if head[0] & 15 == 8:
+            payload = stream.read(size)
+            assert head[0] & 15 != 8
+            if head[0] & 15 == 10:
+                assert payload == b"still-observing"
                 break
     assert ws_status(node, run, grant["ticket"]) == 401
 

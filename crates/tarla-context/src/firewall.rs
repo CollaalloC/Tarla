@@ -2,9 +2,11 @@ use anyhow::{ensure, Result};
 use serde::Serialize;
 use tarla_protocol::{MissionPacket, RunReceipt};
 
-/// Conservative UTF-8 byte budget per configured token so CJK text (3 bytes/char)
-/// plus JSON framing and escaping fit the specification's 1,800 / 500 token caps.
+/// Wire-size estimate including UTF-8 and JSON framing, independent of provider tokenizers.
 pub const BYTES_PER_TOKEN: usize = 4;
+
+const MAX_RECEIPT_TOKENS: usize = 500;
+pub const MAX_RECEIPT_BYTES: usize = MAX_RECEIPT_TOKENS * BYTES_PER_TOKEN;
 
 fn size(value: &impl Serialize) -> Result<usize> {
     Ok(serde_json::to_vec(value)?.len())
@@ -62,7 +64,9 @@ pub fn bound_mission(mut packet: MissionPacket, max_tokens: usize) -> Result<Mis
 /// Preserve identity/state/S0 pointer, reserve room for up to the first two complete
 /// artifact references, fit the executive summary, and append any remaining artifacts.
 pub fn bound_receipt(mut receipt: RunReceipt, max_tokens: usize) -> Result<RunReceipt> {
-    let budget = max_tokens.min(500).saturating_mul(BYTES_PER_TOKEN);
+    let budget = max_tokens
+        .min(MAX_RECEIPT_TOKENS)
+        .saturating_mul(BYTES_PER_TOKEN);
     ensure!(
         !receipt.run_id.trim().is_empty() && !receipt.s0_transcript_pointer.trim().is_empty(),
         "receipt requires a run id and local transcript pointer"
@@ -83,8 +87,9 @@ pub fn bound_receipt(mut receipt: RunReceipt, max_tokens: usize) -> Result<RunRe
     let base_cost = size(&receipt)?;
     ensure!(base_cost < budget, "required receipt fields exceed budget");
     let mark = "…";
+    let full_summary_cost = size(&summary)? - 2;
     let first_ch = summary.chars().next().expect("non-empty summary");
-    let min_summary_cost = (size(&first_ch)? - 2) + mark.len();
+    let min_summary_cost = full_summary_cost.min(size(&first_ch)? - 2 + mark.len());
     ensure!(
         budget - base_cost >= min_summary_cost,
         "no room for bounded receipt summary"
