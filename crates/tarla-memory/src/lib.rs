@@ -6,6 +6,8 @@ mod hosted;
 pub use hosted::{HostedIndex, Projection};
 mod mnemosyne;
 pub use mnemosyne::MnemosyneIndex;
+mod v2;
+pub use v2::*;
 
 use anyhow::{bail, ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -28,7 +30,7 @@ pub fn open(path: &Path, workspace: &str) -> Result<Connection> {
             tx.execute_batch(include_str!("schema.sql"))?;
             tx.execute("INSERT INTO workspace_identity VALUES(1,?1)", [workspace])?;
         }
-        1..=5 => verify_workspace(&tx, workspace)?,
+        1..=6 => verify_workspace(&tx, workspace)?,
         version => bail!("unsupported database schema version {version}"),
     }
     if version < 2 {
@@ -65,6 +67,10 @@ pub fn open(path: &Path, workspace: &str) -> Result<Connection> {
             tx.execute("UPDATE conversation_prefix SET model_memory=?1,rendered_prefix=CASE WHEN frozen_memory=?1 THEN rendered_prefix ELSE NULL END WHERE conversation_id=?2",params![trusted,id])?;
         }
         tx.pragma_update(None, "user_version", 5)?;
+    }
+    if version < 6 {
+        tx.execute_batch(v2::V2_SCHEMA)?;
+        tx.pragma_update(None, "user_version", 6)?;
     }
     tx.commit()?;
     Ok(db)
@@ -520,13 +526,14 @@ pub fn validate_mutation(p: &Mutation) -> Result<()> {
             && valid_id_token(&p.source_node_id),
         "invalid proposal or memory identifier"
     );
+    let scoped_ok = p.scope == "global"
+        || ["project:", "bot:", "topic:"].iter().any(|prefix| {
+            p.scope
+                .strip_prefix(prefix)
+                .is_some_and(|s| !s.trim().is_empty() && s.trim() == s)
+        });
     ensure!(
-        p.scope.len() <= 256
-            && !p.scope.chars().any(char::is_control)
-            && (p.scope == "global"
-                || p.scope
-                    .strip_prefix("project:")
-                    .is_some_and(|s| !s.trim().is_empty() && s.trim() == s)),
+        p.scope.len() <= 256 && !p.scope.chars().any(char::is_control) && scoped_ok,
         "invalid memory scope"
     );
     ensure!(
@@ -535,6 +542,9 @@ pub fn validate_mutation(p: &Mutation) -> Result<()> {
             && (p.is_deleted || !p.content.trim().is_empty()),
         "invalid proposal content or version"
     );
+    if !p.is_deleted {
+        v2::inspect_memory_safety(&p.content)?;
+    }
     if let Some(clock) = &p.hlc_timestamp {
         validate_clock(clock)?;
     }

@@ -120,6 +120,9 @@ jobs:
       - name: S2 visibility and completion receipt latency
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: python3 tests/replication_latency.py --samples 5 --warmup 2 --jitter-ms 50 --receipt-samples 2 --successful-receipts
+      - name: V2.0 event microkernel, botflow orchestration, sync ledger and safety guardrails
+        if: "!cancelled() && steps.binaries.outcome == 'success'"
+        run: python3 tests/v2_botflow_e2e.py
       - name: Rebuild and query the Mnemosyne index with its published SDK
         if: "!cancelled() && steps.binaries.outcome == 'success'"
         run: |

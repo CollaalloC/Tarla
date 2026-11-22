@@ -126,8 +126,14 @@ pub async fn local_ticket(s: &Service, id: &str, v: &Value) -> Api<Value> {
     describe(s, &mut run).await?;
     check_mode(&run, mode)?;
     let term = string(&run, "hc_terminal_id")?;
+    let ts = now();
+    if mode == AttachMode::Interactive {
+        if let Ok(db) = s.db() {
+            bot_session::mark_human_lease_for_terminal(&db, term, ts + 60);
+        }
+    }
     Ok(
-        json!({"ticket":AttachLease::issue(s.ws.attach_key.as_bytes(),s.id(),s.node(),id,term,mode,now())?,"mode":mode,"route":"direct","run_id":id,"node_id":s.node(),"hc_terminal_id":term,"expires_in":60}),
+        json!({"ticket":AttachLease::issue(s.ws.attach_key.as_bytes(),s.id(),s.node(),id,term,mode,ts)?,"mode":mode,"route":"direct","run_id":id,"node_id":s.node(),"hc_terminal_id":term,"expires_in":60}),
     )
 }
 

@@ -154,12 +154,12 @@ fn wait_for_child(child: &mut std::process::Child) -> io::Result<i32> {
 }
 
 #[cfg(not(unix))]
-fn install_signal_forwarder() -> std::io::Result<()> {
+fn install_signal_forwarder() -> io::Result<()> {
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn wait_for_child(child: &mut std::process::Child) -> std::io::Result<i32> {
+fn wait_for_child(child: &mut std::process::Child) -> io::Result<i32> {
     Ok(child.wait()?.code().unwrap_or(1))
 }
 

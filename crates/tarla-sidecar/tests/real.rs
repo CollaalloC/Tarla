@@ -2,8 +2,12 @@
 //! or TARLA_TEST_TAILSCALED to the corresponding locally installed binary.
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fs, io, path::PathBuf, process::Command, time::Duration};
-use tarla_sidecar::{start_network, Herdr, NetworkSpec, TerminalEvent, Toolchain};
+#[cfg(unix)]
+use std::{collections::BTreeMap, process::Command};
+use std::{fs, io, path::PathBuf, time::Duration};
+use tarla_sidecar::{start_network, NetworkSpec, Toolchain};
+#[cfg(unix)]
+use tarla_sidecar::{Herdr, TerminalEvent};
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 

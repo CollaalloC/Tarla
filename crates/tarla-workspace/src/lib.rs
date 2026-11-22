@@ -161,13 +161,14 @@ fn private_dir(path: &Path) -> Result<()> {
             "cannot inspect directory {}",
             path.display()
         );
-        let mut b = fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let created = {
             use std::os::unix::fs::DirBuilderExt;
-            b.mode(0o700);
-        }
-        if let Err(e) = b.create(path) {
+            fs::DirBuilder::new().mode(0o700).create(path)
+        };
+        #[cfg(not(unix))]
+        let created = fs::create_dir(path);
+        if let Err(e) = created {
             if e.kind() != ErrorKind::AlreadyExists {
                 return Err(e.into());
             }

@@ -1573,6 +1573,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tarla-botflow"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tarla-memory",
+ "uuid",
+]
+
+[[package]]
 name = "tarla-cli"
 version = "0.1.0"
 dependencies = [
@@ -1726,6 +1739,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subtle",
+ "tarla-botflow",
  "tarla-context",
  "tarla-gateway",
  "tarla-memory",

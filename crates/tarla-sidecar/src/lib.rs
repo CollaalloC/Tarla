@@ -1,14 +1,20 @@
 //! Private workspace-owned execution and network sidecars.
+mod events;
 mod herdr;
 mod managed;
 mod network;
 mod secrets;
+mod templates;
+pub use events::{parse_event_frame, EventStream, HerdrEvent, HerdrEventKind};
 pub use herdr::{
-    Herdr, TerminalEvent, TerminalReader, TerminalStatus, TerminalWriter, MAX_HERDR_FRAME_BYTES,
-    MAX_TERMINAL_INPUT_BYTES,
+    DocRecord, Herdr, TerminalEvent, TerminalReader, TerminalSpawnSpec, TerminalStatus,
+    TerminalWriter, MAX_HERDR_DOC_BYTES, MAX_HERDR_FRAME_BYTES, MAX_TERMINAL_INPUT_BYTES,
 };
 pub use managed::{credential_environment, try_lock_slot, Toolchain};
 pub use network::{start_network, start_network_for, ManagedNetwork, NetworkPorts, NetworkSpec};
+pub use templates::{
+    render_core_config_toml, render_template_markdown, sync_core_templates, AgentTemplateSpec,
+};
 
 use std::{fs, io, path::Path};
 pub(crate) fn invalid(s: impl Into<String>) -> io::Error {

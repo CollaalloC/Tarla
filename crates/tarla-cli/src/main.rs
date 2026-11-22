@@ -1,4 +1,5 @@
 mod admin;
+mod ctl;
 mod provision;
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -166,6 +167,8 @@ enum Command {
         #[arg(long)]
         via_supervisor: bool,
     },
+    /// Compact JSON orchestration CLI (`bots`, `send-goal`, `cancel-goal`, `emit`, `memory`, `switch-engine`, `rollback`, `exec-op`).
+    Ctl(ctl::CtlArgs),
 }
 #[derive(Copy, Clone, ValueEnum)]
 enum Decision {
@@ -316,6 +319,9 @@ async fn main() -> Result<()> {
         workspace: cli.workspace,
         token,
     };
+    if let Command::Ctl(ctl_args) = &cli.command {
+        return ctl::run_ctl(&c.http, &c.base, &c.workspace, &c.token, ctl_args).await;
+    }
     // Standalone IM gateways can be addressed directly and do not serve /health.
     if !matches!(
         cli.command,
@@ -375,8 +381,12 @@ async fn main() -> Result<()> {
         Command::Unbind { conversation } => c.api(Method::PUT,
             &["v1", "conversations", &conversation, "binding"], Some(json!({"mode":"orchestrator"})), &[]).await?,
         Command::Attach { id, interactive, via_supervisor } => return attach(&c, &id, interactive, via_supervisor).await,
-        Command::Init { .. } | Command::Skills | Command::Supervisor { .. } |
-        Command::InstallTool { .. } | Command::Pair { .. } => unreachable!(),
+        Command::Init { .. }
+        | Command::Skills
+        | Command::Supervisor { .. }
+        | Command::InstallTool { .. }
+        | Command::Pair { .. }
+        | Command::Ctl(_) => unreachable!(),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
