@@ -36,6 +36,6 @@ argv = ["/absolute/path/to/claude"]
 
 每次模型决策都会重新读取当前工作空间的本机工位遥测，以滚动和周配额中较少的剩余百分比排序。相同余量按池中的配置顺序选择。已过重置时间的窗口重新计为零使用率。任一窗口已用达 95%、账号过期、尚在冷却、已有未终结任务或账户锁被占用时跳过该工位。只考虑 `prepaid_subscription` 和 `free_quota`。账号实际计费遵循供应商订阅和额外用量设置。
 
-借用时只启动 `argv[0]` 指定的绝对路径，只传递主管适配器固定的参数。决策在临时空目录进行，输入为当前主管窗口和控制工具的 JSON。Claude 使用 `-p --safe-mode --tools "" --disallowedTools "mcp__*" --strict-mcp-config --mcp-config '{"mcpServers":{}}' --max-turns 1 --no-session-persistence`。CLI 报错或不可用时继续试池中下一个账号，然后试下一个配置的后端。格式错误的模型决策会终止该轮。组织级 Claude 托管策略仍可运行管理员配置的钩子，请在允许借用的主机上核对该策略。[Claude CLI 参数](https://code.claude.com/docs/en/cli-reference)
+借用时只启动 `argv[0]` 指定的绝对路径，只传递主管适配器固定的参数。决策在临时空目录进行，输入为当前主管窗口和控制工具的 JSON。Claude 使用 `-p --safe-mode --tools "" --disallowedTools "mcp__*" --strict-mcp-config --mcp-config '{"mcpServers":{}}' --max-turns 1 --no-session-persistence`。旧版 CLI 缺少 `--safe-mode` 时跳过该工位，诊断详情保存在守护进程日志。CLI 报错或不可用时继续试池中下一个账号，然后试下一个配置的后端。格式错误的模型决策会终止该轮。组织级 Claude 托管策略仍可运行管理员配置的钩子，请在允许借用的主机上核对该策略。[Claude CLI 参数](https://code.claude.com/docs/en/cli-reference)
 
 Codex 的 `exec --ephemeral` 支持临时会话，`--sandbox read-only` 仍允许读取。Gemini 无头模式允许工具执行，也会管理会话历史。当前主管适配器把这两种工位标记为无法借用；无需启动 CLI 即可继续回退。执行机仍可将这两类工位用于普通任务。[Codex CLI](https://developers.openai.com/codex/cli/reference/) · [Gemini 无头模式](https://geminicli.com/docs/cli/headless/) · [Gemini 会话历史](https://geminicli.com/docs/cli/session-management/)

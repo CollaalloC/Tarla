@@ -129,7 +129,21 @@ pub(crate) struct ClaudeSlot {
     credentials: PathBuf,
     model: Option<String>,
 }
-const MAX_STDERR: u64 = 16 * 1024;
+const MAX_STDERR: usize = 16 * 1024;
+
+async fn stderr_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+    use std::collections::VecDeque;
+    let mut tail = VecDeque::with_capacity(MAX_STDERR);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(tail.into());
+        }
+        tail.drain(..(tail.len() + n).saturating_sub(MAX_STDERR));
+        tail.extend(&chunk[..n]);
+    }
+}
 
 fn format_stderr_tail(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
@@ -148,7 +162,8 @@ fn format_stderr_tail(bytes: &[u8]) -> String {
     } else {
         clean
     };
-    format!(": {tail}")
+    let printable: String = tail.chars().filter(|c| !c.is_control()).collect();
+    format!(": {printable}")
 }
 
 fn unsupported_safe_mode(stderr: &[u8]) -> bool {
@@ -181,7 +196,6 @@ impl ClaudeSlot {
         &self,
         cwd: &Path,
         input: &str,
-        include_safe_mode: bool,
     ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), BrainError> {
         let mut cmd = Command::new(&self.executable);
         cmd.current_dir(cwd).env_clear();
@@ -203,11 +217,12 @@ impl ClaudeSlot {
                 cmd.env(key, v);
             }
         }
-        cmd.env("CLAUDE_CONFIG_DIR", &self.credentials)
-            .args(["-p", "--output-format", "json"]);
-        if include_safe_mode {
-            cmd.arg("--safe-mode");
-        }
+        cmd.env("CLAUDE_CONFIG_DIR", &self.credentials).args([
+            "-p",
+            "--output-format",
+            "json",
+            "--safe-mode",
+        ]);
         cmd.args([
             "--tools",
             "",
@@ -238,10 +253,9 @@ impl ClaudeSlot {
         let stderr = child.stderr.take().expect("piped stderr");
         let run = async {
             let write = async {
-                stdin.write_all(input.as_bytes()).await?;
-                stdin.shutdown().await?;
+                let result = stdin.write_all(input.as_bytes()).await;
                 drop(stdin);
-                Ok::<_, std::io::Error>(())
+                result
             };
             let read_out = async {
                 let mut output = Vec::new();
@@ -251,14 +265,18 @@ impl ClaudeSlot {
                 }
                 Ok(output)
             };
-            let read_err = async {
-                let mut err_buf = Vec::new();
-                stderr.take(MAX_STDERR).read_to_end(&mut err_buf).await?;
-                Ok(err_buf)
-            };
-            let (_, output, err_buf) = tokio::try_join!(write, read_out, read_err)?;
+            // A CLI may reject an option before reading stdin. Still drain diagnostics and
+            // collect its exit status, including when the writer receives BrokenPipe.
+            let (written, output, errors) = tokio::try_join!(
+                async { Ok::<_, std::io::Error>(write.await) },
+                read_out,
+                stderr_tail(stderr)
+            )?;
             let status = child.wait().await?;
-            Ok::<_, std::io::Error>((status, output, err_buf))
+            if status.success() {
+                written?;
+            }
+            Ok::<_, std::io::Error>((status, output, errors))
         };
         tokio::time::timeout(Duration::from_secs(120), run)
             .await
@@ -286,28 +304,28 @@ impl BrainBackend for ClaudeSlot {
             BrainError::Unavailable("unable to create private slot working directory".into())
         })?;
         let input = json!({"messages":messages,"tools":tools}).to_string();
-        let (mut status, mut bytes, mut err_bytes) = self.invoke(cwd.path(), &input, true).await?;
-        if !status.success() && unsupported_safe_mode(&err_bytes) {
-            (status, bytes, err_bytes) = self.invoke(cwd.path(), &input, false).await?;
-        }
+        let (status, bytes, err_bytes) = self.invoke(cwd.path(), &input).await?;
         if !status.success() {
-            return Err(BrainError::Unavailable(format!(
-                "subscription CLI exited unsuccessfully ({status}){}",
+            // CLI output may contain local paths, prompt text, or credentials. Keep it
+            // in operator diagnostics, away from API and gateway error responses.
+            eprintln!(
+                "subscription CLI exited ({status}){}",
                 format_stderr_tail(&err_bytes)
-            )));
+            );
+            let reason = if unsupported_safe_mode(&err_bytes) {
+                "subscription CLI lacks required --safe-mode; upgrade this slot"
+            } else {
+                "subscription CLI exited unsuccessfully; check daemon diagnostics"
+            };
+            return Err(BrainError::Unavailable(reason.into()));
         }
         let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| {
             BrainError::Invalid("invalid subscription CLI response envelope".into())
         })?;
         if envelope["is_error"] == true {
-            let detail = envelope["result"]
-                .as_str()
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| format!(": {}", s.chars().take(200).collect::<String>()))
-                .unwrap_or_else(|| format_stderr_tail(&err_bytes));
-            return Err(BrainError::Unavailable(format!(
-                "subscription CLI reported an error{detail}"
-            )));
+            return Err(BrainError::Unavailable(
+                "subscription CLI reported an error".into(),
+            ));
         }
         let text = envelope["result"]
             .as_str()
