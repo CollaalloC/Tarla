@@ -109,7 +109,7 @@ pub async fn cancel(State(s): State<S>, Route(id): Route<String>) -> Api {
     let mut db = s.db()?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let pending=tx.execute("UPDATE service_turn_transfers SET state='cancelled',last_error=NULL WHERE run_id=? AND state='pending'",[&id])?;
-    let running=tx.execute("UPDATE runs SET desired_state='cancelled' WHERE run_id=? AND observed_state NOT IN ('succeeded','failed','cancelled')",[&id])?;
+    let running=tx.execute("UPDATE runs SET desired_state='cancelled' WHERE run_id=? AND observed_state NOT IN ('succeeded','failed','aborted','cancelled','canceled')",[&id])?;
     if running + pending == 0 {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -118,6 +118,7 @@ pub async fn cancel(State(s): State<S>, Route(id): Route<String>) -> Api {
     }
     tx.commit()?;
     s.notify.notify_waiters();
+    s.rev_wake.notify_waiters();
     Ok(Json(one(&s, &id)?))
 }
 pub async fn slots(State(s): State<S>) -> Api {
@@ -231,7 +232,7 @@ pub fn resolve_local_approval(s: &Service, id: &str, v: &str) -> Result<Value> {
          WHERE approval_id=? AND resolution='pending' AND
          (node_id!=? OR EXISTS(SELECT 1 FROM runs r WHERE r.run_id=approvals.run_id AND
           r.target_node_id=approvals.node_id AND r.desired_state='running' AND
-          r.observed_state NOT IN ('succeeded','failed','cancelled')))",
+          r.observed_state NOT IN ('succeeded','failed','aborted','cancelled','canceled')))",
         params![v, now(), id, s.node()],
     )?;
     if n == 0 {
@@ -261,6 +262,7 @@ pub fn resolve_local_approval(s: &Service, id: &str, v: &str) -> Result<Value> {
     }
     tx.commit()?;
     s.notify.notify_waiters();
+    s.rev_wake.notify_waiters();
     Ok(json!({"id":id,"resolution":v}))
 }
 pub async fn logs(State(s): State<S>, Route(id): Route<String>, Query(p): Query<Page>) -> Api {

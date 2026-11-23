@@ -1,10 +1,14 @@
 mod api;
 mod authority;
+mod bot_session;
+mod broker;
+mod checkpoints;
 mod control;
 mod distillation;
 mod drafts;
 mod facts;
 mod fleet;
+mod guardrails;
 mod handoff;
 mod hooks;
 mod launch;
@@ -15,9 +19,11 @@ mod peers;
 mod s1;
 mod skills;
 mod slot_reports;
+mod sync;
 mod terminal;
 mod terminal_relay;
 mod transcript;
+mod v2_ctl;
 
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
@@ -72,10 +78,14 @@ struct Service {
     brain: SupervisorEngine,
     slots: Vec<fleet::Slot>,
     peers: BTreeMap<String, peers::Peer>,
+    botflow: Option<tarla_botflow::BotflowSpec>,
+    herdr_cores: BTreeMap<String, tarla_sidecar::Herdr>,
     locks: tokio::sync::Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     account_locks: std::sync::Mutex<BTreeMap<String, std::fs::File>>,
     http: reqwest::Client,
     notify: tokio::sync::Notify,
+    rev_wake: tokio::sync::Notify,
+    botflow_wake: tokio::sync::Notify,
     s2_changed: tokio::sync::watch::Sender<i64>,
     sync_wake: tokio::sync::Notify,
     receipt_wake: tokio::sync::Notify,
@@ -420,6 +430,8 @@ async fn serve() -> Result<bool> {
     } else {
         actual.to_string()
     };
+    let (botflow, herdr_cores) = bot_session::load_and_provision(&ws, &mut initial)?;
+    drop(initial);
     let service = Arc::new(Service {
         distiller,
         distill_wake: Default::default(),
@@ -434,10 +446,14 @@ async fn serve() -> Result<bool> {
         brain,
         slots,
         peers,
+        botflow,
+        herdr_cores,
         locks: Default::default(),
         account_locks: Default::default(),
         http: http.build()?,
         notify: Default::default(),
+        rev_wake: Default::default(),
+        botflow_wake: Default::default(),
         s2_changed: tokio::sync::watch::channel(0).0,
         sync_wake: Default::default(),
         receipt_wake: Default::default(),
@@ -448,6 +464,9 @@ async fn serve() -> Result<bool> {
     });
 
     let routes = Router::new()
+        .route("/v1/hello", get(sync::hello))
+        .route("/v1/sync", get(sync::get_sync))
+        .route("/v1/events", get(sync::sse_events))
         .route("/v1/conversations/{id}/draft", get(drafts::get))
         .route("/v1/conversations", get(api::conversations))
         .route(
@@ -476,6 +495,19 @@ async fn serve() -> Result<bool> {
             service.clone(),
             api::client_auth,
         ))
+        .route("/v2/ctl/bots", get(v2_ctl::list_bots))
+        .route("/v2/ctl/bots/{id}/switch", post(v2_ctl::post_switch_engine))
+        .route(
+            "/v2/ctl/bots/{id}/human-lease",
+            post(v2_ctl::post_human_lease),
+        )
+        .route("/v2/ctl/goals", post(v2_ctl::post_goal))
+        .route("/v2/ctl/goals/{id}/cancel", post(v2_ctl::post_cancel_goal))
+        .route("/v2/ctl/emit", post(v2_ctl::post_emit))
+        .route("/v2/ctl/memory", post(v2_ctl::post_memory))
+        .route("/v2/ctl/runs/{id}/rollback", post(v2_ctl::post_rollback))
+        .route("/v2/ctl/ops", post(v2_ctl::post_broker_op))
+        .route("/v2/spills/{id}", get(v2_ctl::get_spill))
         .route("/health", get(api::health))
         .route("/v1/terminal/{id}", get(terminal::socket))
         .route("/telemetry/v1/slots/{slot}", post(slot_reports::ingest))
@@ -499,6 +531,7 @@ async fn serve() -> Result<bool> {
         None
     };
     tokio::spawn(fleet::worker(service.clone()));
+    tokio::spawn(bot_session::worker(service.clone()));
     authority::start(&service);
     peers::start_s2_notifications(&service);
     s1::startup(&service);

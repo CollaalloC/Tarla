@@ -238,7 +238,39 @@ pub async fn receive(
             result["term"] = json!(s.term());
             result
         }
-        "ticket" | "terminal_input" | "log" | "resolve" | "forward" => {
+        "v2_state" => {
+            if !s.is_supervisor() {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "v2_state requires the designated supervisor".into(),
+                ));
+            }
+            bot_session::accept_remote_v2_state(&s, node, &v)?
+        }
+        "v2_emit" => {
+            if !s.is_supervisor() {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "v2_emit requires the designated supervisor".into(),
+                ));
+            }
+            let bot_id = string(&v, "bot_id")?;
+            let port = string(&v, "port")?;
+            let payload = v.get("payload").cloned().unwrap_or_else(|| json!({}));
+            let corr = v["correlation_id"].as_str();
+            let hop = v["hop_count"].as_u64().unwrap_or(0) as u8;
+            let (env, outcomes) =
+                bot_session::emit_botflow_port_event(&s, bot_id, port, payload, corr, hop)?;
+            json!({
+                "event_id": env.event_id,
+                "rev": env.rev,
+                "source_topic": env.source_topic,
+                "hop_count": env.hop_count,
+                "outcomes": outcomes,
+            })
+        }
+        "ticket" | "terminal_input" | "log" | "resolve" | "forward" | "v2_goal" | "v2_cancel"
+        | "v2_rollback" | "v2_switch" => {
             if node != s.supervisor() {
                 return Err(ApiError(
                     StatusCode::FORBIDDEN,
@@ -259,6 +291,21 @@ pub async fn receive(
                     .await?
                 }
                 "forward" => api::forward(&s, string(&v, "run_id")?, string(&v, "text")?).await?,
+                "v2_goal" => bot_session::accept_remote_v2_goal(&s, &v)?,
+                "v2_cancel" => {
+                    bot_session::cancel_goal(&s, string(&v, "run_id")?, v["reason"].as_str())
+                        .await?
+                }
+                "v2_rollback" => v2_ctl::local_rollback(&s, string(&v, "run_id")?)?,
+                "v2_switch" => {
+                    let (binding, _) = bot_session::local_switch_bot_engine(
+                        &s,
+                        string(&v, "bot_id")?,
+                        string(&v, "target_ref")?,
+                    )
+                    .await?;
+                    json!({"binding": binding})
+                }
                 _ => api::resolve_local_approval(&s, string(&v, "id")?, string(&v, "resolution")?)?,
             }
         }
@@ -321,7 +368,8 @@ fn sync(s: &Service, node: &str, v: &Value) -> Result<Value> {
         b.scope AS lesson_scope,b.base_version AS lesson_base,o.predecessor AS resume_from
         FROM runs r LEFT JOIN service_run_paths p USING(run_id) LEFT JOIN service_pin_epochs e USING(run_id)
         LEFT JOIN service_lesson_baselines b USING(run_id) LEFT JOIN service_resume_origins o USING(run_id)
-        WHERE target_node_id=? AND r.run_id>? AND observed_state NOT IN ('failed','succeeded','cancelled') ORDER BY r.run_id LIMIT ?",&[&node,&page,&limit])?;
+        WHERE target_node_id=? AND r.run_id>? AND r.conversation_id NOT LIKE 'bot:%'
+        AND observed_state NOT IN ('failed','aborted','succeeded','cancelled','canceled') ORDER BY r.run_id LIMIT ?",&[&node,&page,&limit])?;
     let next_page = if ordered && assignments.len() == 16 {
         string(assignments.last().unwrap(), "run_id")?.to_owned()
     } else {

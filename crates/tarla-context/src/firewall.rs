@@ -74,7 +74,13 @@ pub fn bound_receipt(mut receipt: RunReceipt, max_tokens: usize) -> Result<RunRe
     ensure!(
         matches!(
             receipt.final_state.as_str(),
-            "succeeded" | "failed" | "cancelled" | "blocked"
+            "succeeded"
+                | "failed"
+                | "cancelled"
+                | "canceled"
+                | "aborted"
+                | "blocked"
+                | "blocked_approval"
         ),
         "unknown receipt state"
     );

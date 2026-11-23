@@ -1508,4 +1508,204 @@ mod retrieval_tests {
             .starts_with("Anchor target SQLiteEngineWalConfig"));
         Ok(())
     }
+
+    #[test]
+    fn hot_swap_cold_start_packet_preserves_epoch_memory_dag_and_recent_8_turns() -> Result<()> {
+        let mut db = tarla_memory::open(std::path::Path::new(":memory:"), "work")?;
+        {
+            let mut store = tarla_memory::SqliteMemory::new(&mut db, "work", "chief");
+            tarla_memory::MemoryBackend::propose_mutation(
+                &mut store,
+                &tarla_memory::Mutation {
+                    proposal_id: "g1".into(),
+                    memory_id: "repo-rule".into(),
+                    scope: "global".into(),
+                    content: "Keep main branch clean.".into(),
+                    base_version: 0,
+                    source_node_id: "chief".into(),
+                    source_run_id: None,
+                    is_deleted: false,
+                    hlc_timestamp: None,
+                },
+            )?;
+        }
+        for turn in 1..=12 {
+            append(
+                &mut db,
+                "work",
+                "bot:chief",
+                "cli",
+                &format!("u-{turn}"),
+                "user",
+                &format!(
+                    "Turn {turn} user decision: adopt module_{turn}.rs {}",
+                    "pad ".repeat(20)
+                ),
+            )?;
+            append(
+                &mut db,
+                "work",
+                "bot:chief",
+                "claude",
+                &format!("a-{turn}"),
+                "assistant",
+                &format!("Turn {turn} assistant reply confirming module_{turn}.rs"),
+            )?;
+        }
+        let pkt = build_cold_start_packet(
+            &mut db,
+            "work",
+            "chief",
+            "chief",
+            "bot:chief",
+            Some("t11"),
+            1,
+            "You are chief orchestrator.",
+            8,
+            900,
+        )?;
+        assert!(pkt.compaction_epoch >= 2);
+        assert!(pkt.rendered.contains("Keep main branch clean."));
+        assert!(!pkt.dag_summaries.is_empty());
+        assert!(pkt.rendered.contains("Turn 12 user decision"));
+        assert!(pkt.rendered.contains("Turn 5 user decision"));
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ColdStartPacket {
+    pub compaction_epoch: i64,
+    pub frozen_prefix: String,
+    pub dag_summaries: Vec<String>,
+    pub recent_messages: Vec<ArchivedMessage>,
+    pub rendered: String,
+}
+
+/// Build the seamless cold-start continuation packet when spawning or hot-swapping
+/// an `hc` terminal (`claude` -> `codex` / `gemini`) on an existing `conversation_id`:
+/// `[Role Prompt + Epoch-Pinned Dual-Tier Memory + Lossless DAG Nodes + Recent 8 Protected Turns]`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_cold_start_packet(
+    db: &mut Connection,
+    workspace: &str,
+    node: &str,
+    bot_id: &str,
+    conversation: &str,
+    terminal_addr: Option<&str>,
+    current_epoch: i64,
+    role_prompt: &str,
+    protected_turns: usize,
+    active_budget_tokens: usize,
+) -> Result<ColdStartPacket> {
+    let turns = protected_turns.max(1);
+    let mut epoch = current_epoch.max(1);
+
+    let compacted_now = {
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO conversations(conversation_id,workspace_id,title,created_at,updated_at)
+             VALUES(?1,?2,?1,0,0) ON CONFLICT DO NOTHING",
+            params![conversation, workspace],
+        )?;
+        let before_nodes: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM context_dag_nodes WHERE conversation_id = ?1",
+            [conversation],
+            |r| r.get(0),
+        )?;
+        let (raw_cost, summary_cost) = archive_cost(&tx, conversation)?;
+        let high = active_budget_tokens.max(512).saturating_mul(75) / 100;
+        if raw_cost.saturating_add(summary_cost) > high {
+            compact(&tx, conversation, turns)?;
+        }
+        let mut roots = read_roots(&tx, conversation)?;
+        while roots.len() >= 4 {
+            let same_depth = roots
+                .windows(4)
+                .position(|w| w.iter().all(|r| r.depth == w[0].depth));
+            let Some(i) = same_depth else { break };
+            let parent = merge_nodes(&tx, conversation, &roots[i..i + 4])?;
+            roots.splice(i..i + 4, [parent]);
+        }
+        let after_nodes: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM context_dag_nodes WHERE conversation_id = ?1",
+            [conversation],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        after_nodes > before_nodes
+    };
+    if compacted_now {
+        epoch += 1;
+    }
+
+    let frozen_prefix = tarla_memory::freeze_bot_epoch_memory(
+        db,
+        workspace,
+        node,
+        bot_id,
+        terminal_addr,
+        epoch,
+        role_prompt,
+    )?;
+
+    let tx = db.transaction()?;
+    let roots = read_roots(&tx, conversation)?;
+    let dag_summaries: Vec<String> = roots
+        .into_iter()
+        .map(|r| format!("[history {} {}..{}] {}", r.id, r.start, r.end, r.summary))
+        .collect();
+
+    let cutoff_seq: i64 = tx
+        .query_row(
+            "SELECT seq_no FROM messages WHERE conversation_id = ?1
+             AND sender_role IN ('user','run_receipt')
+             ORDER BY seq_no DESC LIMIT 1 OFFSET ?2",
+            params![conversation, turns.saturating_sub(1)],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let mut stmt = tx.prepare(
+        "SELECT seq_no, sender_role, content FROM messages
+         WHERE conversation_id = ?1 AND (compacted_into IS NULL OR seq_no >= ?2)
+         ORDER BY seq_no ASC",
+    )?;
+    let recent_messages = stmt
+        .query_map(params![conversation, cutoff_seq], |r| {
+            Ok(ArchivedMessage {
+                seq_no: r.get(0)?,
+                role: r.get(1)?,
+                content: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    tx.commit()?;
+
+    let mut rendered = frozen_prefix.clone();
+    if !dag_summaries.is_empty() {
+        rendered.push_str("\n\n[Archived Conversation DAG]\n");
+        for node_line in &dag_summaries {
+            rendered.push_str(node_line);
+            rendered.push('\n');
+        }
+    }
+    if !recent_messages.is_empty() {
+        rendered.push_str(&format!(
+            "\n[Recent Protected Transcript (last <= {turns} turns)]\n"
+        ));
+        for msg in &recent_messages {
+            let body = excerpt(&msg.content, &format!("seq_no={}", msg.seq_no), 1600)?;
+            rendered.push_str(&format!("[#{} {}] {}\n", msg.seq_no, msg.role, body));
+        }
+    }
+
+    Ok(ColdStartPacket {
+        compaction_epoch: epoch,
+        frozen_prefix,
+        dag_summaries,
+        recent_messages,
+        rendered,
+    })
 }

@@ -29,6 +29,7 @@ tarla-supervisor = {path="../tarla-supervisor"}
 tarla-scheduler = {path="../tarla-scheduler"}
 tarla-sidecar = {path="../tarla-sidecar"}
 tarla-gateway = {path="../tarla-gateway"}
+tarla-botflow = {path="../tarla-botflow"}
 tokio-tungstenite = {version="0.28", default-features=false, features=["handshake"]}
 
 [target.'cfg(unix)'.dependencies]

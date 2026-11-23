@@ -15,13 +15,36 @@ use tokio::io::{
 };
 use tokio::time::timeout;
 #[cfg(unix)]
-type Ipc = tokio::net::UnixStream;
+pub(crate) type Ipc = tokio::net::UnixStream;
 #[cfg(windows)]
-type Ipc = tokio::net::windows::named_pipe::NamedPipeClient;
+pub(crate) type Ipc = tokio::net::windows::named_pipe::NamedPipeClient;
 
 pub const MAX_HERDR_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
+pub const MAX_HERDR_DOC_BYTES: usize = 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(12);
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize, PartialEq)]
+pub struct DocRecord {
+    pub name: String,
+    pub version: u64,
+    pub value: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalSpawnSpec {
+    pub run_id: String,
+    pub name: Option<String>,
+    pub template: Option<String>,
+    pub argv: Vec<String>,
+    pub prompt: Option<String>,
+    pub cwd: PathBuf,
+    pub env: BTreeMap<String, String>,
+    pub labels: BTreeMap<String, String>,
+    pub parent: Option<String>,
+    pub outlive_parent: bool,
+    pub notify: Vec<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct Herdr {
@@ -143,10 +166,93 @@ fn derive_session_name(runtime: &Path) -> String {
     }
 }
 
+pub(crate) fn build_spawn_params(spec: &TerminalSpawnSpec) -> io::Result<Value> {
+    if spec.run_id.is_empty() || !spec.cwd.is_absolute() {
+        return Err(invalid("run requires run_id and absolute workdir"));
+    }
+    if spec.template.as_deref().is_none_or(str::is_empty)
+        && spec.argv.first().is_none_or(String::is_empty)
+    {
+        return Err(invalid("run requires either template or non-empty argv"));
+    }
+    let name = match spec.name.as_deref().filter(|s| !s.is_empty()) {
+        Some(custom) => {
+            crate::templates::validate_safe_ident("terminal name", custom, 64)?;
+            custom.to_owned()
+        }
+        None => {
+            let digest = format!("{:x}", Sha256::digest(&spec.run_id));
+            format!("tarla-{}", &digest[..26])
+        }
+    };
+    let mut labels = spec.labels.clone();
+    labels.insert("tarla_run".into(), spec.run_id.clone());
+    let mut params = json!({
+        "name": name,
+        "cwd": spec.cwd,
+        "env": spec.env,
+        "labels": labels,
+        "wait": false,
+        "rm": false,
+        "keep": false,
+    });
+    if let Some(tpl) = spec.template.as_deref().filter(|s| !s.is_empty()) {
+        crate::templates::validate_safe_ident("template", tpl, 64)?;
+        params["template"] = json!(tpl);
+    }
+    if !spec.argv.is_empty() {
+        params["argv"] = json!(spec.argv);
+    }
+    if let Some(prompt) = spec.prompt.as_deref().filter(|s| !s.is_empty()) {
+        params["prompt"] = json!(prompt);
+    }
+    if let Some(parent) = spec.parent.as_deref().filter(|s| !s.is_empty()) {
+        local_terminal(parent)?;
+        params["parent"] = json!(parent);
+        params["outlive_parent"] = json!(spec.outlive_parent);
+        if !spec.notify.is_empty() {
+            params["notify"] = json!(spec.notify);
+        }
+    } else {
+        params["no_parent"] = json!(true);
+    }
+    Ok(params)
+}
+
 impl Herdr {
     pub fn new(runtime_dir: &Path) -> io::Result<Self> {
         private_dir(runtime_dir)?;
         let runtime = runtime_dir.canonicalize()?;
+        let session = derive_session_name(&runtime);
+        Self::from_canonical_runtime(runtime, session)
+    }
+
+    /// Create an isolated `Herdr` instance under `<workspace_runtime>/cores/<core_group>`.
+    pub fn for_core_group(
+        workspace_runtime: &Path,
+        workspace_id: &str,
+        core_group: &str,
+        custom_session: Option<&str>,
+    ) -> io::Result<Self> {
+        crate::templates::validate_safe_ident("workspace id", workspace_id, 40)?;
+        crate::templates::validate_safe_ident("core group", core_group, 40)?;
+        private_dir(workspace_runtime)?;
+        let cores_root = workspace_runtime.join("cores");
+        private_dir(&cores_root)?;
+        let group_dir = cores_root.join(core_group);
+        private_dir(&group_dir)?;
+        let runtime = group_dir.canonicalize()?;
+        let session = match custom_session.filter(|s| !s.is_empty()) {
+            Some(explicit) => {
+                crate::templates::validate_safe_ident("herdr session", explicit, 80)?;
+                explicit.to_owned()
+            }
+            None => format!("tarla-{workspace_id}-{core_group}"),
+        };
+        Self::from_canonical_runtime(runtime, session)
+    }
+
+    fn from_canonical_runtime(runtime: PathBuf, session: String) -> io::Result<Self> {
         #[cfg(unix)]
         let endpoint = crate::unix_socket_path(&runtime, "hc.sock", "hc")?;
         #[cfg(windows)]
@@ -154,12 +260,15 @@ impl Herdr {
             r"\\.\pipe\tarla-hc-{:x}",
             Sha256::digest(runtime.to_string_lossy().as_bytes())
         ));
-        let session = derive_session_name(&runtime);
         Ok(Self {
             runtime,
             endpoint,
             session,
         })
+    }
+
+    pub fn runtime_dir(&self) -> &Path {
+        &self.runtime
     }
     pub fn socket_path(&self) -> &Path {
         &self.endpoint
@@ -231,6 +340,17 @@ impl Herdr {
         local_terminal(address)?;
         Ok(Some(address.to_owned()))
     }
+    /// Spawn a root or child terminal (raw `argv` or managed `.md` template) in this `Herdr` core.
+    pub async fn spawn_terminal(&self, spec: &TerminalSpawnSpec) -> io::Result<String> {
+        let params = build_spawn_params(spec)?;
+        let result = self.rpc("terminal.run", params).await?;
+        let addr = result["address"]
+            .as_str()
+            .ok_or_else(|| invalid("missing terminal address"))?;
+        local_terminal(addr)?;
+        check_owner(&result, &spec.run_id, addr)?;
+        Ok(addr.into())
+    }
     /// Call only after persisting the executor's unique run claim. A timeout is
     /// ambiguous. Reconcile with find_run instead of dispatching again.
     pub async fn start_run(
@@ -243,21 +363,20 @@ impl Herdr {
         if run_id.is_empty() || argv.first().is_none_or(String::is_empty) || !cwd.is_absolute() {
             return Err(invalid("run requires id, argv and absolute workdir"));
         }
-        let digest = format!("{:x}", Sha256::digest(run_id));
-        let name = format!("tarla-{}", &digest[..26]);
-        let result = self
-            .rpc(
-                "terminal.run",
-                json!({"name":name,"argv":argv,"cwd":cwd,"env":env,
-            "labels":{"tarla_run":run_id},"wait":false,"rm":false,"keep":false,"no_parent":true}),
-            )
-            .await?;
-        let addr = result["address"]
-            .as_str()
-            .ok_or_else(|| invalid("missing terminal address"))?;
-        local_terminal(addr)?;
-        check_owner(&result, run_id, addr)?;
-        Ok(addr.into())
+        self.spawn_terminal(&TerminalSpawnSpec {
+            run_id: run_id.to_owned(),
+            name: None,
+            template: None,
+            argv: argv.to_vec(),
+            prompt: None,
+            cwd: cwd.to_path_buf(),
+            env: env.clone(),
+            labels: BTreeMap::new(),
+            parent: None,
+            outlive_parent: false,
+            notify: Vec::new(),
+        })
+        .await
     }
     // Keep both requests on one connection. A replacement core may reuse the
     // same address, but cannot inherit this connection. Addresses are immutable
@@ -302,6 +421,20 @@ impl Herdr {
             .map(str::to_owned)
             .ok_or_else(|| invalid("missing terminal text"))
     }
+    pub async fn interrupt(&self, run_id: &str, terminal: &str) -> io::Result<()> {
+        match self
+            .run_rpc(
+                run_id,
+                terminal,
+                "terminal.interrupt",
+                json!({"terminal":terminal}),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(_) => self.cancel(run_id, terminal).await,
+        }
+    }
     pub async fn cancel(&self, run_id: &str, terminal: &str) -> io::Result<()> {
         self.run_rpc(
             run_id,
@@ -324,6 +457,54 @@ impl Herdr {
         )
         .await?;
         Ok(())
+    }
+    /// Read a versioned blackboard JSON document (`doc.get`) within this `Herdr` core.
+    pub async fn doc_get(&self, name: &str) -> io::Result<Option<DocRecord>> {
+        crate::templates::validate_safe_ident("doc name", name, 64)?;
+        let reply = self.rpc("doc.get", json!({"name": name})).await?;
+        if reply.is_null() || reply.get("version").is_none() {
+            return Ok(None);
+        }
+        Ok(Some(DocRecord {
+            name: reply["name"].as_str().unwrap_or(name).to_owned(),
+            version: reply["version"]
+                .as_u64()
+                .ok_or_else(|| invalid("missing doc version"))?,
+            value: reply.get("value").cloned().unwrap_or(Value::Null),
+        }))
+    }
+    /// Write a versioned blackboard JSON document (`doc.set`, capped at 1 MiB with optimistic `version`).
+    pub async fn doc_set(
+        &self,
+        name: &str,
+        expected_version: Option<u64>,
+        value: &Value,
+    ) -> io::Result<DocRecord> {
+        crate::templates::validate_safe_ident("doc name", name, 64)?;
+        let encoded = serde_json::to_vec(value)?;
+        if encoded.len() > MAX_HERDR_DOC_BYTES {
+            return Err(invalid("blackboard document exceeds 1 MiB limit"));
+        }
+        let mut params = json!({"name": name, "value": value});
+        if let Some(ver) = expected_version {
+            params["version"] = json!(ver);
+        }
+        let reply = self.rpc("doc.set", params).await?;
+        Ok(DocRecord {
+            name: reply["name"].as_str().unwrap_or(name).to_owned(),
+            version: reply["version"]
+                .as_u64()
+                .ok_or_else(|| invalid("missing doc version"))?,
+            value: reply.get("value").cloned().unwrap_or_else(|| value.clone()),
+        })
+    }
+    /// Subscribe to the real-time monotonic `events.subscribe` stream on this `Herdr` core.
+    pub async fn subscribe_events(&self, since_seq: Option<u64>) -> io::Result<crate::EventStream> {
+        timeout(RPC_TIMEOUT, async {
+            let stream = self.socket().await?;
+            crate::EventStream::connect(stream, since_seq).await
+        })
+        .await?
     }
     pub async fn attach(
         &self,
@@ -671,5 +852,44 @@ mod protocol_tests {
             deep.session_name(),
             "tarla-engineering-production-workspace-alpha"
         );
+    }
+
+    #[test]
+    fn multi_core_groups_and_parent_child_template_delegation_params() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("workspaces/work/runtime");
+        let code_core = Herdr::for_core_group(&rt, "work", "code_core", None).unwrap();
+        let ops_core = Herdr::for_core_group(&rt, "work", "ops_core", None).unwrap();
+        assert_eq!(code_core.session_name(), "tarla-work-code_core");
+        assert_eq!(ops_core.session_name(), "tarla-work-ops_core");
+        assert_ne!(code_core.socket_path(), ops_core.socket_path());
+        assert_ne!(code_core.runtime_dir(), ops_core.runtime_dir());
+
+        let child_spec = TerminalSpawnSpec {
+            run_id: "run-child-1".into(),
+            name: Some("gemini-reviewer".into()),
+            template: Some("gemini-rev".into()),
+            argv: Vec::new(),
+            prompt: Some("核查刚生成的补丁".into()),
+            cwd: tmp.path().canonicalize().unwrap(),
+            env: BTreeMap::new(),
+            labels: BTreeMap::from([("tarla_bot".into(), "reviewer".into())]),
+            parent: Some("t2".into()),
+            outlive_parent: false,
+            notify: vec!["done".into(), "error".into(), "blocked".into()],
+        };
+        let params = build_spawn_params(&child_spec).unwrap();
+        assert_eq!(params["name"], "gemini-reviewer");
+        assert_eq!(params["template"], "gemini-rev");
+        assert_eq!(params["parent"], "t2");
+        assert_eq!(params["outlive_parent"], false);
+        assert_eq!(params["notify"], json!(["done", "error", "blocked"]));
+        assert!(params.get("no_parent").is_none());
+        assert_eq!(params["labels"]["tarla_run"], "run-child-1");
+        assert_eq!(params["labels"]["tarla_bot"], "reviewer");
+
+        let mut bad = child_spec;
+        bad.parent = Some("remote/t2".into());
+        assert!(build_spawn_params(&bad).is_err());
     }
 }
