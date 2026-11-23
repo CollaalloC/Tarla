@@ -81,6 +81,55 @@ def write_executable(path: Path, code: str):
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+def read_sse_through(node, since, stop_rev):
+    request = Request(
+        f"{node.url}/v1/events?since={since}",
+        headers={"Authorization": f"Bearer {node.token}", "X-Tarla-Workspace": node.workspace},
+    )
+    events = []
+    deadline = time.monotonic() + 10
+    with urlopen(request, timeout=10) as response:
+        for line in response:
+            assert time.monotonic() < deadline, f"SSE did not reach revision {stop_rev}"
+            if line.startswith(b"data:"):
+                event = json.loads(line[5:])
+                events.append(event)
+                if event["rev"] >= stop_rev:
+                    assert event["rev"] == stop_rev
+                    return events
+    raise AssertionError(f"SSE closed before revision {stop_rev}")
+
+
+def check_reconnect(node):
+    start = http_get_json(node, "/v1/hello")["latest_rev"]
+
+    def feedback(sequence):
+        return http_post_json(node, "/v2/ctl/emit", {
+            "port": "feedback", "payload": {"reconnect_sequence": sequence},
+        })["rev"]
+
+    checkpoint = feedback(0)
+    assert read_sse_through(node, start, checkpoint)[-1]["rev"] == checkpoint
+    # The first stream is now closed. Write enough events to force multiple catch-up pages.
+    offline_revs = [feedback(i) for i in range(1, 6)]
+    last = offline_revs[-1]
+    cursor = checkpoint
+    pages = []
+    while cursor < last:
+        batch = http_get_json(node, f"/v1/sync?since={cursor}&limit=2")
+        page = [event for event in batch["events"] if event["rev"] <= last]
+        assert page and all(event["rev"] > cursor for event in page)
+        assert len(batch["events"]) <= 2
+        pages.extend(page)
+        cursor = page[-1]["rev"]
+        if cursor < last:
+            assert batch["has_more"]
+    revs = [event["rev"] for event in pages]
+    assert revs == sorted(set(revs))
+    assert [rev for rev in revs if rev in offline_revs] == offline_revs
+    assert read_sse_through(node, checkpoint, last) == pages
+
+
 class WebhookFixture(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -601,6 +650,7 @@ bots:
         until(lambda: len(sse_received) >= 5, "live SSE sync_ledger frames received")
         sse_revs = [e["rev"] for e in sse_received]
         assert sse_revs == sorted(sse_revs)
+        check_reconnect(chief)
 
     print(
         "PASS V2.0 end-to-end: multi-core templates, /v1/hello + /v1/sync + SSE rev cursor, "
